@@ -1,0 +1,365 @@
+/* Web-font slot: uncomment the line below and put your font there. A web-font
+   @import must come before the Tailwind import — an @import placed after any
+   other rule is a build error, and it is reported against a line number in the
+   expanded Tailwind output, far past the end of this file, so the message
+   cannot point you at the mistake. */
+/* @import url('https://fonts.googleapis.com/css2?family=Your+Font:wght@400..700&display=swap'); */
+@import "tailwindcss";
+@import "tailwindcss-safe-area";
+
+@theme {
+  /* Scheme D text floor: the smallest named text size is ~13px.
+     Derek's explicitly-sized elements (the 10.4px Savings/Source
+     toggles, the half-size Week-view meal choices, the 20px group
+     titles, the Sales by Store header, the Membership Alternatives
+     shrink-to-fit steps) set their own pixel sizes and are not
+     affected by this token. */
+  --text-xs: 13px;
+  --text-xs--line-height: 18px;
+  --text-sm: 14px;
+  --text-sm--line-height: 20px;
+  --text-base: 16px;
+  --text-base--line-height: 24px;
+  --text-lg: 18px;
+  --text-lg--line-height: 28px;
+  --text-xl: 20px;
+  --text-xl--line-height: 28px;
+  --text-2xl: 24px;
+  --text-2xl--line-height: 32px;
+  --text-3xl: 30px;
+  --text-3xl--line-height: 36px;
+  --text-4xl: 36px;
+  --text-4xl--line-height: 40px;
+  --text-5xl: 48px;
+  --text-5xl--line-height: 52px;
+}
+
+/* Scheme D — "Calm High-Contrast" (Alpha 0.55): legibility-first.
+   Near-white background, deep ink text, stronger borders, household
+   accent deep green, business accent blue (in .bit-scope below).
+   ONE colour breakdown serves both sides: the household scheme is
+   the baseline and the business side replicates the same palette
+   roles — status colours included — with blue in place of green.
+   Every token has a dark-mode counterpart. */
+:root {
+  color-scheme: light dark;
+  --bg: #fafaf7;
+  --surface: #ffffff;
+  --surface-alt: #efefe9;
+  --text: #14201a;
+  --dim: #46564c;
+  --border: #c9cfc9;
+  --accent: #14532d;
+  --accent-text: #ffffff;
+  --accent-soft: #dde9dc;
+  --amber: #7a5200;
+  --amber-soft: #f3e6c3;
+  --red: #a02c18;
+  --red-soft: #f8ded4;
+  --ok-bg: #d7e7d2;
+  --ok-text: #1e4d24;
+  --out-bg: #f6d7cb;
+  --out-text: #8a2a15;
+  --unknown-bg: #e7e7de;
+  --unknown-text: #52503f;
+  --heart: #b92c44;
+  --heart-text: #ffffff;
+  --radius: 12px;
+  --space-surface: var(--surface);
+  --space-surface-alt: var(--surface-alt);
+  --space-muted: var(--dim);
+  --space-border: var(--border);
+  --space-accent: var(--accent);
+
+  /* Unified category palette: six capped, muted slots, used
+     identically on both sides. Each slot is a tint background
+     (-bg), a dark readable text colour for that tint (-fg), and a
+     mid-strength dot/stripe colour (-dot). A category's name in
+     text always accompanies its colour, so colour is never the
+     only signal. The business side re-declares the same six slots
+     hue-shifted into the blue family (see .bit-scope). */
+  --cat-1-bg: hsl(132 26% 88%);
+  --cat-1-fg: hsl(140 38% 25%);
+  --cat-1-dot: hsl(140 26% 44%);
+  --cat-2-bg: hsl(42 42% 87%);
+  --cat-2-fg: hsl(38 58% 27%);
+  --cat-2-dot: hsl(40 38% 46%);
+  --cat-3-bg: hsl(208 30% 88%);
+  --cat-3-fg: hsl(210 42% 29%);
+  --cat-3-dot: hsl(210 26% 49%);
+  --cat-4-bg: hsl(12 40% 88%);
+  --cat-4-fg: hsl(9 48% 31%);
+  --cat-4-dot: hsl(11 38% 50%);
+  --cat-5-bg: hsl(272 24% 89%);
+  --cat-5-fg: hsl(270 30% 34%);
+  --cat-5-dot: hsl(270 22% 53%);
+  --cat-6-bg: hsl(174 30% 86%);
+  --cat-6-fg: hsl(172 48% 25%);
+  --cat-6-dot: hsl(172 32% 41%);
+
+  /* Launch-chooser scene colours (App.tsx HouseScene / TruckScene):
+     token-driven so both illustrations sit correctly in dark mode
+     as well as light. */
+  --scene-sky: #d9edf8;
+  --scene-cloud: #ffffff;
+  --scene-grass: #a9d69f;
+  --scene-grass-dark: #8cc184;
+  --scene-wall: #fdf6e3;
+  --scene-roof: #c96f4a;
+  --scene-road: #767c85;
+  --scene-shadow: rgba(20, 40, 25, 0.18);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111511;
+    --surface: #1c211c;
+    --surface-alt: #272c26;
+    --text: #edf2ea;
+    --dim: #a7b3a4;
+    --border: #424c42;
+    --accent: #8fd0a4;
+    --accent-text: #0c2313;
+    --accent-soft: #1e3524;
+    --amber: #e5bc55;
+    --amber-soft: #3a3016;
+    --red: #ef9a83;
+    --red-soft: #42241b;
+    --ok-bg: #26452c;
+    --ok-text: #abdcb0;
+    --out-bg: #4c2b1f;
+    --out-text: #f2b394;
+    --unknown-bg: #2f2e25;
+    --unknown-text: #c0bda6;
+    --heart: #e0607a;
+    --heart-text: #ffffff;
+
+    --cat-1-bg: hsl(140 24% 21%);
+    --cat-1-fg: hsl(140 42% 79%);
+    --cat-1-dot: hsl(140 28% 58%);
+    --cat-2-bg: hsl(40 26% 21%);
+    --cat-2-fg: hsl(42 48% 78%);
+    --cat-2-dot: hsl(40 32% 58%);
+    --cat-3-bg: hsl(210 26% 22%);
+    --cat-3-fg: hsl(210 45% 80%);
+    --cat-3-dot: hsl(210 30% 60%);
+    --cat-4-bg: hsl(11 26% 22%);
+    --cat-4-fg: hsl(12 45% 80%);
+    --cat-4-dot: hsl(11 32% 60%);
+    --cat-5-bg: hsl(270 22% 23%);
+    --cat-5-fg: hsl(270 32% 81%);
+    --cat-5-dot: hsl(270 24% 62%);
+    --cat-6-bg: hsl(172 26% 20%);
+    --cat-6-fg: hsl(172 42% 78%);
+    --cat-6-dot: hsl(172 30% 56%);
+
+    --scene-sky: #20384f;
+    --scene-cloud: #7e93a8;
+    --scene-grass: #33543a;
+    --scene-grass-dark: #2a4731;
+    --scene-wall: #8a7a5c;
+    --scene-roof: #9a5638;
+    --scene-road: #454b53;
+    --scene-shadow: rgba(0, 0, 0, 0.35);
+  }
+}
+
+/* BIT (Business Inventory Tracker) side: Scheme D replicated in
+   blue. The household scheme is the baseline; the business side
+   keeps every palette role — accent, status colours, and the same
+   six-slot category structure — with blue in place of green. The
+   BIT side's root element carries .bit-scope. */
+.bit-scope {
+  --accent: #1e4f8a;
+  --accent-soft: #dbe7f5;
+
+  /* The unified category palette, hue-shifted into the blue
+     family: same slot count, same tint/text/dot structure and
+     lightness steps as the household slots above. */
+  --cat-1-bg: hsl(212 45% 88%);
+  --cat-1-fg: hsl(212 55% 27%);
+  --cat-1-dot: hsl(212 40% 47%);
+  --cat-2-bg: hsl(200 48% 87%);
+  --cat-2-fg: hsl(200 58% 26%);
+  --cat-2-dot: hsl(200 42% 44%);
+  --cat-3-bg: hsl(228 40% 89%);
+  --cat-3-fg: hsl(228 42% 32%);
+  --cat-3-dot: hsl(228 32% 53%);
+  --cat-4-bg: hsl(190 42% 86%);
+  --cat-4-fg: hsl(190 55% 25%);
+  --cat-4-dot: hsl(190 40% 40%);
+  --cat-5-bg: hsl(246 34% 89%);
+  --cat-5-fg: hsl(246 38% 34%);
+  --cat-5-dot: hsl(246 28% 55%);
+  --cat-6-bg: hsl(218 36% 88%);
+  --cat-6-fg: hsl(218 45% 29%);
+  --cat-6-dot: hsl(218 30% 50%);
+}
+@media (prefers-color-scheme: dark) {
+  .bit-scope {
+    --accent: #93bde9;
+    --accent-text: #0d2036;
+    --accent-soft: #1d3049;
+
+    --cat-1-bg: hsl(212 32% 22%);
+    --cat-1-fg: hsl(212 55% 80%);
+    --cat-1-dot: hsl(212 38% 60%);
+    --cat-2-bg: hsl(200 32% 21%);
+    --cat-2-fg: hsl(200 55% 79%);
+    --cat-2-dot: hsl(200 38% 58%);
+    --cat-3-bg: hsl(228 28% 23%);
+    --cat-3-fg: hsl(228 42% 81%);
+    --cat-3-dot: hsl(228 30% 62%);
+    --cat-4-bg: hsl(190 30% 20%);
+    --cat-4-fg: hsl(190 48% 78%);
+    --cat-4-dot: hsl(190 36% 56%);
+    --cat-5-bg: hsl(246 26% 23%);
+    --cat-5-fg: hsl(246 36% 82%);
+    --cat-5-dot: hsl(246 28% 64%);
+    --cat-6-bg: hsl(218 28% 22%);
+    --cat-6-fg: hsl(218 45% 80%);
+    --cat-6-dot: hsl(218 32% 60%);
+  }
+}
+
+/* Phone tap targets: at least 32px tall. */
+@layer base {
+  button, [role="button"], select, summary, input:not([type="checkbox"], [type="radio"]) {
+    min-height: 2rem;
+  }
+}
+
+/* Heart popup entrance (Meal Planner tab). */
+@keyframes heart-pop {
+  0% { transform: scale(0.6); opacity: 0; }
+  60% { transform: scale(1.06); opacity: 1; }
+  100% { transform: scale(1); opacity: 1; }
+}
+.heart-pop {
+  animation: heart-pop 0.35s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .heart-pop {
+    animation: none;
+  }
+}
+
+/* Boiling pot (Scan recipe file scan, Meal Planner tab): steam wisps
+   loop up off the pot and fade while the lid rattles on top. */
+@keyframes pot-steam {
+  0% { transform: translateY(4px) scaleY(0.7); opacity: 0; }
+  30% { opacity: 0.85; }
+  100% { transform: translateY(-13px) scaleY(1.15); opacity: 0; }
+}
+@keyframes pot-lid {
+  0%, 100% { transform: translateY(0) rotate(0deg); }
+  25% { transform: translateY(-2.6px) rotate(-2.4deg); }
+  55% { transform: translateY(-1px) rotate(1.6deg); }
+  78% { transform: translateY(-3px) rotate(-1deg); }
+}
+.pot-steam {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: pot-steam 1.7s ease-in-out infinite;
+}
+.pot-steam-2 { animation-delay: 0.55s; }
+.pot-steam-3 { animation-delay: 1.1s; }
+.pot-lid {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: pot-lid 0.62s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pot-steam, .pot-lid {
+    animation: none;
+  }
+}
+
+/* Launch-chooser scenes (App.tsx HouseScene / TruckScene): gentle,
+   looping, flat-illustration motion. Clouds loop inside their own
+   patch of sky, chimney smoke rises and fades; the truck bobs with
+   spinning wheels over a scrolling dashed road line, exhaust puffs
+   trailing, scenery passing. Under prefers-reduced-motion every
+   animation stops and the scenes show as still frames. */
+.chooser-scene {
+  display: block;
+  height: auto;
+}
+/* Clouds travel in a small, clearly visible local loop: each
+   cloud wanders a short distance inside its own patch of sky and
+   loops continuously — gentle local motion, not a slow crawl
+   across the whole scene. The two clouds run at different periods
+   and phases (one reversed) so they never move in lockstep. */
+@keyframes scene-cloud-loop {
+  0% { transform: translate(0, 0); }
+  30% { transform: translate(11px, -1.5px); }
+  55% { transform: translate(15px, 0.5px); }
+  80% { transform: translate(5px, 1.5px); }
+  100% { transform: translate(0, 0); }
+}
+.scene-cloud-a {
+  animation: scene-cloud-loop 6s ease-in-out infinite;
+}
+.scene-cloud-b {
+  animation: scene-cloud-loop 7.5s ease-in-out infinite reverse;
+}
+@keyframes scene-smoke-rise {
+  0% { transform: translateY(2px) scale(0.6); opacity: 0; }
+  25% { opacity: 0.75; }
+  100% { transform: translateY(-16px) scale(1.5); opacity: 0; }
+}
+.scene-smoke {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: scene-smoke-rise 3.6s ease-out infinite;
+}
+.scene-smoke-2 { animation-delay: 1.2s; }
+.scene-smoke-3 { animation-delay: 2.4s; }
+@keyframes scene-truck-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-1.6px); }
+}
+.scene-truck {
+  animation: scene-truck-bob 0.7s ease-in-out infinite;
+}
+@keyframes scene-wheel-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.scene-wheel {
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+  animation: scene-wheel-spin 0.8s linear infinite;
+}
+@keyframes scene-road-scroll {
+  from { stroke-dashoffset: 0; }
+  to { stroke-dashoffset: 34; }
+}
+.scene-road-dash {
+  animation: scene-road-scroll 0.5s linear infinite;
+}
+@keyframes scene-scenery-pass {
+  from { transform: translateX(0); }
+  to { transform: translateX(-320px); }
+}
+.scene-scenery {
+  animation: scene-scenery-pass 9s linear infinite;
+}
+@keyframes scene-puff-trail {
+  0% { transform: translateX(4px) scale(0.6); opacity: 0; }
+  25% { opacity: 0.8; }
+  100% { transform: translateX(-16px) scale(1.4); opacity: 0; }
+}
+.scene-puff {
+  transform-box: fill-box;
+  transform-origin: 50% 50%;
+  animation: scene-puff-trail 1.8s ease-out infinite;
+}
+.scene-puff-2 { animation-delay: 0.6s; }
+.scene-puff-3 { animation-delay: 1.2s; }
+@media (prefers-reduced-motion: reduce) {
+  .scene-cloud-a, .scene-cloud-b, .scene-smoke, .scene-truck,
+  .scene-wheel, .scene-road-dash, .scene-scenery, .scene-puff {
+    animation: none;
+  }
+}
