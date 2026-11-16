@@ -1,6 +1,6 @@
 # HitBit
 
-HitBit — a combined household and business inventory tracker (Alpha 0.76).
+HitBit — a combined household and business inventory tracker (Beta 0.01, closed November 16, 2026).
 
 - **HIT — Household Inventory Tracker:** household inventory (HIT List), shopping list with sale tracking, meal planner, receipt scanning, and expiry tracking.
 - **BIT — Business Inventory Tracker:** multi-business inventory with blind inventory checks ("doing the rounds"), per-business-type needs profiles, requisitions (Toronto Fire Services SOG F-SUPP workflow for TFS Station 226), POS daily-sync groundwork, and a simulation analytics tab.

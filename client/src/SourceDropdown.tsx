@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
+import { useMenuDismiss } from "./popupHooks";
 
 /**
  * The small "Source ▾" dropdown, mirroring the Shopping List tab's
@@ -8,6 +9,8 @@ import { useState } from "react";
  * hyperlink. Tapping the link opens a tiny menu with exactly "Open
  * link" and "Copy link" (with a "Copied ✓" confirmation). The URL
  * is always one recorded by the app — never guessed or built here.
+ * The dropdown follows the app's one dismissal spec: an outside
+ * tap, a scroll, or Escape closes it.
  */
 export function SourceDropdown({
   name,
@@ -26,6 +29,13 @@ export function SourceDropdown({
   const [open, setOpen] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
   const [copied, setCopied] = useState(false);
+  // One dismissal spec (Beta 0.04, audit #6): an outside tap, a
+  // scroll, or Escape closes the dropdown and its link menu.
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  useMenuDismiss(open, wrapRef, () => {
+    setOpen(false);
+    setMenuOpen(false);
+  });
 
   const copyLink = async () => {
     try {
@@ -51,7 +61,7 @@ export function SourceDropdown({
   };
 
   return (
-    <div>
+    <div ref={wrapRef}>
       <button
         type="button"
         aria-expanded={open}
@@ -60,14 +70,18 @@ export function SourceDropdown({
           setOpen((v) => !v);
           setMenuOpen(false);
         }}
-        className="inline-flex items-center gap-[3px] rounded-full px-[6px] py-[1.5px] text-[9px] font-bold"
+        className="hit24y-lg inline-flex items-center gap-[3px] rounded-full px-[6px] py-[1.25px] text-[12px] leading-none font-bold"
         style={{
           backgroundColor: "var(--surface-alt)",
           color: "var(--accent)",
           border: "1px solid var(--border)",
           // Same small size as the Shopping List tab's Source
           // toggle: overrides the global 2rem button minimum in
-          // theme.css so the toggle stays little.
+          // theme.css so the toggle stays little. The text sits
+          // at the 12px floor (audit #10) on a line-height of 1,
+          // so the pill's visual height is unchanged; the
+          // .hit24y-lg overlay (theme.css) grows the tappable
+          // height to 24.5px.
           minHeight: "16.5px",
         }}
       >

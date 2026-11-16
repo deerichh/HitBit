@@ -1,26 +1,32 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  Bar,
-  BarChart,
-  CartesianGrid,
-  Cell,
-  ReferenceLine,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
+Bar,
+BarChart,
+CartesianGrid,
+Cell,
+ResponsiveContainer,
+Tooltip,
+XAxis,
+YAxis,
 } from "recharts";
 import { fileToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
+import { AccountPolicy, ActorTag } from "./AccountPolicy";
 import {
-  BIZ_TYPES,
-  PACKS_TYPED,
-  bitNeedsProfile,
-  isFoodAndBeverageType,
-  packCategoryOptions,
-  parseManifestText,
-  type ManifestLine,
+GearButton,
+SettingsDrawer,
+SettingsDrawerItem,
+} from "./SettingsDrawer";
+import { INFO_BUTTON_STYLE, useHoldInfo } from "./popupHooks";
+import {
+BIZ_TYPES,
+PACKS_TYPED,
+bitNeedsProfile,
+isFoodAndBeverageType,
+packCategoryOptions,
+parseManifestText,
+type ManifestLine,
 } from "./bitPacks";
 
 // BIT — Business Inventory Tracker: the business side of the app,
@@ -130,6 +136,8 @@ function typeLabel(business: BitBusiness): string {
 }
 
 type BitWasteEntry = BitState["wasteLog"][number];
+type BitStockEvent = BitState["stockEvents"][number];
+type BitManifestImport = BitState["manifestImports"][number];
 
 /** A count for display: whole numbers plain, fractional counts
     (Bar / Pub tenths) with their one decimal — 0.7 stays "0.7",
@@ -228,6 +236,89 @@ function Chevron({ collapsed }: { collapsed: boolean }) {
   );
 }
 
+/**
+ * The ⓘ button of the one header spec (Beta 0.05, audit #9): it
+ * sits beside a banner's title count and its popup lists — names
+ * only, one per line — what the count counts, so the number
+ * always matches the list. HOLD-TO-SHOW, like every ⓘ in the app
+ * (see popupHooks): shown while held, gone within 2 seconds of
+ * release. Category groups don't carry one — expanding the group
+ * already shows its items; this serves banners whose counted set
+ * isn't the expanded rows (Requisition history's numbers).
+ */
+function BitInfoListButton({
+  names,
+  emptyText,
+  ariaLabel,
+}: {
+  names: string[];
+  emptyText: string;
+  ariaLabel: string;
+}) {
+  const hold = useHoldInfo();
+
+  return (
+    <span
+      data-hold-info-root=""
+      className="relative inline-flex shrink-0 items-center"
+    >
+      {hold.visible && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute top-full right-0 z-50 mt-1 rounded-lg border px-2.5 py-1.5 text-left shadow-lg"
+          style={{
+            backgroundColor: "var(--surface)",
+            color: "var(--text)",
+            borderColor: "var(--border)",
+            fontSize: 13,
+            boxShadow: "0 6px 20px rgba(0,0,0,0.22)",
+            opacity: hold.fading ? 0 : 1,
+            transition: "opacity 0.7s ease",
+          }}
+        >
+          {names.length > 0 ? (
+            names.map((name, idx) => (
+              <span
+                key={`${name}-${idx}`}
+                className="block font-semibold whitespace-nowrap"
+              >
+                {name}
+              </span>
+            ))
+          ) : (
+            <span className="block font-semibold whitespace-nowrap">
+              {emptyText}
+            </span>
+          )}
+        </span>
+      )}
+      <button
+        type="button"
+        aria-label={ariaLabel}
+        {...hold.buttonProps}
+        className="hit24 inline-flex shrink-0 items-center justify-center rounded-full leading-none"
+        style={{
+          width: 18,
+          height: 18,
+          // Overrides the global 2rem button minimum in theme.css
+          // so the button stays small and quiet beside the count.
+          // The visible box stays 18×18; the .hit24 overlay
+          // (theme.css, audit #10) grows the tappable area to
+          // 24×24 without changing the layout.
+          minHeight: 18,
+          padding: 0,
+          fontSize: 13,
+          color: "var(--dim)",
+          backgroundColor: "transparent",
+          ...INFO_BUTTON_STYLE,
+        }}
+      >
+        ⓘ
+      </button>
+    </span>
+  );
+}
+
 function TagChips({ tags }: { tags: string[] }) {
   if (tags.length === 0) return null;
   return (
@@ -262,6 +353,68 @@ function roundDate(iso: string): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+/** Whole local calendar days from a date's day to today. */
+function daysAgoFrom(d: Date): number {
+  const startOfDay = (x: Date) =>
+    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  return Math.round((startOfDay(new Date()) - startOfDay(d)) / 86_400_000);
+}
+
+/** The counted-last stamp (audit #16), in plain words with the
+    date and its relative age: "Last counted: Sat Nov 15 · today",
+    "· yesterday", "· 3 days ago" — or "Not counted yet" when
+    there is no finished count to point at. */
+function lastCountedLabel(iso: string | null): string {
+  if (!iso) return "Not counted yet";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "Not counted yet";
+  const days = daysAgoFrom(d);
+  const rel =
+    days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  const date = d.toLocaleDateString("en-CA", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  return `Last counted: ${date} · ${rel}`;
+}
+
+/** A long-form date ("November 15, 2026") for the requisition
+    state lines; "" when the stamp is missing or invalid. */
+function longDateOrEmpty(iso: string | null): string {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "";
+  return d.toLocaleDateString("en-CA", {
+    year: "numeric",
+    month: "long",
+    day: "numeric",
+  });
+}
+
+/** A requisition's state, shown plainly (audit #15): Prepared by
+    (name, date) → Approved by (name, date) → Sent (date). Parts
+    never recorded are skipped — a requisition sent before the
+    approver step existed only knows its sent date. */
+function RequisitionStateLine({ req }: { req: BitRequisition }) {
+  const parts: string[] = [];
+  if (req.preparedBy) {
+    const d = longDateOrEmpty(req.preparedAt);
+    parts.push(`Prepared by ${req.preparedBy}${d ? ` · ${d}` : ""}`);
+  }
+  if (req.approvedBy) {
+    const d = longDateOrEmpty(req.approvedAt);
+    parts.push(`Approved by ${req.approvedBy}${d ? ` · ${d}` : ""}`);
+  }
+  const sent = longDateOrEmpty(req.sentAt);
+  parts.push(sent ? `Sent ${sent}` : "Sent");
+  return (
+    <p className="text-xs font-semibold text-[var(--dim)]">
+      {parts.join(" → ")}
+    </p>
+  );
 }
 
 /**
@@ -814,12 +967,102 @@ function ManifestImport({
 // never a fixed overlay with its own scroller (the household app's
 // standing rule, learned the hard way).
 
+/** Team-size bands for the wizard's team-size step (Alpha 0.90):
+    eight presets, plus Other with manual entry. */
+const TEAM_SIZE_BANDS = [
+  "Just me",
+  "2–3",
+  "4–5",
+  "6–10",
+  "11–15",
+  "16–25",
+  "26–50",
+  "More than 50",
+];
+
+/** Extra category options used to pad a pack's category list to
+    eight presets on the wizard's categories step (Alpha 0.90),
+    mirroring the staging questionnaire. */
+const WIZARD_CATEGORY_EXTRAS = [
+  "Packaging",
+  "Cleaning & Janitorial",
+  "Equipment & Smallwares",
+  "Seasonal & Specials",
+  "Office & Admin",
+  "Merchandise",
+  "Deliveries",
+  "Repairs & Maintenance",
+];
+
+const wizChipBase =
+  "rounded-full border-2 px-4 py-2 text-sm font-bold text-left";
+const wizChipOn = {
+  backgroundColor: "var(--accent)",
+  color: "var(--accent-text)",
+  borderColor: "var(--accent)",
+} as const;
+const wizChipOff = {
+  borderColor: "var(--border)",
+  backgroundColor: "var(--surface)",
+  color: "var(--text)",
+} as const;
+
+/**
+ * The wizard's "Your setup so far" preview box (Alpha 0.90): the
+ * same label/value rows as the Review step, rendered ~30% smaller,
+ * sitting under each step's questions. Labels always show; values
+ * fill in as answers are given (team size and categories start
+ * blank — nothing is pre-picked for them).
+ */
+function BitSetupPreview({ rows }: { rows: [string, string][] }) {
+  return (
+    <div
+      className="mt-6 rounded-xl border px-3 py-2"
+      style={{
+        borderColor: "var(--border)",
+        backgroundColor: "var(--surface-alt)",
+        fontSize: "11.5px",
+        lineHeight: "16px",
+      }}
+      aria-label="Your setup so far"
+    >
+      <p className="font-bold" style={{ fontSize: "11.5px" }}>
+        Your setup so far — fills in as you answer
+      </p>
+      <table className="mt-1 w-full" style={{ fontSize: "11.5px" }}>
+        <tbody>
+          {rows.map(([label, value]) => (
+            <tr key={label}>
+              <th
+                className="py-0.5 pr-2 text-left align-top font-bold whitespace-nowrap"
+                style={{ color: "var(--dim)" }}
+              >
+                {label}
+              </th>
+              <td className="py-0.5 font-semibold">{value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 interface WizardProps {
+  /** Always null since Alpha 0.88: setup only ever creates a NEW
+      business (first run, or "Add New Business"), so the wizard
+      never prefills from — and can never overwrite — an existing
+      business. Kept as a prop so the call site states that
+      explicitly. */
   business: BitBusiness | null;
-  /** The business this setup run targets (the active business). */
+  /** Business that manifest photo scans uploaded during the
+      wizard attach to (null on first run / add mode). The items a
+      confirmed scan contributes are imported into the NEW business
+      at Finish, via the id completeBitSetup returns. */
   businessId?: number | null;
   scans: BitScan[];
-  onDone: () => void;
+  /** Called with the newly created business's id. */
+  onDone: (newBusinessId: number) => void;
   /** Null on first run (nothing to go back to). */
   onCancel: (() => void) | null;
   onDismissScan: (scan: BitScan) => void;
@@ -855,6 +1098,18 @@ function BitSetupWizard({
     business ? business.categories : [],
   );
   const [customGroup, setCustomGroup] = useState("");
+  // Team-size step (Alpha 0.90): one of the eight bands, or a
+  // custom entry typed through Other (stored exactly like a band).
+  const [teamSize, setTeamSize] = useState("");
+  const [teamOtherOpen, setTeamOtherOpen] = useState(false);
+  const [teamOtherDraft, setTeamOtherDraft] = useState("");
+  // Business-type Other entry (Alpha 0.90): a type typed through
+  // the Other… button behaves exactly like a preset — it selects
+  // the "Other" type with the typed text as its custom type, takes
+  // a ✓ chip, and shows in the preview box and on Review.
+  const [typeOtherOpen, setTypeOtherOpen] = useState(false);
+  const [typeOtherDraft, setTypeOtherDraft] = useState("");
+  const [typeCustomApplied, setTypeCustomApplied] = useState(false);
   const [wizLines, setWizLines] = useState<ManifestLine[]>([]);
   const [scanConfirm, setScanConfirm] = useState<{
     scanId: number;
@@ -867,8 +1122,13 @@ function BitSetupWizard({
 
   // The category options for this pack: ONE combined list — the
   // pack's categories and its former zones together, all presented
-  // as categories, duplicates merged.
+  // as categories, duplicates merged — padded to eight presets
+  // with the questionnaire's extra options (Alpha 0.90).
   const groupOptions = packCategoryOptions(pack);
+  for (const extra of WIZARD_CATEGORY_EXTRAS) {
+    if (groupOptions.length >= 8) break;
+    if (!groupOptions.includes(extra)) groupOptions.push(extra);
+  }
   // A starter-pack item is in scope when its category — or its
   // former zone, now treated as a category — was picked. It is
   // grouped under its category when that was picked, otherwise
@@ -888,12 +1148,31 @@ function BitSetupWizard({
 
   function pickType(t: string) {
     setBizType(t);
+    if (t !== "Other") setTypeCustomApplied(false);
     const p = PACKS_TYPED[t] ?? PACKS_TYPED["Other"];
     if (!p) return;
     setName(p.defaultName);
     // Switching type starts the category picks over: only the
     // categories the user picks for this type are stored.
     setGroups([]);
+  }
+
+  function applyTypeOther() {
+    const v = typeOtherDraft.trim();
+    if (!v) return;
+    pickType("Other");
+    setCustomType(v);
+    setTypeCustomApplied(true);
+    setTypeOtherDraft("");
+    setTypeOtherOpen(false);
+  }
+
+  function applyTeamOther() {
+    const v = teamOtherDraft.trim();
+    if (!v) return;
+    setTeamSize(v);
+    setTeamOtherDraft("");
+    setTeamOtherOpen(false);
   }
 
   function toggleGroup(g: string) {
@@ -956,12 +1235,16 @@ function BitSetupWizard({
           });
         }
       }
-      await api.completeBitSetup({
-        businessId: businessId ?? business?.id ?? null,
+      // Add-only (Alpha 0.88): completeBitSetup always creates a
+      // brand-new business and returns its id — no existing
+      // business is targeted, so nothing existing can be
+      // overwritten or wiped by finishing setup.
+      const setup = await api.completeBitSetup({
         businessType: bizType,
         customType:
           bizType === "Other" ? customType.trim() || null : null,
         name: name.trim() || pack.defaultName,
+        teamSize: teamSize.trim() ? teamSize.trim() : null,
         // The business's categories are exactly the ones picked.
         categories: groups,
         // Freezer checks are only for food & beverage businesses.
@@ -972,17 +1255,19 @@ function BitSetupWizard({
         items: merged,
       });
       if (scanConfirm) {
+        // The confirmed scan's lines belong to the NEW business
+        // this setup just created — never to an existing one.
         await api.importBitManifest({
-          businessId: businessId ?? business?.id ?? null,
+          businessId: setup.businessId,
           lines: scanConfirm.rows,
           scanId: scanConfirm.scanId,
         });
       }
-      return merged.length;
+      return setup.businessId;
     },
-    onSuccess: () => {
+    onSuccess: (newBusinessId) => {
       void queryClient.invalidateQueries({ queryKey: ["bit"] });
-      onDone();
+      onDone(newBusinessId);
     },
     onError: () =>
       setFinishError("Setup didn't save. Please try again."),
@@ -991,15 +1276,21 @@ function BitSetupWizard({
   const stepTitle = [
     "What kind of business is this for?",
     "What's the business called?",
+    "How many people are on your team?",
     "Which categories do you want?",
     "Already have an inventory list?",
     "Review your setup",
   ][step - 1];
 
+  const typeDisplay =
+    bizType === "Other" && customType.trim()
+      ? `Other — ${customType.trim()}`
+      : bizType;
+
   return (
     <section aria-label="Business setup" className="pt-2 pb-12">
       <p className="text-xs font-bold tracking-wide text-[var(--dim)]">
-        BUSINESS SETUP · STEP {step} OF 5
+        BUSINESS SETUP · STEP {step} OF 6
       </p>
       <h2 className="mt-1 text-2xl font-bold">{stepTitle}</h2>
 
@@ -1014,7 +1305,7 @@ function BitSetupWizard({
                   type="button"
                   aria-pressed={selected}
                   onClick={() => pickType(t)}
-                  className="rounded-full border px-4 py-2 text-sm font-bold"
+                  className="rounded-full border-2 px-4 py-2 text-sm font-bold"
                   style={
                     selected
                       ? {
@@ -1029,11 +1320,78 @@ function BitSetupWizard({
                         }
                   }
                 >
-                  {t}
+                  {selected ? `✓ ${t}` : t}
                 </button>
               );
             })}
+            {typeCustomApplied && customType.trim() && (
+              <button
+                type="button"
+                aria-pressed={true}
+                className={wizChipBase}
+                style={wizChipOn}
+                onClick={() => {
+                  setTypeCustomApplied(false);
+                  setCustomType("");
+                }}
+              >
+                ✓ {customType.trim()}
+              </button>
+            )}
+            <button
+              type="button"
+              aria-pressed={typeOtherOpen}
+              className={wizChipBase}
+              style={wizChipOff}
+              onClick={() => setTypeOtherOpen((v) => !v)}
+            >
+              Other…
+            </button>
           </div>
+          {typeOtherOpen && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <input
+                value={typeOtherDraft}
+                onChange={(e) => setTypeOtherDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    applyTypeOther();
+                  }
+                }}
+                placeholder="Type your own business type…"
+                aria-label="Your own business type"
+                className="min-w-0 flex-1 rounded-xl border px-3 py-2 text-base"
+                style={{
+                  borderColor: "var(--border)",
+                  backgroundColor: "var(--surface)",
+                }}
+                autoComplete="off"
+                autoFocus
+              />
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+                onClick={applyTypeOther}
+              >
+                Use this
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-3 py-2 text-sm font-bold text-[var(--dim)]"
+                onClick={() => {
+                  setTypeOtherOpen(false);
+                  setTypeOtherDraft("");
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
           {bizType === "Other" && (
             <label className="mt-3 flex flex-col gap-1 text-sm font-semibold text-[var(--dim)]">
               What kind of business is it?
@@ -1084,6 +1442,96 @@ function BitSetupWizard({
       {step === 3 && (
         <div className="mt-4">
           <p className="text-sm text-[var(--dim)]">
+            Everyone who counts, receives or orders stock — team size
+            shapes how rounds and requisitions are set up.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            {TEAM_SIZE_BANDS.map((band) => {
+              const selected = teamSize === band;
+              return (
+                <button
+                  key={band}
+                  type="button"
+                  aria-pressed={selected}
+                  className={wizChipBase}
+                  style={selected ? wizChipOn : wizChipOff}
+                  onClick={() => setTeamSize(band)}
+                >
+                  {selected ? `✓ ${band}` : band}
+                </button>
+              );
+            })}
+            {teamSize && !TEAM_SIZE_BANDS.includes(teamSize) && (
+              <button
+                type="button"
+                aria-pressed={true}
+                className={wizChipBase}
+                style={wizChipOn}
+                onClick={() => setTeamSize("")}
+              >
+                ✓ {teamSize}
+              </button>
+            )}
+            <button
+              type="button"
+              aria-pressed={teamOtherOpen}
+              className={wizChipBase}
+              style={wizChipOff}
+              onClick={() => setTeamOtherOpen((v) => !v)}
+            >
+              Other…
+            </button>
+          </div>
+          {teamOtherOpen && (
+            <div className="mt-3 flex flex-wrap gap-2">
+              <input
+                value={teamOtherDraft}
+                onChange={(e) => setTeamOtherDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    applyTeamOther();
+                  }
+                }}
+                placeholder="Type your own team size…"
+                aria-label="Your own team size"
+                className="min-w-0 flex-1 rounded-xl border px-3 py-2 text-base"
+                style={{
+                  borderColor: "var(--border)",
+                  backgroundColor: "var(--surface)",
+                }}
+                autoComplete="off"
+                autoFocus
+              />
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+                onClick={applyTeamOther}
+              >
+                Use this
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-3 py-2 text-sm font-bold text-[var(--dim)]"
+                onClick={() => {
+                  setTeamOtherOpen(false);
+                  setTeamOtherDraft("");
+                }}
+              >
+                Cancel
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {step === 4 && (
+        <div className="mt-4">
+          <p className="text-sm text-[var(--dim)]">
             Select all that apply — only the categories you pick are
             added to the business, and only items in those categories
             are included. Nothing is pre-picked.
@@ -1097,7 +1545,7 @@ function BitSetupWizard({
                   type="button"
                   aria-pressed={selected}
                   onClick={() => toggleGroup(g)}
-                  className="rounded-full border px-4 py-2 text-sm font-bold"
+                  className="rounded-full border-2 px-4 py-2 text-sm font-bold"
                   style={
                     selected
                       ? {
@@ -1112,7 +1560,7 @@ function BitSetupWizard({
                         }
                   }
                 >
-                  {g}
+                  {selected ? `✓ ${g}` : g}
                 </button>
               );
             })}
@@ -1124,14 +1572,14 @@ function BitSetupWizard({
                   type="button"
                   aria-pressed={true}
                   onClick={() => toggleGroup(g)}
-                  className="rounded-full border px-4 py-2 text-sm font-bold"
+                  className="rounded-full border-2 px-4 py-2 text-sm font-bold"
                   style={{
                     backgroundColor: "var(--accent)",
                     color: "var(--accent-text)",
                     borderColor: "var(--accent)",
                   }}
                 >
-                  {g} ✕
+                  ✓ {g} ✕
                 </button>
               ))}
           </div>
@@ -1167,7 +1615,7 @@ function BitSetupWizard({
         </div>
       )}
 
-      {step === 4 && (
+      {step === 5 && (
         <div className="mt-4">
           <p className="text-sm text-[var(--dim)]">
             Optional — import a manifest you already have and its items
@@ -1202,7 +1650,7 @@ function BitSetupWizard({
         </div>
       )}
 
-      {step === 5 && (
+      {step === 6 && (
         <div className="mt-4 flex flex-col gap-2">
           {[
             [
@@ -1212,6 +1660,7 @@ function BitSetupWizard({
                 : bizType,
             ],
             ["Business name", name.trim() || pack.defaultName],
+            ["Team size", teamSize.trim() || "Not specified"],
             [
               "Categories",
               groups.length > 0 ? groups.join(", ") : "None picked",
@@ -1268,19 +1717,25 @@ function BitSetupWizard({
               {bitNeedsProfile(bizType).note}
             </p>
           </div>
-          {business && (
-            <p className="text-sm font-semibold text-[var(--amber)]">
-              Finishing replaces the current BIT inventory with this
-              starter pack (plus any manifest lines above). Past
-              inventory checks are kept.
-            </p>
-          )}
           {finishError && (
             <p role="alert" className="text-sm font-semibold text-[var(--red)]">
               {finishError}
             </p>
           )}
         </div>
+      )}
+
+      {/* The preview box sits under the questions on every step but
+          Review — the Review summary takes its place there. */}
+      {step < 6 && (
+        <BitSetupPreview
+          rows={[
+            ["Business type", typeDisplay],
+            ["Business name", name],
+            ["Team size", teamSize],
+            ["Categories", groups.join(", ")],
+          ]}
+        />
       )}
 
       {/* In-flow step navigation — directly under the step's options. */}
@@ -1311,7 +1766,7 @@ function BitSetupWizard({
             Cancel
           </button>
         )}
-        {step < 5 ? (
+        {step < 6 ? (
           <>
             <button
               type="button"
@@ -1324,11 +1779,11 @@ function BitSetupWizard({
             >
               Continue
             </button>
-            {step === 4 && (
+            {step === 5 && (
               <button
                 type="button"
                 className="rounded-full px-4 py-2 text-sm font-bold text-[var(--dim)]"
-                onClick={() => setStep(5)}
+                onClick={() => setStep(6)}
               >
                 Skip
               </button>
@@ -1353,6 +1808,663 @@ function BitSetupWizard({
   );
 }
 
+// ---- Par editor (Alpha 0.79) -----------------------------------------
+// The one par (threshold) editor, shared by the Inventory Checks
+// Finish summary and the Inventory tab: a number field prefilled
+// with the item's current par, saved through setBitItemPar. When
+// a counted value is passed (the Finish summary), a one-tap
+// "Par = counted" shortcut sets par to that count. Par is a whole
+// number ≥ 0; 0 means no threshold set.
+
+function ParEditor({
+  itemId,
+  itemName,
+  par,
+  countedValue,
+  shortcutLabel = "Par = counted",
+}: {
+  itemId: number;
+  itemName: string;
+  par: number;
+  countedValue?: number;
+  shortcutLabel?: string;
+}) {
+  const queryClient = useQueryClient();
+  const [text, setText] = useState(String(par));
+  const [dirty, setDirty] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  // Keep the field in step with the stored par (e.g. after a
+  // save refetches) — but never overwrite what the user is typing.
+  useEffect(() => {
+    if (!dirty) setText(String(par));
+  }, [par, dirty]);
+
+  const save = useMutation({
+    mutationFn: async (value: number) =>
+      await api.setBitItemPar({ itemId, par: value }),
+    onSuccess: () => {
+      setDirty(false);
+      setSaved(true);
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+      void queryClient.invalidateQueries({ queryKey: ["bit-trends"] });
+    },
+  });
+
+  const parsed = Math.floor(Number(text));
+  const valid =
+    text.trim() !== "" && Number.isFinite(parsed) && parsed >= 0;
+  const shortcutPar =
+    countedValue != null ? Math.max(0, Math.ceil(countedValue)) : null;
+
+  return (
+    <span className="inline-flex flex-wrap items-center gap-1.5">
+      <label
+        className="text-xs font-semibold text-[var(--dim)]"
+        htmlFor={`par-input-${itemId}`}
+      >
+        Par
+      </label>
+      <input
+        id={`par-input-${itemId}`}
+        type="number"
+        min={0}
+        step={1}
+        inputMode="numeric"
+        aria-label={`Par level for ${itemName}`}
+        value={text}
+        onChange={(e) => {
+          setText(e.target.value);
+          setDirty(true);
+          setSaved(false);
+        }}
+        className="w-16 rounded-lg border px-2 py-1 text-center text-sm font-bold"
+        style={{
+          borderColor: "var(--border)",
+          backgroundColor: "var(--surface)",
+        }}
+      />
+      <button
+        type="button"
+        className="rounded-full px-3 py-1 text-xs font-bold"
+        style={{
+          backgroundColor: "var(--accent)",
+          color: "var(--accent-text)",
+          opacity: !dirty || !valid || save.isPending ? 0.5 : 1,
+        }}
+        disabled={!dirty || !valid || save.isPending}
+        onClick={() => save.mutate(parsed)}
+      >
+        {save.isPending ? "Saving…" : "Save par"}
+      </button>
+      {shortcutPar != null && (
+        <button
+          type="button"
+          className="rounded-full px-3 py-1 text-xs font-bold"
+          style={{ backgroundColor: "var(--surface-alt)" }}
+          disabled={save.isPending}
+          onClick={() => {
+            setText(String(shortcutPar));
+            save.mutate(shortcutPar);
+          }}
+        >
+          {shortcutLabel} ({fmtCount(countedValue ?? 0)})
+        </button>
+      )}
+      {saved && !dirty && (
+        <span
+          className="text-xs font-bold"
+          style={{ color: "var(--ok-text)" }}
+        >
+          Saved ✓
+        </span>
+      )}
+      {save.isError && (
+        <span className="text-xs font-bold text-[var(--red)]">
+          Didn't save — try again.
+        </span>
+      )}
+    </span>
+  );
+}
+
+// ---- Variance follow-through (Alpha 0.82) ----------------------------
+// On the Finish summary, every variance gets a one-tap reason
+// picker (Used / Damaged / Expired / Missing / Counting error)
+// that writes straight onto the item's snapshot for the round —
+// prompted, never blocking. A large variance (|counted − book|
+// ≥ 5 units or ≥ 25% of book) also offers the one blind recount
+// allowed per item per round: the book value and the first count
+// stay hidden while recounting, and submitting replaces the
+// counted value everywhere the round recorded it. Alpha 0.83:
+// "hidden" is enforced across the whole summary — while a recount
+// is open, the parent masks that item's figures in its variance
+// header and in the counted-items list (including the ParEditor's
+// "Par = counted" shortcut label, which prints the counted value).
+
+const VARIANCE_REASONS = [
+  "Used",
+  "Damaged",
+  "Expired",
+  "Missing",
+  "Counting error",
+] as const;
+
+function isLargeVariance(book: number, counted: number): boolean {
+  const diff = Math.abs(counted - book);
+  return diff >= 5 || (book > 0 && diff >= book * 0.25);
+}
+
+type SummaryCountedItem = RoundSummary["countedItems"][number];
+
+function VarianceFollowUp({
+  item,
+  fractional,
+  recountOpen,
+  onRecountOpenChange,
+  onReasonSaved,
+  onRecounted,
+}: {
+  item: SummaryCountedItem;
+  fractional: boolean;
+  // The open/closed state lives in the summary's parent (Alpha
+  // 0.83): while a recount is open, the parent masks this item's
+  // book and first counted values everywhere else on the summary
+  // — the variance header and the counted-items list — so the
+  // recount is genuinely blind.
+  recountOpen: boolean;
+  onRecountOpenChange: (open: boolean) => void;
+  onReasonSaved: (reason: string | null) => void;
+  onRecounted: (
+    newCounted: number,
+    variances: RoundSummary["variances"],
+    belowPar: RoundSummary["belowPar"],
+  ) => void;
+}) {
+  const queryClient = useQueryClient();
+  const [recountText, setRecountText] = useState("");
+  const [recountError, setRecountError] = useState<string | null>(null);
+
+  const saveReason = useMutation({
+    mutationFn: async (reason: string | null) =>
+      await api.setBitVarianceReason({
+        snapshotId: item.snapshotId,
+        reason: reason as
+          | "Used"
+          | "Damaged"
+          | "Expired"
+          | "Missing"
+          | "Counting error"
+          | null,
+      }),
+    onSuccess: (res, reason) => {
+      if (res.ok) {
+        onReasonSaved(reason);
+        void queryClient.invalidateQueries({ queryKey: ["bit-trends"] });
+      }
+    },
+  });
+
+  const submitRecount = useMutation({
+    mutationFn: async (counted: number) =>
+      await api.recountBitItem({ snapshotId: item.snapshotId, counted }),
+    onSuccess: (res) => {
+      if (!res.ok || res.counted == null) {
+        setRecountError(res.error ?? "The recount didn't save.");
+        return;
+      }
+      onRecountOpenChange(false);
+      setRecountText("");
+      setRecountError(null);
+      onRecounted(res.counted, res.variances, res.belowPar);
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+      void queryClient.invalidateQueries({ queryKey: ["bit-trends"] });
+    },
+    onError: () => setRecountError("The recount didn't save. Try again."),
+  });
+
+  const recountValue = Number(recountText);
+  const recountValid =
+    recountText.trim() !== "" &&
+    Number.isFinite(recountValue) &&
+    recountValue >= 0;
+  const large = isLargeVariance(item.book, item.counted);
+
+  return (
+    <div className="mt-1 flex flex-col gap-1.5">
+      <div
+        className="flex flex-wrap items-center gap-1"
+        role="group"
+        aria-label={`Reason for the ${item.name} variance`}
+      >
+        <span className="text-xs font-semibold text-[var(--dim)]">
+          Why?
+        </span>
+        {VARIANCE_REASONS.map((r) => {
+          const selected = item.varianceReason === r;
+          return (
+            <button
+              key={r}
+              type="button"
+              aria-pressed={selected}
+              disabled={saveReason.isPending}
+              onClick={() => saveReason.mutate(selected ? null : r)}
+              className="rounded-full border px-2.5 py-1 text-xs font-bold"
+              style={
+                selected
+                  ? {
+                      backgroundColor: "var(--accent)",
+                      color: "var(--accent-text)",
+                      borderColor: "var(--accent)",
+                    }
+                  : {
+                      borderColor: "var(--border)",
+                      backgroundColor: "var(--surface)",
+                      color: "var(--text)",
+                    }
+              }
+            >
+              {r}
+            </button>
+          );
+        })}
+        {saveReason.isPending && (
+          <span className="text-xs text-[var(--dim)]">Saving…</span>
+        )}
+        {saveReason.isError && (
+          <span className="text-xs font-bold text-[var(--red)]">
+            Didn't save — try again.
+          </span>
+        )}
+      </div>
+      {item.recounted ? (
+        <p className="text-xs font-semibold text-[var(--dim)]">
+          Recounted ✓ — the recount is this item's count for the check.
+        </p>
+      ) : (
+        large &&
+        !recountOpen && (
+          <div>
+            <button
+              type="button"
+              onClick={() => {
+                onRecountOpenChange(true);
+                setRecountError(null);
+              }}
+              className="rounded-full px-3 py-1 text-xs font-bold"
+              style={{
+                backgroundColor: "var(--amber-soft)",
+                color: "var(--amber)",
+              }}
+            >
+              ⚠ Big difference — recount {item.name}
+            </button>
+          </div>
+        )
+      )}
+      {recountOpen && !item.recounted && (
+        <div
+          className="rounded-lg border p-2"
+          style={{
+            borderColor: "var(--amber)",
+            backgroundColor: "var(--surface)",
+          }}
+        >
+          <label
+            className="flex flex-col gap-1 text-xs font-semibold text-[var(--dim)]"
+            htmlFor={`recount-input-${item.snapshotId}`}
+          >
+            Blind recount — count {item.name} again and enter it here.
+            The book count and your first count stay hidden; one
+            recount per item per check.
+            <span className="flex items-center gap-2">
+              <input
+                id={`recount-input-${item.snapshotId}`}
+                type="number"
+                min={0}
+                step={fractional ? 0.1 : 1}
+                inputMode="decimal"
+                aria-label={`Blind recount for ${item.name}`}
+                value={recountText}
+                onChange={(e) => setRecountText(e.target.value)}
+                className="w-24 rounded-lg border px-2 py-1.5 text-center text-sm font-bold text-[var(--text)]"
+                style={{
+                  borderColor: "var(--border)",
+                  backgroundColor: "var(--surface)",
+                }}
+              />
+              <button
+                type="button"
+                className="rounded-full px-3 py-1.5 text-xs font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                  opacity:
+                    !recountValid || submitRecount.isPending ? 0.5 : 1,
+                }}
+                disabled={!recountValid || submitRecount.isPending}
+                onClick={() => submitRecount.mutate(recountValue)}
+              >
+                {submitRecount.isPending ? "Saving…" : "Save recount"}
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-3 py-1.5 text-xs font-bold"
+                style={{ backgroundColor: "var(--surface-alt)" }}
+                onClick={() => onRecountOpenChange(false)}
+              >
+                Cancel
+              </button>
+            </span>
+          </label>
+          {recountError && (
+            <p role="alert" className="mt-1 text-xs font-bold text-[var(--red)]">
+              {recountError}
+            </p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---- Trends view (Alpha 0.79) -----------------------------------------
+// Reached from the Inventory Checks tab. Everything shown comes
+// from getBitTrends: the per-item snapshots finishBitRound has
+// written since Alpha 0.79 plus the stock events logged outside
+// checks. Until the first check is finished there is no history,
+// and the view says so honestly — nothing is backfilled.
+
+type BitTrends = ApiResponse<typeof api, "getBitTrends">;
+
+function TrendsView({
+  business,
+  onBack,
+}: {
+  business: BitBusiness;
+  onBack: () => void;
+}) {
+  const trends = useQuery({
+    queryKey: ["bit-trends", business.id],
+    queryFn: async () =>
+      await api.getBitTrends({ businessId: business.id }),
+  });
+  const data: BitTrends | undefined = trends.data;
+  const withUsage = (data?.items ?? []).filter((i) => i.intervals > 0);
+  const suggestions = (data?.items ?? []).filter(
+    (i) => i.suggestedPar != null && i.suggestedPar !== i.currentPar,
+  );
+  // Running low watchlist (Alpha 0.84): every item getBitTrends
+  // could honestly forecast, soonest run-out first.
+  const runningLow = (data?.items ?? [])
+    .flatMap((i) => (i.forecast ? [{ name: i.name, ...i.forecast }] : []))
+    .sort((a, b) => a.daysOfCover - b.daysOfCover);
+
+  return (
+    <div className="flex flex-col gap-2 pt-2">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-lg font-bold">Trends</h3>
+        <button
+          type="button"
+          onClick={onBack}
+          className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
+          style={{
+            backgroundColor: "var(--surface-alt)",
+            color: "var(--text)",
+          }}
+        >
+          ← Back to checks
+        </button>
+      </div>
+
+      {trends.isPending && (
+        <p className="py-4 text-center text-sm text-[var(--dim)]">
+          Loading trends…
+        </p>
+      )}
+      {trends.isError && (
+        <p role="alert" className="text-sm font-semibold text-[var(--red)]">
+          Trends couldn't load. Please try again.
+        </p>
+      )}
+      {data && !data.hasHistory && (
+        <div
+          className="rounded-xl border p-4 text-center"
+          style={{
+            borderColor: "var(--border)",
+            backgroundColor: "var(--surface)",
+          }}
+        >
+          <p className="text-base font-bold">No count history yet</p>
+          <p className="mt-1 text-sm text-[var(--dim)]">
+            Trends build from your finished inventory checks — finish
+            a check and counts over time, usage between checks, and
+            running-low forecasts start appearing here.
+          </p>
+        </div>
+      )}
+
+      {data && data.hasHistory && (
+        <>
+          {(runningLow.length > 0 || data.notEnoughHistory > 0) && (
+            <section
+              aria-label="Running low"
+              className="rounded-xl border p-3"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface)",
+              }}
+            >
+              <h4 className="text-base font-bold">Running low</h4>
+              <p className="text-xs text-[var(--dim)]">
+                Stockout forecasts from your count history: on-hand ÷
+                average daily usage between checks.
+              </p>
+              {runningLow.length > 0 && (
+                <ul className="mt-1 flex flex-col gap-1 text-sm">
+                  {runningLow.map((r) => (
+                    <li
+                      key={r.name}
+                      className="flex items-baseline justify-between gap-2"
+                    >
+                      <span className="min-w-0">{r.name}</span>
+                      <span className="shrink-0 text-right">
+                        <span className="font-semibold">
+                          {r.daysOfCover.toFixed(1)} days of cover
+                        </span>
+                        <span className="block text-xs font-normal text-[var(--dim)]">
+                          {fmtCount(r.onHand)} on hand ·{" "}
+                          {fmtCount(r.avgDailyUsage)}/day · runs out{" "}
+                          {formatExpiryDate(r.runOutDate)}
+                        </span>
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              {data.notEnoughHistory > 0 && (
+                <p className="mt-1 text-xs text-[var(--dim)]">
+                  {data.notEnoughHistory} item
+                  {data.notEnoughHistory === 1
+                    ? " doesn't"
+                    : "s don't"}{" "}
+                  have enough count history yet to forecast.
+                </p>
+              )}
+            </section>
+          )}
+
+          <section
+            aria-label="Counts over time"
+            className="rounded-xl border p-3"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+          >
+            <h4 className="text-base font-bold">Counts over time</h4>
+            <div className="mt-1 flex flex-col">
+              {data.items.map((it) => (
+                <div
+                  key={it.name}
+                  className="border-b py-2 last:border-b-0"
+                  style={{ borderColor: "var(--border)" }}
+                >
+                  <p className="text-sm font-semibold">
+                    {it.name}
+                    <span className="font-normal text-[var(--dim)]">
+                      {" "}
+                      · {it.category} · par {it.currentPar}
+                    </span>
+                  </p>
+                  <p className="text-xs text-[var(--dim)]">
+                    {it.checks
+                      .map(
+                        (c) =>
+                          `${roundDate(c.at)}: ${fmtCount(c.counted)}`,
+                      )
+                      .join(" · ")}
+                  </p>
+                  <p className="text-xs text-[var(--dim)]">
+                    {it.varianceCount > 0
+                      ? `Varied from book in ${it.varianceCount} of ${it.checks.length} check${it.checks.length === 1 ? "" : "s"}`
+                      : "Matched book every check"}
+                    {it.belowParCount > 0
+                      ? ` · at or below par in ${it.belowParCount} check${it.belowParCount === 1 ? "" : "s"}`
+                      : ""}
+                  </p>
+                </div>
+              ))}
+            </div>
+          </section>
+
+          {withUsage.length > 0 && (
+            <section
+              aria-label="Usage between checks"
+              className="rounded-xl border p-3"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface)",
+              }}
+            >
+              <h4 className="text-base font-bold">Usage between checks</h4>
+              <p className="text-xs text-[var(--dim)]">
+                Previous count + stock received − next count, from the
+                checks and receipts on record.
+              </p>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm">
+                {withUsage.map((it) => (
+                  <li key={it.name} className="flex justify-between gap-2">
+                    <span className="min-w-0">{it.name}</span>
+                    <span className="shrink-0 font-semibold">
+                      {fmtCount(it.usageTotal)} used over {it.intervals}{" "}
+                      interval{it.intervals === 1 ? "" : "s"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {data.repeatVariances.length > 0 && (
+            <section
+              aria-label="Repeated variances"
+              className="rounded-xl border p-3"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface)",
+              }}
+            >
+              <h4 className="text-base font-bold">Repeated variances</h4>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm">
+                {data.repeatVariances.map((r) => (
+                  <li key={r.name}>
+                    <div className="flex justify-between gap-2">
+                      <span className="min-w-0">{r.name}</span>
+                      <span className="shrink-0 font-semibold">
+                        differed from book {r.varianceCount} times
+                      </span>
+                    </div>
+                    {r.reasons.length > 0 && (
+                      <p className="text-xs text-[var(--dim)]">
+                        Reasons recorded:{" "}
+                        {r.reasons
+                          .map(
+                            (x) =>
+                              `${x.reason}${x.count > 1 ? ` ×${x.count}` : ""}`,
+                          )
+                          .join(", ")}
+                      </p>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {data.mostBelowPar.length > 0 && (
+            <section
+              aria-label="Most often at or below par"
+              className="rounded-xl border p-3"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface)",
+              }}
+            >
+              <h4 className="text-base font-bold">
+                Most often at or below par
+              </h4>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm">
+                {data.mostBelowPar.map((r) => (
+                  <li key={r.name} className="flex justify-between gap-2">
+                    <span className="min-w-0">{r.name}</span>
+                    <span className="shrink-0 font-semibold">
+                      at/below par in {r.belowParCount} check
+                      {r.belowParCount === 1 ? "" : "s"}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+
+          {suggestions.length > 0 && (
+            <section
+              aria-label="Par suggestions"
+              className="rounded-xl border p-3"
+              style={{
+                borderColor: "var(--amber)",
+                backgroundColor: "var(--surface)",
+              }}
+            >
+              <h4 className="text-base font-bold">
+                Par suggestions — suggestions only
+              </h4>
+              <p className="text-xs text-[var(--dim)]">
+                Based on the heaviest usage seen between two checks.
+                Nothing is changed automatically — set a par from a
+                check's Finish summary or the Inventory tab when a
+                suggestion looks right.
+              </p>
+              <ul className="mt-1 flex flex-col gap-0.5 text-sm">
+                {suggestions.map((it) => (
+                  <li key={it.name} className="flex justify-between gap-2">
+                    <span className="min-w-0">{it.name}</span>
+                    <span className="shrink-0 font-semibold">
+                      suggested par {it.suggestedPar} (currently{" "}
+                      {it.currentPar})
+                    </span>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ---- Inventory Checks tab (formerly Rounds) --------------------------
 
 function RoundsTab({
@@ -1366,6 +2478,13 @@ function RoundsTab({
 }) {
   const queryClient = useQueryClient();
   const [counterName, setCounterName] = useState("");
+  // TFS (the requisition business) counts by shift, not by name
+  // (Alpha 0.80): the round's counter identity is the platoon
+  // letter, defaulting to A. Other businesses keep the name field.
+  const isTfs = business.usesRequisition;
+  const [shift, setShift] = useState("A");
+  const [summaryShift, setSummaryShift] = useState<string | null>(null);
+  const counterMissing = !isTfs && counterName.trim() === "";
   const [groupFilter, setGroupFilter] = useState("");
   const [counts, setCounts] = useState<Record<number, number>>({});
   const [editing, setEditing] = useState<{ id: number; text: string } | null>(
@@ -1374,7 +2493,25 @@ function RoundsTab({
   const [remainingOnly, setRemainingOnly] = useState(false);
   const [temps, setTemps] = useState<Record<string, string>>({});
   const [summary, setSummary] = useState<RoundSummary | null>(null);
+  // Alpha 0.83: which summary item (if any) has its blind recount
+  // open. While set, that item's book and first counted values are
+  // masked everywhere on the summary so the recount stays blind.
+  const [recountOpenItemId, setRecountOpenItemId] = useState<
+    number | null
+  >(null);
   const [finishError, setFinishError] = useState<string | null>(null);
+  const [showTrends, setShowTrends] = useState(false);
+  // Cycle-count scheduling (Alpha 0.85): the server's "This
+  // week's count" proposal (getBitWeeklyCount), and — once the
+  // counter starts it — the exact proposed item set the open
+  // check is scoped to. Null = a normal full/category check.
+  const weekly = useQuery({
+    queryKey: ["bit-weekly", business.id],
+    queryFn: async () =>
+      await api.getBitWeeklyCount({ businessId: business.id }),
+  });
+  const [weeklyIds, setWeeklyIds] = useState<number[] | null>(null);
+  const weeklySet = weeklyIds ? new Set(weeklyIds) : null;
 
   // The check runs by category: only the categories chosen in the
   // setup questionnaire (plus any added later with Add Category)
@@ -1393,9 +2530,13 @@ function RoundsTab({
   const groupItems = items.filter((it) =>
     bizGroups.includes(groupOf(it)),
   );
-  const scope = groupFilter
-    ? groupItems.filter((it) => groupOf(it) === groupFilter)
-    : groupItems;
+  // A weekly cycle-count check (Alpha 0.85) is scoped to exactly
+  // its proposed set instead of the category filter.
+  const scope = weeklySet
+    ? items.filter((it) => weeklySet.has(it.id))
+    : groupFilter
+      ? groupItems.filter((it) => groupOf(it) === groupFilter)
+      : groupItems;
   const countedCount = scope.filter((it) => counts[it.id] != null).length;
   const visible = remainingOnly
     ? scope.filter((it) => counts[it.id] == null)
@@ -1406,10 +2547,17 @@ function RoundsTab({
     mutationFn: async () =>
       await api.finishBitRound({
         businessId: business.id,
-        counterName: counterName.trim(),
+        // TFS rounds store the shift letter as the counter
+        // identity; every other business stores the counter's name.
+        counterName: isTfs ? shift : counterName.trim(),
         // The filter names one of the business's categories; the
-        // server scopes the check to that category.
-        zoneFilter: groupFilter || null,
+        // server scopes the check to that category. A weekly
+        // cycle-count check (Alpha 0.85) instead sends its exact
+        // proposed item set, and the server scopes to that.
+        zoneFilter: weeklyIds
+          ? "This week's count"
+          : groupFilter || null,
+        itemIds: weeklyIds,
         counts: Object.entries(counts)
           .filter(([id]) =>
             scope.some((it) => it.id === Number(id)),
@@ -1428,10 +2576,16 @@ function RoundsTab({
       }),
     onSuccess: (res) => {
       setSummary(res);
+      setSummaryShift(isTfs ? shift : null);
+      setRecountOpenItemId(null);
       setCounts({});
       setTemps({});
       setFinishError(null);
+      // A finished weekly check clears the weekly scope; the
+      // snapshots it just wrote move the proposal forward.
+      setWeeklyIds(null);
       void queryClient.invalidateQueries({ queryKey: ["bit"] });
+      void queryClient.invalidateQueries({ queryKey: ["bit-weekly"] });
     },
     onError: () =>
       setFinishError("The check didn't save. Please try again."),
@@ -1454,15 +2608,205 @@ function RoundsTab({
     setEditing(null);
   }
 
+  if (showTrends) {
+    return (
+      <TrendsView business={business} onBack={() => setShowTrends(false)} />
+    );
+  }
+
+  // Variance follow-through (Alpha 0.82): a reason saved from the
+  // summary, or a submitted blind recount, updates the summary in
+  // place so the nudge count, the variance list and the counted
+  // items all reflect the round's new state.
+  const applyReason = (itemId: number, reason: string | null) => {
+    setSummary((s) =>
+      s
+        ? {
+            ...s,
+            countedItems: s.countedItems.map((ci) =>
+              ci.itemId === itemId ? { ...ci, varianceReason: reason } : ci,
+            ),
+          }
+        : s,
+    );
+  };
+  const applyRecount = (
+    itemId: number,
+    newCounted: number,
+    variances: RoundSummary["variances"],
+    belowPar: RoundSummary["belowPar"],
+  ) => {
+    setSummary((s) =>
+      s
+        ? {
+            ...s,
+            variances,
+            belowPar,
+            countedItems: s.countedItems.map((ci) =>
+              ci.itemId === itemId
+                ? {
+                    ...ci,
+                    counted: newCounted,
+                    recounted: true,
+                    varianceReason: null,
+                  }
+                : ci,
+            ),
+          }
+        : s,
+    );
+  };
+  const unreasonedVariances = summary
+    ? summary.countedItems.filter(
+        (ci) => ci.counted !== ci.book && !ci.varianceReason,
+      ).length
+    : 0;
+
+  // The Finish summary's counted items, grouped by category for
+  // the par editors (Alpha 0.79).
+  const countedGroups: {
+    category: string;
+    items: RoundSummary["countedItems"];
+  }[] = [];
+  if (summary) {
+    const byCat = new Map<string, RoundSummary["countedItems"]>();
+    for (const ci of summary.countedItems) {
+      const list = byCat.get(ci.category);
+      if (list) list.push(ci);
+      else byCat.set(ci.category, [ci]);
+    }
+    for (const [category, list] of byCat)
+      countedGroups.push({ category, items: list });
+  }
+
   return (
     <div className="flex flex-col gap-2 pt-2">
-      {business.usesRequisition && (
-        <p
-          className="text-sm font-bold tracking-wide"
-          style={{ color: "var(--accent)" }}
+      {/* Counted-last stamp (audit #16): the business's most
+          recent finished check round — "Not counted yet" until
+          the first real check is finished. */}
+      <p className="text-sm font-semibold text-[var(--dim)]">
+        {lastCountedLabel(rounds[0]?.createdAt ?? null)}
+      </p>
+      <div className="flex items-center justify-between gap-2">
+        {business.usesRequisition ? (
+          <p
+            className="text-sm font-bold tracking-wide"
+            style={{ color: "var(--accent)" }}
+          >
+            Fire Station Supply Inventory
+          </p>
+        ) : (
+          <span />
+        )}
+        <button
+          type="button"
+          onClick={() => setShowTrends(true)}
+          className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
+          style={{
+            backgroundColor: "var(--surface-alt)",
+            color: "var(--text)",
+          }}
         >
-          Fire Station Supply Inventory
-        </p>
+          📈 Trends
+        </button>
+      </div>
+      <p className="text-xs text-[var(--dim)]">
+        Par levels (your reorder thresholds) are set on the Finish
+        summary after a check and in the Inventory tab — counting
+        itself stays blind.
+      </p>
+      {!weeklyIds && (
+        <div
+          className="rounded-xl border p-3"
+          style={{
+            borderColor: "var(--border)",
+            backgroundColor: "var(--surface)",
+          }}
+        >
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-base font-bold">This week's count</h3>
+            {weekly.data && weekly.data.due.length > 0 && (
+              <span className="text-sm font-bold">
+                {weekly.data.due.length} due
+              </span>
+            )}
+          </div>
+          <p className="mt-0.5 text-xs text-[var(--dim)]">
+            Cycle counting: busy or problem items (A) are due
+            weekly, items with some activity (B) every 4 weeks,
+            and quiet items (C) every 12 weeks — so a big
+            inventory gets counted in small weekly sets instead
+            of all at once.
+          </p>
+          {weekly.isPending && (
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              Working out this week's count…
+            </p>
+          )}
+          {weekly.isError && (
+            <p
+              role="alert"
+              className="mt-2 text-sm font-semibold text-[var(--red)]"
+            >
+              This week's count couldn't load. Please try again.
+            </p>
+          )}
+          {weekly.data && weekly.data.due.length === 0 && (
+            <p className="mt-2 text-sm font-semibold">
+              Nothing due this week
+            </p>
+          )}
+          {weekly.data && weekly.data.due.length > 0 && (
+            <>
+              <ul className="mt-2 flex flex-col">
+                {weekly.data.due.slice(0, 40).map((d) => (
+                  <li
+                    key={d.itemId}
+                    className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5 border-b py-1.5 last:border-b-0"
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <span className="min-w-0 text-sm font-semibold">
+                      {d.name}
+                    </span>
+                    <span className="shrink-0 text-xs text-[var(--dim)]">
+                      {d.neverCounted
+                        ? `${d.cls} · ${d.intervalLabel} · due — never counted`
+                        : `${d.cls} · ${d.intervalLabel}, last counted ${d.daysSinceLastCount} ${d.daysSinceLastCount === 1 ? "day" : "days"} ago`}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {weekly.data.due.length > 40 && (
+                <p className="mt-1 text-xs text-[var(--dim)]">
+                  …and {weekly.data.due.length - 40} more due this
+                  week — all of them are in the count when you
+                  start it.
+                </p>
+              )}
+              <button
+                type="button"
+                className="mt-3 rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+                onClick={() => {
+                  setWeeklyIds(
+                    (weekly.data?.due ?? []).map((d) => d.itemId),
+                  );
+                  setGroupFilter("");
+                  setCounts({});
+                  setSummary(null);
+                  setSummaryShift(null);
+                  setRemainingOnly(false);
+                  setFinishError(null);
+                }}
+              >
+                Start this week's count
+              </button>
+            </>
+          )}
+        </div>
       )}
       {summary && (
         <div
@@ -1475,8 +2819,9 @@ function RoundsTab({
         >
           <h3 className="text-lg font-bold">Inventory check finished</h3>
           <p className="text-sm text-[var(--dim)]">
-            Counted {summary.counted} of {summary.total} · counts written
-            back to the inventory.
+            Counted {summary.counted} of {summary.total}
+            {summaryShift ? ` · Shift ${summaryShift}` : ""} · counts
+            written back to the inventory.
           </p>
           {showFreezerCheck && summary.freezerReadings.some((f) => f.alert) && (
             <p
@@ -1500,33 +2845,147 @@ function RoundsTab({
               <p className="text-sm font-bold">
                 Variances ({summary.variances.length})
               </p>
-              <ul className="mt-1 flex flex-col gap-0.5 text-sm">
-                {summary.variances.map((v) => (
-                  <li key={v.item} className="flex justify-between gap-2">
-                    <span className="min-w-0">{v.item}</span>
-                    <span className="shrink-0 font-semibold">
-                      book {fmtCount(v.book)} → counted{" "}
-                      {fmtCount(v.counted)}{" "}
-                      <span
-                        style={{
-                          color:
-                            v.counted - v.book < 0
-                              ? "var(--red)"
-                              : "var(--ok-text)",
-                        }}
-                      >
-                        ({v.counted - v.book > 0 ? "+" : ""}
-                        {fmtCount(v.counted - v.book)})
-                      </span>
-                    </span>
-                  </li>
-                ))}
+              {unreasonedVariances > 0 && (
+                <p
+                  className="mt-0.5 text-xs font-semibold"
+                  style={{ color: "var(--amber)" }}
+                >
+                  {unreasonedVariances} variance
+                  {unreasonedVariances === 1 ? "" : "s"} without a
+                  reason — tap one below if you know it. Optional;
+                  nothing is blocked either way.
+                </p>
+              )}
+              <ul className="mt-1 flex flex-col gap-1 text-sm">
+                {summary.variances.map((v) => {
+                  const ci = summary.countedItems.find(
+                    (c) => c.name === v.item,
+                  );
+                  // Alpha 0.83: while this item's blind recount is
+                  // open, its book and first counted values are
+                  // masked here (and in the counted-items list
+                  // below) so neither number is on screen.
+                  const recounting =
+                    ci != null && recountOpenItemId === ci.itemId;
+                  return (
+                    <li
+                      key={v.item}
+                      className="border-b pb-1.5 last:border-b-0"
+                      style={{ borderColor: "var(--border)" }}
+                    >
+                      <div className="flex flex-wrap justify-between gap-2">
+                        <span className="min-w-0">{v.item}</span>
+                        {recounting ? (
+                          <span className="shrink-0 font-semibold text-[var(--dim)]">
+                            variance — counts hidden during recount
+                          </span>
+                        ) : (
+                          <span className="shrink-0 font-semibold">
+                            book {fmtCount(v.book)} → counted{" "}
+                            {fmtCount(v.counted)}{" "}
+                            <span
+                              style={{
+                                color:
+                                  v.counted - v.book < 0
+                                    ? "var(--red)"
+                                    : "var(--ok-text)",
+                              }}
+                            >
+                              ({v.counted - v.book > 0 ? "+" : ""}
+                              {fmtCount(v.counted - v.book)})
+                            </span>
+                          </span>
+                        )}
+                      </div>
+                      {ci && (
+                        <VarianceFollowUp
+                          item={ci}
+                          fractional={fractional}
+                          recountOpen={recounting}
+                          onRecountOpenChange={(open) =>
+                            setRecountOpenItemId(open ? ci.itemId : null)
+                          }
+                          onReasonSaved={(reason) =>
+                            applyReason(ci.itemId, reason)
+                          }
+                          onRecounted={(newCounted, variances, belowPar) =>
+                            applyRecount(
+                              ci.itemId,
+                              newCounted,
+                              variances,
+                              belowPar,
+                            )
+                          }
+                        />
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             </div>
           ) : (
             <p className="mt-2 text-sm">
               No variances — every count matched the book count.
             </p>
+          )}
+          {summary.countedItems.length > 0 && (
+            <div className="mt-3">
+              <p className="text-sm font-bold">
+                Set par levels for this check
+              </p>
+              <p className="text-xs text-[var(--dim)]">
+                Par is the threshold that puts an item on the{" "}
+                {business.usesRequisition ? "Requisition" : "Order Email"}{" "}
+                build when a count lands at or below it. Set them here,
+                with the real counts in front of you.
+              </p>
+              {countedGroups.map((g) => (
+                <div key={g.category} className="mt-2">
+                  <p
+                    className="text-xs font-bold tracking-wide"
+                    style={{ color: "var(--accent)" }}
+                  >
+                    {g.category}
+                  </p>
+                  <div className="flex flex-col">
+                    {g.items.map((ci) => {
+                      // Alpha 0.83: while this item's blind recount
+                      // is open above, hide its book/counted figures
+                      // here too, and drop the "Par = counted"
+                      // shortcut, whose label prints the counted
+                      // value.
+                      const recounting = recountOpenItemId === ci.itemId;
+                      return (
+                        <div
+                          key={ci.itemId}
+                          className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b py-1.5 last:border-b-0"
+                          style={{ borderColor: "var(--border)" }}
+                        >
+                          <div className="min-w-40 flex-1">
+                            <p className="text-sm font-semibold leading-tight">
+                              {ci.name}
+                            </p>
+                            <p className="text-xs text-[var(--dim)]">
+                              {recounting
+                                ? "counts hidden during recount"
+                                : `book ${fmtCount(ci.book)} → counted ${fmtCount(ci.counted)}`}
+                            </p>
+                          </div>
+                          <ParEditor
+                            itemId={ci.itemId}
+                            itemName={ci.name}
+                            par={ci.par}
+                            countedValue={
+                              recounting ? undefined : ci.counted
+                            }
+                          />
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
           {summary.belowPar.length > 0 && (
             <p className="mt-2 text-sm">
@@ -1554,7 +3013,11 @@ function RoundsTab({
               backgroundColor: "var(--accent)",
               color: "var(--accent-text)",
             }}
-            onClick={() => setSummary(null)}
+            onClick={() => {
+              setSummary(null);
+              setSummaryShift(null);
+              setRecountOpenItemId(null);
+            }}
           >
             Start a new check
           </button>
@@ -1568,26 +3031,86 @@ function RoundsTab({
           backgroundColor: "var(--surface)",
         }}
       >
-        <div className="grid gap-2 sm:grid-cols-2">
-          <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
-            Who's counting?
-            <input
-              value={counterName}
-              onChange={(e) => setCounterName(e.target.value)}
-              placeholder="Counter's name"
-              className="rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]"
+        {weeklyIds && (
+          <div
+            className="mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2"
+            style={{ backgroundColor: "var(--accent-soft)" }}
+          >
+            <p className="text-sm font-bold">
+              This week's count — {weeklyIds.length} item
+              {weeklyIds.length === 1 ? "" : "s"} due
+            </p>
+            <button
+              type="button"
+              className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
               style={{
-                borderColor: "var(--border)",
                 backgroundColor: "var(--surface)",
+                color: "var(--text)",
               }}
-              autoComplete="off"
-            />
-          </label>
+              onClick={() => {
+                setWeeklyIds(null);
+                setCounts({});
+              }}
+            >
+              Count everything instead
+            </button>
+          </div>
+        )}
+        <div className="grid gap-2 sm:grid-cols-2">
+          {isTfs ? (
+            <div className="flex flex-col gap-0.5">
+              <span className="text-xs font-semibold text-[var(--dim)]">
+                Shift
+              </span>
+              <div className="flex gap-1" role="group" aria-label="Shift">
+                {["A", "B", "C", "D"].map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    aria-pressed={shift === s}
+                    onClick={() => setShift(s)}
+                    className="flex-1 rounded-lg border px-2 py-1.5 text-sm font-bold"
+                    style={
+                      shift === s
+                        ? {
+                            backgroundColor: "var(--accent)",
+                            color: "var(--accent-text)",
+                            borderColor: "var(--accent)",
+                          }
+                        : {
+                            borderColor: "var(--border)",
+                            backgroundColor: "var(--surface)",
+                            color: "var(--text)",
+                          }
+                    }
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+              Who's counting?
+              <input
+                value={counterName}
+                onChange={(e) => setCounterName(e.target.value)}
+                placeholder="Counter's name"
+                className="rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]"
+                style={{
+                  borderColor: "var(--border)",
+                  backgroundColor: "var(--surface)",
+                }}
+                autoComplete="off"
+              />
+            </label>
+          )}
           <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
             Category
             <select
               value={groupFilter}
               onChange={(e) => setGroupFilter(e.target.value)}
+              disabled={weeklyIds != null}
               className="rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]"
               style={{
                 borderColor: "var(--border)",
@@ -1698,7 +3221,11 @@ function RoundsTab({
                     <button
                       type="button"
                       aria-label={`Decrease count for ${it.name}`}
-                      className="h-8 w-8 rounded-full text-lg font-bold"
+                      // 44×44 (audit #10): the Checks steppers are
+                      // the gloved-counting control at the station,
+                      // so they meet the platform size even though
+                      // the Inventory tab's steppers stay at 32.
+                      className="h-11 w-11 rounded-full text-lg font-bold"
                       style={{ backgroundColor: "var(--surface-alt)" }}
                       disabled={!isCounted || counted <= 0}
                       onClick={() => setCount(it.id, (counted ?? 0) - 1)}
@@ -1752,7 +3279,7 @@ function RoundsTab({
                     <button
                       type="button"
                       aria-label={`Increase count for ${it.name}`}
-                      className="h-8 w-8 rounded-full text-lg font-bold"
+                      className="h-11 w-11 rounded-full text-lg font-bold"
                       style={{ backgroundColor: "var(--surface-alt)" }}
                       onClick={() =>
                         setCount(it.id, (counted ?? 0) + 1)
@@ -1788,7 +3315,9 @@ function RoundsTab({
           <p className="text-xs text-[var(--dim)]">
             Record each freezer's temperature during this check. Anything
             warmer than −18°C is flagged as a food-safety alert in the
-            check summary and the order email.
+            check summary and the order email. Freezers run below zero —
+            tap +/− beside a box (or type the minus sign) to enter a
+            negative temperature.
           </p>
           <div className="mt-2 flex flex-col">
             {business.freezers.map((f) => {
@@ -1805,22 +3334,50 @@ function RoundsTab({
                   <span className="min-w-32 flex-1 text-sm font-bold">
                     {f}
                   </span>
-                  <input
-                    type="number"
-                    step="0.1"
-                    inputMode="decimal"
-                    placeholder="°C"
-                    aria-label={`Temperature for ${f} in degrees Celsius`}
-                    value={raw}
-                    onChange={(e) =>
-                      setTemps((prev) => ({ ...prev, [f]: e.target.value }))
-                    }
-                    className="w-24 rounded-lg border px-2 py-1.5 text-center text-sm font-bold"
-                    style={{
-                      borderColor: "var(--border)",
-                      backgroundColor: "var(--surface)",
-                    }}
-                  />
+                  <div className="flex shrink-0 items-center gap-1">
+                    <button
+                      type="button"
+                      aria-label={`Toggle negative temperature for ${f}`}
+                      aria-pressed={raw.trim().startsWith("-")}
+                      onClick={() =>
+                        setTemps((prev) => {
+                          const cur = prev[f] ?? "";
+                          return {
+                            ...prev,
+                            [f]: cur.trim().startsWith("-")
+                              ? cur.replace("-", "")
+                              : `-${cur}`,
+                          };
+                        })
+                      }
+                      // 44×44 (audit #10), like the counting
+                      // steppers on this same Checks screen.
+                      className="h-11 w-11 rounded-full text-sm font-bold"
+                      style={{ backgroundColor: "var(--surface-alt)" }}
+                    >
+                      +/−
+                    </button>
+                    <input
+                      type="number"
+                      step="0.1"
+                      min={-40}
+                      inputMode="decimal"
+                      placeholder="°C"
+                      aria-label={`Temperature for ${f} in degrees Celsius`}
+                      value={raw}
+                      onChange={(e) =>
+                        setTemps((prev) => ({
+                          ...prev,
+                          [f]: e.target.value,
+                        }))
+                      }
+                      className="w-24 rounded-lg border px-2 py-1.5 text-center text-sm font-bold"
+                      style={{
+                        borderColor: "var(--border)",
+                        backgroundColor: "var(--surface)",
+                      }}
+                    />
+                  </div>
                   <span
                     className="text-xs font-bold"
                     style={{
@@ -1855,19 +3412,16 @@ function RoundsTab({
         style={{
           backgroundColor: "var(--accent)",
           color: "var(--accent-text)",
-          opacity:
-            countedCount === 0 || counterName.trim() === "" ? 0.5 : 1,
+          opacity: countedCount === 0 || counterMissing ? 0.5 : 1,
         }}
-        disabled={
-          finish.isPending || countedCount === 0 || counterName.trim() === ""
-        }
+        disabled={finish.isPending || countedCount === 0 || counterMissing}
         onClick={() => finish.mutate()}
       >
         {finish.isPending ? "Finishing…" : "Finish check"}
       </button>
-      {(countedCount === 0 || counterName.trim() === "") && (
+      {(countedCount === 0 || counterMissing) && (
         <p className="-mt-1 text-xs text-[var(--dim)]">
-          {counterName.trim() === ""
+          {counterMissing
             ? "Add the counter's name above to finish a check."
             : "Count at least one item to finish a check."}
         </p>
@@ -1881,6 +3435,13 @@ function RoundsTab({
               const alerts = isFoodBusiness
                 ? r.freezerReadings.filter((f) => f.alert)
                 : [];
+              // TFS rounds store the shift letter as the counter
+              // identity and read "Shift A"; anything else stored
+              // (a name) shows as-is.
+              const counterLabel =
+                isTfs && /^[A-D]$/.test(r.counterName)
+                  ? `Shift ${r.counterName}`
+                  : r.counterName;
               return (
                 <div
                   key={r.id}
@@ -1891,7 +3452,7 @@ function RoundsTab({
                   }}
                 >
                   <p className="font-semibold">
-                    {roundDate(r.createdAt)} · {r.counterName}
+                    {roundDate(r.createdAt)} · {counterLabel}
                     {r.zoneFilter
                       ? ` · ${r.zoneFilter}`
                       : " · All categories"}
@@ -2317,6 +3878,30 @@ function PosPanel({
     locationId: "",
     notes: "",
   });
+  // Backdrop guard (Beta 0.04, audit #6 — Derek approved: "a
+  // backdrop tap can never discard typed input"). The Custom POS
+  // popup holds typed form input, so while any field differs from
+  // its untouched state the popup counts as holding unsaved input
+  // and a backdrop tap does nothing; Cancel stays the deliberate
+  // exit. With every field untouched, a backdrop tap still closes
+  // it as before.
+  const customDirty =
+    custom.name !== "" ||
+    custom.shareMethod !== "API key" ||
+    custom.endpointUrl !== "" ||
+    custom.apiKey !== "" ||
+    custom.locationId !== "" ||
+    custom.notes !== "";
+  // Escape closes the Custom POS popup under the same guard as
+  // its backdrop: never while it holds unsaved input.
+  useEffect(() => {
+    if (!customOpen) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !customDirty) setCustomOpen(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [customOpen, customDirty]);
 
   const save = useMutation({
     mutationFn: async (vars: {
@@ -2841,7 +4426,12 @@ function PosPanel({
         <div
           className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
           style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
-          onClick={() => setCustomOpen(false)}
+          onClick={() => {
+            // Backdrop guard: never discard typed input — with
+            // unsaved input in the fields a backdrop tap does
+            // nothing (see customDirty above).
+            if (!customDirty) setCustomOpen(false);
+          }}
         >
           <div
             role="dialog"
@@ -3177,6 +4767,10 @@ function PosPanel({
                 <span>× {tx.quantity}</span>
                 <span className="text-[var(--dim)]">{tx.source}</span>
                 <span className="text-[var(--dim)]">{roundDate(tx.createdAt)}</span>
+                <span className="text-[var(--dim)]">
+                  {tx.actor === "connected" ? "Connected account" : "Primary"}
+                  {tx.permanent ? " · Permanent" : ""}
+                </span>
                 {tx.belowPar && !tx.undone && (
                   <span
                     className="rounded-full px-2 py-0.5 text-xs font-bold"
@@ -3187,7 +4781,9 @@ function PosPanel({
                 )}
                 {tx.undone ? (
                   <span className="font-semibold text-[var(--dim)]">Undone</span>
-                ) : (
+                ) : tx.permanent ? (
+                  <span className="font-semibold text-[var(--dim)]">Permanent</span>
+                ) : tx.canUndo ? (
                   <button
                     type="button"
                     aria-label={`Undo sale of ${tx.itemName ?? tx.posRef}`}
@@ -3197,7 +4793,7 @@ function PosPanel({
                   >
                     Undo
                   </button>
-                )}
+                ) : null}
               </li>
             ))}
           </ul>
@@ -3264,9 +4860,11 @@ function PosPanel({
  * only for businesses whose needs profile includes it): a date
  * input to set / edit / clear the item's expiry date, plus the
  * flag the date earns — "Expired" in the alert style once the
- * date has passed, "Expires soon" within 2 days, and the days
- * remaining shown whenever a date is set. No date = no flag and
- * the item behaves exactly as before.
+ * date has passed, a "Use first" flag within 3 days (Beta 0.03,
+ * audit #14 — the same window as the household side's expiry
+ * chip, so both sides share one definition of close-to-expiry),
+ * and the days remaining shown whenever a date is set. No date =
+ * no flag and the item behaves exactly as before.
  */
 function BitItemExpiryRow({
   item,
@@ -3312,7 +4910,7 @@ function BitItemExpiryRow({
           </span>
         </>
       )}
-      {days != null && item.expiryDate && days >= 0 && days <= 2 && (
+      {days != null && item.expiryDate && days >= 0 && days <= 3 && (
         <>
           <span
             className="rounded-full px-2 py-0.5 text-[13px] font-bold"
@@ -3321,18 +4919,18 @@ function BitItemExpiryRow({
               color: "var(--amber)",
             }}
           >
-            Expires soon
+            Use first
           </span>
           <span className="text-xs text-[var(--dim)]">
             {days === 0
-              ? "today"
+              ? "expires today"
               : days === 1
-                ? "tomorrow"
-                : `in ${days} days`}
+                ? "expires tomorrow"
+                : `expires in ${days} days`}
           </span>
         </>
       )}
-      {days != null && item.expiryDate && days > 2 && (
+      {days != null && item.expiryDate && days > 3 && (
         <span className="text-xs text-[var(--dim)]">
           Expires {formatExpiryDate(item.expiryDate)} · {days} days left
         </span>
@@ -3392,6 +4990,26 @@ function WasteLogPanel({
     onError: () => {
       setMsg(null);
       setError("That waste entry couldn't be logged. Try again.");
+    },
+  });
+
+  // Undo coverage (audit #5): an entry's Undo restores the stock
+  // it deducted and retires the entry (it stays, marked Undone).
+  const undoWaste = useMutation({
+    mutationFn: async (id: number) => await api.undoBitWaste({ id }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setError(null);
+        setMsg("Waste entry undone — the stock was put back.");
+      } else {
+        setMsg(null);
+        setError(res.error ?? "That waste entry couldn't be undone.");
+      }
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+    },
+    onError: () => {
+      setMsg(null);
+      setError("That waste entry couldn't be undone. Try again.");
     },
   });
 
@@ -3492,17 +5110,46 @@ function WasteLogPanel({
             {wasteLog.map((w) => (
               <div
                 key={w.id}
-                className="flex flex-wrap items-baseline justify-between gap-2 border-b py-1.5 last:border-b-0"
+                className={`flex flex-wrap items-baseline justify-between gap-2 border-b py-1.5 last:border-b-0 ${w.undone ? "opacity-55" : ""}`}
                 style={{ borderColor: "var(--border)" }}
               >
                 <span className="min-w-0 text-sm font-semibold">
                   {w.itemName}{" "}
                   <span className="font-normal text-[var(--dim)]">
                     — {w.quantity} {w.unit} · {w.reason}
+                    <ActorTag actor={w.actor} permanent={w.permanent} />
                   </span>
+                  {w.undone && (
+                    <span className="ml-1 text-xs font-bold text-[var(--dim)]">
+                      Undone
+                    </span>
+                  )}
                 </span>
-                <span className="shrink-0 text-xs text-[var(--dim)]">
-                  {roundDate(w.createdAt)}
+                <span className="flex shrink-0 items-baseline gap-2">
+                  <span className="text-xs text-[var(--dim)]">
+                    {roundDate(w.createdAt)}
+                  </span>
+                  {!w.undone && w.permanent && (
+                    <span className="text-xs font-bold text-[var(--dim)]">
+                      Permanent
+                    </span>
+                  )}
+                  {!w.undone && w.canUndo && (
+                    <button
+                      type="button"
+                      aria-label={`Undo waste of ${w.quantity} ${w.unit} of ${w.itemName}`}
+                      disabled={undoWaste.isPending}
+                      onClick={() => undoWaste.mutate(w.id)}
+                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                      style={{
+                        backgroundColor: "var(--surface-alt)",
+                        color: "var(--accent)",
+                        border: "1px solid var(--border)",
+                      }}
+                    >
+                      Undo
+                    </button>
+                  )}
                 </span>
               </div>
             ))}
@@ -3516,19 +5163,28 @@ function WasteLogPanel({
 function InventoryTab({
   business,
   items,
+  rounds,
   scans,
   wasteLog,
+  stockEvents,
+  manifestImports,
   onDismissScan,
 }: {
   business: BitBusiness;
   items: BitItem[];
+  rounds: BitState["rounds"];
   scans: BitScan[];
   wasteLog: BitWasteEntry[];
+  stockEvents: BitStockEvent[];
+  manifestImports: BitManifestImport[];
   onDismissScan: (scan: BitScan) => void;
 }) {
   const queryClient = useQueryClient();
   const [search, setSearch] = useState("");
   const [belowParOnly, setBelowParOnly] = useState(false);
+  // The item whose par editor is open (Alpha 0.79): tapping a
+  // row's "Par N" opens the shared ParEditor under that row.
+  const [parEditId, setParEditId] = useState<number | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   // The four action panels are mutually exclusive: at most one of
   // "add" | "import" | "category" | "pos" is open at a time, and
@@ -3608,6 +5264,37 @@ function InventoryTab({
       await api.setBitItemCount(vars),
     onSettled: () =>
       void queryClient.invalidateQueries({ queryKey: ["bit"] }),
+  });
+
+  // Undo coverage (audit #5): a count change's Undo restores the
+  // count from before it; a manifest import's Undo reverts
+  // exactly the items and quantities that import touched.
+  const [undoMsg, setUndoMsg] = useState<string | null>(null);
+  const undoCountChange = useMutation({
+    mutationFn: async (id: number) => await api.undoBitStockEvent({ id }),
+    onSuccess: (res) => {
+      setUndoMsg(
+        res.ok
+          ? "Count change undone — the count is back to what it was."
+          : (res.error ?? "That count change couldn't be undone."),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+    },
+    onError: () =>
+      setUndoMsg("That count change couldn't be undone. Try again."),
+  });
+  const undoImport = useMutation({
+    mutationFn: async (id: number) =>
+      await api.undoBitManifestImport({ id }),
+    onSuccess: (res) => {
+      setUndoMsg(
+        res.ok
+          ? "Import undone — the items and counts it set are back to what they were."
+          : (res.error ?? "That import couldn't be undone."),
+      );
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+    },
+    onError: () => setUndoMsg("That import couldn't be undone. Try again."),
   });
 
   // Expiry dates (Alpha 0.75): only rendered for businesses whose
@@ -3697,6 +5384,17 @@ function InventoryTab({
 
   return (
     <div className="flex flex-col gap-2 pt-2">
+      {/* Counted-last stamp (audit #16): the business's most
+          recent finished check round — "Not counted yet" until
+          the first real check is finished. */}
+      <p className="text-sm font-semibold text-[var(--dim)]">
+        {lastCountedLabel(rounds[0]?.createdAt ?? null)}
+      </p>
+      {undoMsg && (
+        <p className="text-sm font-semibold" role="status">
+          {undoMsg}
+        </p>
+      )}
       <div className="flex flex-wrap items-center gap-2">
         <input
           type="search"
@@ -3837,6 +5535,74 @@ function InventoryTab({
               return `Imported ${res.added} new item${res.added === 1 ? "" : "s"} · updated ${res.updated} count${res.updated === 1 ? "" : "s"}`;
             }}
           />
+          {manifestImports.length > 0 && (
+            <div className="mt-3">
+              <p className="text-sm font-bold">Recent imports</p>
+              <div className="mt-1 flex flex-col">
+                {manifestImports.map((imp) => (
+                  <div
+                    key={imp.id}
+                    className={`flex flex-wrap items-baseline justify-between gap-2 border-b py-1.5 last:border-b-0 ${imp.undone ? "opacity-55" : ""}`}
+                    style={{ borderColor: "var(--border)" }}
+                  >
+                    <span className="min-w-0 text-sm">
+                      <span className="font-semibold">
+                        {imp.scanId != null
+                          ? "Manifest photo import"
+                          : "Manifest import"}
+                      </span>{" "}
+                      <span className="text-[var(--dim)]">
+                        — {imp.addedNames.length} added
+                        {imp.addedNames.length > 0
+                          ? ` (${imp.addedNames.join(", ")})`
+                          : ""}
+                        {" · "}
+                        {imp.updatedNames.length} counts set
+                        {imp.updatedNames.length > 0
+                          ? ` (${imp.updatedNames.join(", ")})`
+                          : ""}
+                        <ActorTag
+                          actor={imp.actor}
+                          permanent={imp.permanent}
+                        />
+                      </span>
+                      {imp.undone && (
+                        <span className="ml-1 text-xs font-bold text-[var(--dim)]">
+                          Undone
+                        </span>
+                      )}
+                    </span>
+                    <span className="flex shrink-0 items-baseline gap-2">
+                      <span className="text-xs text-[var(--dim)]">
+                        {roundDate(imp.createdAt)}
+                      </span>
+                      {!imp.undone && imp.permanent && (
+                        <span className="text-xs font-bold text-[var(--dim)]">
+                          Permanent
+                        </span>
+                      )}
+                      {!imp.undone && imp.canUndo && (
+                        <button
+                          type="button"
+                          aria-label="Undo this manifest import"
+                          disabled={undoImport.isPending}
+                          onClick={() => undoImport.mutate(imp.id)}
+                          className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                          style={{
+                            backgroundColor: "var(--surface-alt)",
+                            color: "var(--accent)",
+                            border: "1px solid var(--border)",
+                          }}
+                        >
+                          Undo
+                        </button>
+                      )}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -4102,12 +5868,15 @@ function InventoryTab({
       )}
 
       {groups.map((g) => {
-        const atPar = g.items.filter((i) => i.onHand > i.par).length;
+        // The fraction counts items strictly ABOVE par (onHand >
+        // par) — the header label says "above par" to match
+        // (Beta 0.02, audit #3).
+        const abovePar = g.items.filter((i) => i.onHand > i.par).length;
         const totalInGroup = items.filter(
           (i) => groupOf(i) === g.name,
         ).length;
         const shown = g.items;
-        const pct = totalInGroup > 0 ? (atPar / totalInGroup) * 100 : 100;
+        const pct = totalInGroup > 0 ? (abovePar / totalInGroup) * 100 : 100;
         const fracStyle =
           pct >= 75
             ? { backgroundColor: "var(--ok-bg)", color: "var(--ok-text)" }
@@ -4133,6 +5902,14 @@ function InventoryTab({
                 backgroundColor: "var(--accent-soft)",
               }}
             >
+              {/* One header spec (Beta 0.05, audit #9): chevron on
+                  the LEFT and the item count in the title as
+                  "- X", like every banner in the app — no count
+                  text on the right. The above-par health figure
+                  lives inside the expanded group (below), not in
+                  the header. No ⓘ here: expanding the group
+                  already shows its items. */}
+              <Chevron collapsed={!isOpen} />
               <span
                 aria-hidden="true"
                 className="h-3.5 w-3.5 shrink-0 rounded-full"
@@ -4144,8 +5921,8 @@ function InventoryTab({
                 className="min-w-0 flex-1 truncate font-bold"
                 style={{
                   // Long group names step down so the full name
-                  // stays readable beside the at-par fraction box
-                  // (the HIT List's long-name shrink, applied here).
+                  // stays readable (the HIT List's long-name
+                  // shrink, applied here).
                   fontSize:
                     g.name.length <= 19
                       ? 20
@@ -4154,18 +5931,19 @@ function InventoryTab({
                         : 13,
                 }}
               >
-                {g.name}
+                {g.name} - {totalInGroup}
               </span>
-              <span
-                className="shrink-0 rounded-md px-1.5 py-0.5 text-xs font-bold"
-                style={fracStyle}
-              >
-                {atPar}/{totalInGroup} at par
-              </span>
-              <Chevron collapsed={!isOpen} />
             </button>
             {isOpen && (
               <div className="mt-1 flex flex-col gap-1">
+                {totalInGroup > 0 && (
+                  <p
+                    className="px-2 pt-0.5 text-xs font-bold"
+                    style={{ color: fracStyle.color }}
+                  >
+                    {abovePar} of {totalInGroup} above par
+                  </p>
+                )}
                 {shown.length === 0 && (
                   <p className="px-2 py-1.5 text-sm text-[var(--dim)]">
                     No items in this category yet.
@@ -4193,10 +5971,42 @@ function InventoryTab({
                           <TagChips tags={it.tags} />
                         </p>
                         <p className="text-xs text-[var(--dim)]">
-                          Par {it.par} · {groupOf(it)}
+                          <button
+                            type="button"
+                            aria-label={`Set par level for ${it.name}`}
+                            aria-expanded={parEditId === it.id}
+                            className="font-bold underline"
+                            style={{ color: "var(--accent)" }}
+                            onClick={() =>
+                              setParEditId(
+                                parEditId === it.id ? null : it.id,
+                              )
+                            }
+                          >
+                            Par {it.par}
+                          </button>{" "}
+                          · {groupOf(it)}
                           {it.supplier ? ` · ${it.supplier}` : ""}
                           {it.sku ? ` · SKU ${it.sku}` : ""}
+                          {/* This item's own last-counted date
+                              (audit #16), from its check
+                              snapshots; absent until a finished
+                              check has counted it. */}
+                          {it.lastCountedAt
+                            ? ` · Counted ${new Date(it.lastCountedAt).toLocaleDateString("en-CA", { month: "short", day: "numeric", year: "numeric" })}`
+                            : ""}
                         </p>
+                        {parEditId === it.id && (
+                          <span className="mt-1 block">
+                            <ParEditor
+                              itemId={it.id}
+                              itemName={it.name}
+                              par={it.par}
+                              countedValue={it.onHand}
+                              shortcutLabel="Par = on hand"
+                            />
+                          </span>
+                        )}
                         {expiryTracking && (
                           <BitItemExpiryRow
                             item={it}
@@ -4290,11 +6100,83 @@ function InventoryTab({
         );
       })}
       {filtered.length === 0 && (
+        // The no-match message names the active filter that caused
+        // it (Beta 0.05, audit #7): the search text, the
+        // "Below par only" filter, or both.
         <p className="py-4 text-center text-sm text-[var(--dim)]">
           {items.length === 0
             ? "No inventory items yet — add one or import a manifest."
-            : "No items match that search."}
+            : searching && belowParOnly
+              ? `No items match “${search.trim()}” with “Below par only” on.`
+              : belowParOnly
+                ? "Nothing is at or below par right now — turn off “Below par only” to see everything."
+                : `No items match “${search.trim()}”.`}
         </p>
+      )}
+
+      {/* Recent count changes (audit #5): the Inventory tab's
+          own count edits, newest first — each carries an Undo
+          that restores the count from before the change. */}
+      {stockEvents.length > 0 && (
+        <section
+          aria-label="Recent count changes"
+          className="rounded-xl border p-3"
+          style={{
+            borderColor: "var(--border)",
+            backgroundColor: "var(--surface)",
+          }}
+        >
+          <h3 className="text-base font-bold">Recent count changes</h3>
+          <div className="mt-1 flex flex-col">
+            {stockEvents.map((e) => (
+              <div
+                key={e.id}
+                className={`flex flex-wrap items-baseline justify-between gap-2 border-b py-1.5 last:border-b-0 ${e.undone ? "opacity-55" : ""}`}
+                style={{ borderColor: "var(--border)" }}
+              >
+                <span className="min-w-0 text-sm font-semibold">
+                  {e.itemName}{" "}
+                  <span className="font-normal text-[var(--dim)]">
+                    — {e.delta >= 0 ? "+" : "−"}
+                    {fmtCount(Math.abs(e.delta))} from a count edit
+                    <ActorTag actor={e.actor} permanent={e.permanent} />
+                  </span>
+                  {e.undone && (
+                    <span className="ml-1 text-xs font-bold text-[var(--dim)]">
+                      Undone
+                    </span>
+                  )}
+                </span>
+                <span className="flex shrink-0 items-baseline gap-2">
+                  <span className="text-xs text-[var(--dim)]">
+                    {roundDate(e.createdAt)}
+                  </span>
+                  {!e.undone && e.permanent && (
+                    <span className="text-xs font-bold text-[var(--dim)]">
+                      Permanent
+                    </span>
+                  )}
+                  {!e.undone && e.canUndo && (
+                    <button
+                      type="button"
+                      aria-label={`Undo the count change for ${e.itemName}`}
+                      disabled={undoCountChange.isPending}
+                      onClick={() => undoCountChange.mutate(e.id)}
+                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                      style={{
+                        backgroundColor: "var(--surface-alt)",
+                        color: "var(--accent)",
+                        border: "1px solid var(--border)",
+                      }}
+                    >
+                      Undo
+                    </button>
+                  )}
+                </span>
+              </div>
+            ))}
+          </div>
+        </section>
       )}
 
       {/* Waste log (Alpha 0.75): Restaurant needs profile only. */}
@@ -4354,7 +6236,15 @@ function RequisitionTab({
 
   const [division, setDivision] = useState(business.division ?? "");
   const [doName, setDoName] = useState(business.dutyOfficerName ?? "");
+  const [approver, setApprover] = useState(business.approverName ?? "");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
+  // Pre-send completeness popup (audit #8): opened by "Mark
+  // requisition as sent" whenever a header box is unfilled. The
+  // popup carries its own approver field — a missing approver is
+  // the one gap that cannot be waived.
+  const [sendPopupOpen, setSendPopupOpen] = useState(false);
+  const [popupApprover, setPopupApprover] = useState("");
+  const [popupError, setPopupError] = useState<string | null>(null);
   const [qtyEdits, setQtyEdits] = useState<Record<string, number>>({});
   const [receivedEdits, setReceivedEdits] = useState<
     Record<number, number>
@@ -4372,6 +6262,30 @@ function RequisitionTab({
   const [addedIds, setAddedIds] = useState<number[]>([]);
   const [itemSearch, setItemSearch] = useState("");
   const [flashKey, setFlashKey] = useState<string | null>(null);
+  // The build list's category groups collapse exactly like the
+  // category groups on the Inventory tab: a set of the expanded
+  // category names, empty (all collapsed) by default. View-only —
+  // the requisition text and the send use every build line
+  // regardless of which groups are collapsed.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggleGroup(category: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+  }
+
+  function expandGroup(category: string) {
+    setExpanded((prev) => {
+      if (prev.has(category)) return prev;
+      const next = new Set(prev);
+      next.add(category);
+      return next;
+    });
+  }
   const flashTimer = useRef<number | null>(null);
 
   function flashLine(key: string) {
@@ -4388,15 +6302,23 @@ function RequisitionTab({
   }
 
   const saveProfile = useMutation({
-    mutationFn: async () =>
+    mutationFn: async (vars: { approverName?: string }) =>
       await api.updateBitRequisitionProfile({
         businessId: business.id,
         division: division.trim() || null,
         dutyOfficerName: doName.trim() || null,
+        // The pre-send popup can supply the approver it collected.
+        approverName: (vars.approverName ?? approver).trim() || null,
       }),
-    onSuccess: () => {
-      setProfileMsg("Saved.");
-      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+    onSuccess: (res) => {
+      if (res.ok) {
+        setProfileMsg("Saved.");
+        void queryClient.invalidateQueries({ queryKey: ["bit"] });
+      } else {
+        // E.g. approver recorded as the D.O.'s own name — the
+        // server rejects it and nothing was saved.
+        setProfileMsg(res.error ?? "That didn't save. Try again.");
+      }
     },
     onError: () => setProfileMsg("That didn't save. Try again."),
   });
@@ -4499,6 +6421,23 @@ function RequisitionTab({
     return lines;
   }, [items, resubmittedLines, draftExtras, addedIds]);
 
+  // The build list grouped by category for display. buildLines is
+  // already in the SOG order sequence, so first-appearance order
+  // keeps the groups in that sequence: Medical, then Stationery /
+  // Office Supplies, then Cleaning / General, then the rest.
+  const lineGroups = useMemo(() => {
+    const map = new Map<string, ReqBuildLine[]>();
+    for (const line of buildLines) {
+      const list = map.get(line.category);
+      if (list) list.push(line);
+      else map.set(line.category, [line]);
+    }
+    return [...map.entries()].map(([category, lines]) => ({
+      category,
+      lines,
+    }));
+  }, [buildLines]);
+
   // Live search over the station's INVENTORY items only — nothing
   // else is ever offered here — by name or by SKU / Material #,
   // word-based so "ice pack" finds "Ice packs".
@@ -4530,11 +6469,14 @@ function RequisitionTab({
     const existing = buildLines.find((l) => l.itemId === item.id);
     if (existing) {
       // Already a line on this draft — never duplicate it; flash
-      // the line that's there instead.
+      // the line that's there instead (opening its category group
+      // first, so the flash lands on a visible line).
+      expandGroup(existing.category);
       flashLine(existing.key);
       return;
     }
     setAddedIds((prev) => (prev.includes(item.id) ? prev : [...prev, item.id]));
+    expandGroup(item.category);
     flashLine(`manual-${item.id}`);
   }
 
@@ -4567,6 +6509,7 @@ function RequisitionTab({
       `Date: ${todayLong}`,
       `Req. No.: ${reqNo}`,
       `D.O. Name: ${doName.trim() || ""}`,
+      `Approver: ${approver.trim() || ""}`,
       "",
       "Item / Description | Qty | Unit | Material # | GL | Comments",
     ];
@@ -4582,7 +6525,7 @@ function RequisitionTab({
     );
     return out.join("\n");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sendLines, division, doName, reqNo, todayLong, stationNo]);
+  }, [sendLines, division, doName, approver, reqNo, todayLong, stationNo]);
 
   const mailto = `mailto:tfsqm@toronto.ca?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(requisitionText)}`;
 
@@ -4656,6 +6599,28 @@ function RequisitionTab({
     onError: () => setCheckMsg("That check-off didn't save. Try again."),
   });
 
+  // Undo coverage (audit #5): a Received / Not received mark can
+  // be undone — the line goes back to pending, any stock the
+  // receipt applied comes back off, and a requisition the
+  // check-off closed reopens.
+  const undoCheckOff = useMutation({
+    mutationFn: async (lineId: number) =>
+      await api.undoBitRequisitionCheckOff({ lineId }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setCheckMsg(
+          res.reopened
+            ? "Check-off undone — the requisition is outstanding again and the line is waiting to be checked off."
+            : "Check-off undone — the line is waiting to be checked off again.",
+        );
+      } else {
+        setCheckMsg(res.error ?? "That check-off couldn't be undone.");
+      }
+      void queryClient.invalidateQueries({ queryKey: ["bit"] });
+    },
+    onError: () => setCheckMsg("That check-off couldn't be undone. Try again."),
+  });
+
   const removeExtra = useMutation({
     mutationFn: async (id: number) =>
       await api.removeBitRequisitionDraftExtra({ id }),
@@ -4665,7 +6630,116 @@ function RequisitionTab({
 
   const profileDirty =
     division !== (business.division ?? "") ||
-    doName !== (business.dutyOfficerName ?? "");
+    doName !== (business.dutyOfficerName ?? "") ||
+    approver !== (business.approverName ?? "");
+
+  // Pre-send completeness (audit #8): which header boxes are
+  // unfilled, read from the fields exactly as they stand.
+  const missingDivision = division.trim() === "";
+  const missingDoName = doName.trim() === "";
+  const missingApprover = approver.trim() === "";
+  const anyMissing = missingDivision || missingDoName || missingApprover;
+
+  /** Save any unsaved header edits, then mark the requisition
+      sent. A rejected save (approver recorded as the D.O.'s own
+      name) stops the send and surfaces its message. */
+  async function doSend() {
+    if (profileDirty) {
+      try {
+        const res = await saveProfile.mutateAsync({});
+        if (!res.ok) {
+          setSendMsg(null);
+          setSendError(res.error ?? "The header details didn't save.");
+          return;
+        }
+      } catch {
+        setSendMsg(null);
+        setSendError("The header details didn't save. Try again.");
+        return;
+      }
+    }
+    send.mutate();
+  }
+
+  /** "Mark requisition as sent": if anything is unfilled, the
+      completeness popup lists exactly which boxes are empty
+      first; a complete header sends straight away. */
+  function attemptSend() {
+    setSendError(null);
+    if (anyMissing) {
+      setPopupApprover(approver);
+      setPopupError(null);
+      setSendPopupOpen(true);
+      return;
+    }
+    void doSend();
+  }
+
+  /** The popup's send button. Division / D.O. Name gaps are
+      waived ("Send anyway"); a missing approver is not — the
+      popup's own approver field must hold a name different from
+      the D.O.'s, which is recorded before the send. */
+  async function confirmPopupSend() {
+    if (missingApprover) {
+      const name = popupApprover.trim();
+      if (!name) {
+        setPopupError(
+          "An approver is required before sending — enter the District Chief's name.",
+        );
+        return;
+      }
+      if (
+        doName.trim() &&
+        name.toLowerCase() === doName.trim().toLowerCase()
+      ) {
+        setPopupError(
+          "The approver must be different from the D.O. who prepared the requisition.",
+        );
+        return;
+      }
+      setApprover(name);
+      setSendPopupOpen(false);
+      try {
+        const res = await saveProfile.mutateAsync({
+          approverName: name,
+        });
+        if (!res.ok) {
+          setSendMsg(null);
+          setSendError(res.error ?? "The header details didn't save.");
+          return;
+        }
+      } catch {
+        setSendMsg(null);
+        setSendError("The header details didn't save. Try again.");
+        return;
+      }
+      send.mutate();
+      return;
+    }
+    setSendPopupOpen(false);
+    void doSend();
+  }
+
+  // The draft's state, shown plainly like a sent requisition's
+  // (audit #15). A recorded date shows when the name on screen is
+  // the one on file; a name still being typed has no date yet.
+  const draftPreparedDate =
+    doName.trim() && doName.trim() === (business.dutyOfficerName ?? "")
+      ? longDateOrEmpty(business.dutyOfficerRecordedAt)
+      : "";
+  const draftApprovedDate =
+    approver.trim() && approver.trim() === (business.approverName ?? "")
+      ? longDateOrEmpty(business.approverRecordedAt)
+      : "";
+  const draftState = [
+    doName.trim()
+      ? `Prepared by ${doName.trim()}${draftPreparedDate ? ` · ${draftPreparedDate}` : ""}`
+      : "Prepared by —",
+    approver.trim()
+      ? `Approved by ${approver.trim()}${draftApprovedDate ? ` · ${draftApprovedDate}` : ""}`
+      : "Approved by —",
+    "Not sent yet",
+  ].join(" → ");
 
   const fieldCls =
     "rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]";
@@ -4701,6 +6775,9 @@ function RequisitionTab({
               received are never back-ordered; they are resubmitted
               on the next requisition.
             </p>
+            <div className="mt-1">
+              <RequisitionStateLine req={requisition} />
+            </div>
             {checkMsg && (
               <p className="mt-2 text-sm font-semibold" role="status">
                 {checkMsg}
@@ -4752,6 +6829,30 @@ function RequisitionTab({
                         >
                           Not received — will resubmit
                         </span>
+                      )}
+                      {l.status !== "pending" && (
+                        <span className="shrink-0 text-xs text-[var(--dim)]">
+                          {l.actor === "connected"
+                            ? "Connected account"
+                            : "Primary"}
+                          {l.permanent ? " · Permanent" : ""}
+                        </span>
+                      )}
+                      {l.status !== "pending" && l.canUndo && (
+                        <button
+                          type="button"
+                          aria-label={`Undo the check-off for ${l.name}`}
+                          disabled={undoCheckOff.isPending}
+                          onClick={() => undoCheckOff.mutate(l.id)}
+                          className="shrink-0 rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                          style={{
+                            backgroundColor: "var(--surface-alt)",
+                            color: "var(--accent)",
+                            border: "1px solid var(--border)",
+                          }}
+                        >
+                          Undo
+                        </button>
                       )}
                     </div>
                     {l.status === "pending" && (
@@ -4864,10 +6965,47 @@ function RequisitionTab({
                 />
               </label>
             </div>
+            {/* Approver separation (audit #15): the District
+                Chief who approves — the form's DC name/signature
+                line — recorded apart from the D.O. who prepared
+                it. No approver, no send; and the approver can
+                never be the preparer's own name. */}
+            <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+              Approver — District Chief
+              <input
+                value={approver}
+                aria-label="Approver name"
+                onChange={(e) => setApprover(e.target.value)}
+                placeholder="Not recorded yet"
+                className={fieldCls}
+                style={fieldStyle}
+                autoComplete="off"
+              />
+            </label>
+            {approver.trim() &&
+              doName.trim() &&
+              approver.trim().toLowerCase() ===
+                doName.trim().toLowerCase() && (
+                <p
+                  role="alert"
+                  className="mt-1 text-xs font-semibold text-[var(--red)]"
+                >
+                  The approver must be different from the D.O. who
+                  prepared the requisition.
+                </p>
+              )}
+            <p className="mt-1 text-xs text-[var(--dim)]">
+              {business.approverName && business.approverRecordedAt
+                ? `Approver recorded ${longDateOrEmpty(business.approverRecordedAt)}.`
+                : "No approver recorded yet — one is required before this requisition can be sent."}
+            </p>
             <p className="mt-2 text-sm">
               <strong>Station:</strong> {stationNo} ·{" "}
               <strong>Date:</strong> {todayLong} ·{" "}
               <strong>Req. No.:</strong> {reqNo}
+            </p>
+            <p className="mt-1 text-xs font-semibold text-[var(--dim)]">
+              {draftState}
             </p>
             {(profileDirty || profileMsg) && (
               <div className="mt-2 flex items-center gap-2">
@@ -4879,7 +7017,7 @@ function RequisitionTab({
                     color: "var(--accent-text)",
                   }}
                   disabled={!profileDirty || saveProfile.isPending}
-                  onClick={() => saveProfile.mutate()}
+                  onClick={() => saveProfile.mutate({})}
                 >
                   {saveProfile.isPending ? "Saving…" : "Save header details"}
                 </button>
@@ -5036,10 +7174,44 @@ function RequisitionTab({
               above to add an item by hand.
             </p>
           ) : (
-            <div className="flex flex-col gap-1">
-              {buildLines.map((line) => {
-                const qty = qtyOf(line);
+            <div className="flex flex-col gap-2">
+              {lineGroups.map((g) => {
+                const isOpen = expanded.has(g.category);
                 return (
+                  <section key={g.category} aria-label={g.category}>
+                    <button
+                      type="button"
+                      aria-expanded={isOpen}
+                      onClick={() => toggleGroup(g.category)}
+                      className="flex w-full items-center gap-2 rounded-xl border-2 px-3 py-2 text-left"
+                      style={{
+                        borderColor: "var(--accent)",
+                        backgroundColor: "var(--accent-soft)",
+                      }}
+                    >
+                      {/* One header spec (Beta 0.05, audit #9):
+                          chevron on the LEFT, item count in the
+                          title as "- X", no right-side count. */}
+                      <Chevron collapsed={!isOpen} />
+                      <span
+                        aria-hidden="true"
+                        className="h-3.5 w-3.5 shrink-0 rounded-full"
+                        style={{
+                          backgroundColor: catColor(
+                            business.colors,
+                            g.category,
+                          ),
+                        }}
+                      />
+                      <span className="min-w-0 flex-1 truncate font-bold">
+                        {g.category} - {g.lines.length}
+                      </span>
+                    </button>
+                    {isOpen && (
+                      <div className="mt-1 flex flex-col gap-1">
+                        {g.lines.map((line) => {
+                          const qty = qtyOf(line);
+                          return (
                   <div
                     key={line.key}
                     id={`req-line-${line.key}`}
@@ -5148,7 +7320,12 @@ function RequisitionTab({
                         Remove
                       </button>
                     )}
-                  </div>
+                          </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </section>
                 );
               })}
             </div>
@@ -5204,7 +7381,7 @@ function RequisitionTab({
                   color: "var(--text)",
                 }}
                 disabled={send.isPending || sendLines.length === 0}
-                onClick={() => send.mutate()}
+                onClick={attemptSend}
               >
                 {send.isPending ? "Sending…" : "Mark requisition as sent"}
               </button>
@@ -5237,26 +7414,47 @@ function RequisitionTab({
         </>
       )}
 
+      {!requisition && checkMsg && (
+        <p className="text-sm font-semibold" role="status">
+          {checkMsg}
+        </p>
+      )}
+
       {history.length > 0 && (
         <section aria-label="Requisition history">
-          <button
-            type="button"
-            aria-expanded={historyOpen}
-            onClick={() => setHistoryOpen((o) => !o)}
-            className="flex w-full items-center gap-2 rounded-xl border-2 px-3 py-2 text-left"
+          {/* One header spec (Beta 0.05, audit #9): the standard
+              accent box, chevron on the LEFT, the count in the
+              title as "- X" (never "(N on file)"), and an ⓘ beside
+              it listing the requisition numbers it counts. */}
+          <div
+            className="flex w-full items-center gap-2 rounded-xl border-2 px-3 py-2"
             style={{
               borderColor: "var(--accent)",
               backgroundColor: "var(--accent-soft)",
             }}
           >
-            <span className="min-w-0 flex-1 font-bold">
-              Requisition history{" "}
-              <span className="text-sm font-semibold text-[var(--dim)]">
-                ({history.length} on file)
+            <button
+              type="button"
+              aria-expanded={historyOpen}
+              onClick={() => setHistoryOpen((o) => !o)}
+              // -my-2 py-2 (audit #10): the toggle's tappable
+              // area fills the banner's full height, like the
+              // other banner toggles — the negative margins
+              // cancel the extra padding in layout, so the
+              // banner doesn't grow.
+              className="-my-2 flex min-w-0 flex-1 items-center gap-2 py-2 text-left"
+            >
+              <Chevron collapsed={!historyOpen} />
+              <span className="min-w-0 flex-1 font-bold">
+                Requisition history - {history.length}
               </span>
-            </span>
-            <Chevron collapsed={!historyOpen} />
-          </button>
+            </button>
+            <BitInfoListButton
+              names={history.map((h) => h.reqNo)}
+              emptyText="No requisitions"
+              ariaLabel="Show the requisitions in this history"
+            />
+          </div>
           {historyOpen && (
             <div className="mt-1 flex flex-col gap-1">
               {history.map((h) => (
@@ -5279,6 +7477,7 @@ function RequisitionTab({
                       ? ` · checked off ${new Date(h.closedAt).toLocaleDateString("en-CA", { month: "long", day: "numeric" })}`
                       : ""}
                   </p>
+                  <RequisitionStateLine req={h} />
                   <p className="text-xs text-[var(--dim)]">
                     {h.lines.filter((l) => l.status === "received").length}{" "}
                     received ·{" "}
@@ -5291,11 +7490,178 @@ function RequisitionTab({
                           .join(", ")}`
                       : ""}
                   </p>
+                  {/* Each line's check-off mark, with its Undo
+                      (audit #5): undoing one reopens this
+                      requisition and returns the line to pending. */}
+                  <div className="mt-1 flex flex-col gap-1">
+                    {h.lines.map((l) => (
+                      <div
+                        key={l.id}
+                        className="flex flex-wrap items-center gap-2"
+                      >
+                        <span className="min-w-0 flex-1 text-xs">
+                          {l.name}{" "}
+                          <span className="text-[var(--dim)]">
+                            — ordered {l.qtyOrdered} {l.unit}
+                          </span>
+                        </span>
+                        {l.status === "received" && (
+                          <span
+                            className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold"
+                            style={{
+                              backgroundColor: "var(--ok-bg)",
+                              color: "var(--ok-text)",
+                            }}
+                          >
+                            Received {l.qtyReceived ?? l.qtyOrdered}
+                          </span>
+                        )}
+                        {l.status === "not_received" && (
+                          <span
+                            className="shrink-0 rounded-full px-2 py-0.5 text-xs font-bold"
+                            style={{
+                              backgroundColor: "var(--out-bg)",
+                              color: "var(--out-text)",
+                            }}
+                          >
+                            Not received
+                          </span>
+                        )}
+                        {l.status !== "pending" && (
+                          <span className="shrink-0 text-xs text-[var(--dim)]">
+                            {l.actor === "connected"
+                              ? "Connected account"
+                              : "Primary"}
+                            {l.permanent ? " · Permanent" : ""}
+                          </span>
+                        )}
+                        {l.status !== "pending" && l.canUndo && (
+                          <button
+                            type="button"
+                            aria-label={`Undo the check-off for ${l.name}`}
+                            disabled={undoCheckOff.isPending}
+                            onClick={() => undoCheckOff.mutate(l.id)}
+                            className="shrink-0 rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                            style={{
+                              backgroundColor: "var(--surface-alt)",
+                              color: "var(--accent)",
+                              border: "1px solid var(--border)",
+                            }}
+                          >
+                            Undo
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               ))}
             </div>
           )}
         </section>
+      )}
+
+      {/* Pre-send completeness popup (audit #8): lists exactly
+          which header boxes are unfilled. Division and D.O. Name
+          can be waived with "Send anyway"; a missing approver
+          cannot — the popup offers the approver field right here
+          and that is the only way through. The backdrop follows
+          the typed-input guard: while the popup's approver field
+          holds text that isn't on file, a backdrop tap does
+          nothing (Go back is the deliberate exit). */}
+      {sendPopupOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
+          onClick={() => {
+            if (popupApprover === approver) setSendPopupOpen(false);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Before you send"
+            className="w-full max-w-md rounded-2xl border p-4"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-bold">Before you send</h3>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              These boxes are still unfilled:
+            </p>
+            <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 text-sm font-semibold">
+              {missingDivision && <li>Division</li>}
+              {missingDoName && <li>D.O. Name</li>}
+              {missingApprover && <li>Approver (District Chief)</li>}
+            </ul>
+            {missingApprover ? (
+              <>
+                <p className="mt-2 text-sm">
+                  An approver is required before sending — this one
+                  can&rsquo;t be waived. The approver must be
+                  different from the D.O. who prepared the
+                  requisition.
+                </p>
+                <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+                  Approver — District Chief
+                  <input
+                    value={popupApprover}
+                    aria-label="Approver name"
+                    onChange={(e) => {
+                      setPopupApprover(e.target.value);
+                      setPopupError(null);
+                    }}
+                    placeholder="District Chief's name"
+                    className={fieldCls}
+                    style={fieldStyle}
+                    autoComplete="off"
+                  />
+                </label>
+                {popupError && (
+                  <p
+                    role="alert"
+                    className="mt-2 text-sm font-semibold text-[var(--red)]"
+                  >
+                    {popupError}
+                  </p>
+                )}
+              </>
+            ) : (
+              <p className="mt-2 text-sm text-[var(--dim)]">
+                You can go back and fill them in, or send anyway —
+                the requisition goes out with them blank.
+              </p>
+            )}
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--surface-alt)",
+                  color: "var(--text)",
+                }}
+                onClick={() => setSendPopupOpen(false)}
+              >
+                Go back
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+                disabled={send.isPending || saveProfile.isPending}
+                onClick={() => void confirmPopupSend()}
+              >
+                {missingApprover ? "Record approver & send" : "Send anyway"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -5310,6 +7676,12 @@ function suggestedOrderQty(it: BitItem): number {
   return Math.ceil(need / pack) * pack;
 }
 
+/** The in-app group label for items with no supplier on file.
+    It is a grouping label ONLY (audit #8): it never appears in
+    the outgoing email body — supplier-less items are listed
+    there under their category groups instead. */
+const NO_SUPPLIER_LABEL = "No supplier recorded";
+
 function OrderEmailTab({
   business,
   items,
@@ -5319,12 +7691,35 @@ function OrderEmailTab({
   items: BitItem[];
   rounds: BitState["rounds"];
 }) {
-  const needItems = items.filter((it) => it.onHand <= it.par);
+  // ONE par definition app-wide (Beta 0.02, audit #3): an item
+  // needs ordering when it is at or below par AND a par is set
+  // (par > 0) — the same rule the Requisition build list uses.
+  const needItems = items.filter(
+    (it) => it.onHand <= it.par && it.par > 0,
+  );
   const [qtyEdits, setQtyEdits] = useState<Record<number, number>>({});
   const [to, setTo] = useState("");
   const [subjectEdit, setSubjectEdit] = useState<string | null>(null);
   const [bodyOverride, setBodyOverride] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  // Pre-send completeness popup (audit #8): opened by "Open in
+  // email app" when the To field is empty or any item being
+  // ordered has no supplier recorded.
+  const [emailPopupOpen, setEmailPopupOpen] = useState(false);
+  // Supplier groups collapse exactly like the category groups on
+  // the Inventory tab: a set of the expanded group names, empty
+  // (all collapsed) by default. View-only — the email body below
+  // is computed from every group regardless of collapse state.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  function toggleGroup(supplier: string) {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(supplier)) next.delete(supplier);
+      else next.add(supplier);
+      return next;
+    });
+  }
 
   const today = new Date().toLocaleDateString("en-CA", {
     year: "numeric",
@@ -5337,7 +7732,7 @@ function OrderEmailTab({
   const groups = useMemo(() => {
     const map = new Map<string, BitItem[]>();
     for (const it of needItems) {
-      const key = it.supplier?.trim() || "No supplier recorded";
+      const key = it.supplier?.trim() || NO_SUPPLIER_LABEL;
       if (!map.has(key)) map.set(key, []);
       map.get(key)?.push(it);
     }
@@ -5361,15 +7756,41 @@ function OrderEmailTab({
       `Here's the inventory order list for ${business.name} (${today}) — everything at or below par after the latest count:`,
       "",
     ];
+    // A line whose order quantity is 0 is omitted from the email
+    // body (Beta 0.02, audit #3) — an item sitting exactly at par
+    // needs nothing ordered. A group left with no lines is
+    // omitted entirely, heading included.
+    const lineFor = (it: BitItem): string | null => {
+      const qty = qtyEdits[it.id] ?? suggestedOrderQty(it);
+      if (qty <= 0) return null;
+      return `  • ${it.name} — order ${qty} ${it.unit} (on hand: ${it.onHand}, par: ${it.par}${it.sku ? `, SKU ${it.sku}` : ""})`;
+    };
     for (const g of groups) {
-      lines.push(`${g.supplier}:`);
-      for (const it of g.items) {
-        const qty = qtyEdits[it.id] ?? suggestedOrderQty(it);
-        lines.push(
-          `  • ${it.name} — order ${qty} ${it.unit} (on hand: ${it.onHand}, par: ${it.par}${it.sku ? `, SKU ${it.sku}` : ""})`,
-        );
+      if (g.supplier === NO_SUPPLIER_LABEL) {
+        // "No supplier recorded" is an in-app grouping ONLY
+        // (audit #8): the heading never appears in the email a
+        // supplier reads. Supplier-less items are listed under
+        // their category groups, with no supplier heading.
+        const byCategory = new Map<string, string[]>();
+        for (const it of g.items) {
+          const line = lineFor(it);
+          if (!line) continue;
+          const list = byCategory.get(it.category);
+          if (list) list.push(line);
+          else byCategory.set(it.category, [line]);
+        }
+        for (const [category, itemLines] of byCategory) {
+          lines.push(`${category}:`, ...itemLines, "");
+        }
+        continue;
       }
-      lines.push("");
+      const itemLines: string[] = [];
+      for (const it of g.items) {
+        const line = lineFor(it);
+        if (line) itemLines.push(line);
+      }
+      if (itemLines.length === 0) continue;
+      lines.push(`${g.supplier}:`, ...itemLines, "");
     }
     if (latestAlerts.length > 0) {
       lines.push(
@@ -5386,6 +7807,24 @@ function OrderEmailTab({
 
   const body = bodyOverride ?? computedBody;
   const mailto = `mailto:${encodeURIComponent(to.trim())}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+
+  // What the pre-send popup checks (audit #8): an empty recipient
+  // and the items actually being ordered (quantity above 0) that
+  // have no supplier recorded.
+  const missingTo = to.trim() === "";
+  const supplierlessOrdered = needItems.filter(
+    (it) =>
+      !it.supplier?.trim() &&
+      (qtyEdits[it.id] ?? suggestedOrderQty(it)) > 0,
+  );
+  const emailIncomplete = missingTo || supplierlessOrdered.length > 0;
+
+  /** The popup's "Send anyway": go ahead and open the email app
+      with the mailto exactly as composed. */
+  function sendEmailAnyway() {
+    setEmailPopupOpen(false);
+    window.location.href = mailto;
+  }
 
   async function copyBody() {
     try {
@@ -5417,14 +7856,29 @@ function OrderEmailTab({
           Nothing to order — every item is above par.
         </p>
       ) : (
-        groups.map((g) => (
+        groups.map((g) => {
+          const isOpen = expanded.has(g.supplier);
+          return (
           <section key={g.supplier} aria-label={`Order from ${g.supplier}`}>
-            <h3
-              className="rounded-lg px-2 py-1 text-sm font-bold"
-              style={{ backgroundColor: "var(--accent-soft)" }}
+            <button
+              type="button"
+              aria-expanded={isOpen}
+              onClick={() => toggleGroup(g.supplier)}
+              className="flex w-full items-center gap-2 rounded-xl border-2 px-3 py-2 text-left"
+              style={{
+                borderColor: "var(--accent)",
+                backgroundColor: "var(--accent-soft)",
+              }}
             >
-              {g.supplier}
-            </h3>
+              {/* One header spec (Beta 0.05, audit #9): chevron on
+                  the LEFT, item count in the title as "- X", no
+                  right-side count. */}
+              <Chevron collapsed={!isOpen} />
+              <span className="min-w-0 flex-1 truncate font-bold">
+                {g.supplier} - {g.items.length}
+              </span>
+            </button>
+            {isOpen && (
             <div className="mt-1 flex flex-col gap-1">
               {g.items.map((it) => {
                 const qty = qtyEdits[it.id] ?? suggestedOrderQty(it);
@@ -5489,8 +7943,10 @@ function OrderEmailTab({
                 );
               })}
             </div>
+            )}
           </section>
-        ))
+          );
+        })
       )}
 
       {latestAlerts.length > 0 && (
@@ -5581,6 +8037,15 @@ function OrderEmailTab({
               backgroundColor: "var(--accent)",
               color: "var(--accent-text)",
             }}
+            onClick={(e) => {
+              // Pre-send completeness (audit #8): anything
+              // unfilled, the popup lists it before the email
+              // app opens.
+              if (emailIncomplete) {
+                e.preventDefault();
+                setEmailPopupOpen(true);
+              }
+            }}
           >
             Open in email app
           </a>
@@ -5602,16 +8067,84 @@ function OrderEmailTab({
           )}
         </div>
       </div>
+
+      {/* Pre-send completeness popup (audit #8): an empty To field
+          and any items with no supplier recorded are listed
+          before the email goes out; both can be waived with
+          "Send anyway". The popup holds no typed input, so its
+          backdrop closes it freely. */}
+      {emailPopupOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
+          onClick={() => setEmailPopupOpen(false)}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Before you send"
+            className="w-full max-w-md rounded-2xl border p-4"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h3 className="text-base font-bold">Before you send</h3>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              Before this email goes out:
+            </p>
+            <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 text-sm font-semibold">
+              {missingTo && <li>The recipient (To) field is empty</li>}
+              {supplierlessOrdered.length > 0 && (
+                <li>
+                  No supplier recorded for:{" "}
+                  {supplierlessOrdered.map((it) => it.name).join(", ")}
+                </li>
+              )}
+            </ul>
+            <p className="mt-2 text-sm text-[var(--dim)]">
+              You can go back and fill these in, or send anyway.
+            </p>
+            <div className="mt-3 flex flex-wrap gap-2">
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--surface-alt)",
+                  color: "var(--text)",
+                }}
+                onClick={() => setEmailPopupOpen(false)}
+              >
+                Go back
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+                onClick={sendEmailAnyway}
+              >
+                Send anyway
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-// ---- Analytics tab (Alpha 0.76) -------------------------------------
+// ---- Analytics screen (Alpha 0.77) ----------------------------------
 // Shown only for businesses with a stored analytics dataset
 // (business.hasAnalytics — today The Daily Scoop's BIT Sim 01
-// results). Every figure is computed here from the stored monthly
-// rows, the stored menu results and the LIVE item list; nothing is
-// hard-coded copy.
+// results), opened from the "Analytics" button beside Business
+// setup. A timeframe showcase: exactly one timeframe is selected
+// at a time, and every statistic, observation and suggestion is
+// computed live from the stored monthly rows for that timeframe's
+// months; nothing is hard-coded copy.
 
 function AnalyticsPanel({
   title,
@@ -5634,46 +8167,38 @@ function AnalyticsPanel({
   );
 }
 
-function AnalyticsStatRow({
-  label,
-  value,
-  alert,
-}: {
-  label: string;
-  value: string;
-  alert?: boolean;
-}) {
-  return (
-    <div className="flex items-baseline justify-between gap-3 py-1">
-      <span className="text-sm text-[var(--dim)]">{label}</span>
-      <span
-        className="text-right text-sm font-bold"
-        style={alert ? { color: "var(--red)" } : undefined}
-      >
-        {value}
-      </span>
-    </div>
-  );
+type BitTimeframe = "quarter" | "firstHalf" | "secondHalf" | "year";
+
+/** "Dec 2025" -> "Dec". */
+function monthShortName(label: string): string {
+  return label.split(" ")[0] ?? label;
 }
 
-function AnalyticsTab({
-  business,
-  items,
-}: {
-  business: BitBusiness;
-  items: BitItem[];
-}) {
+/** A month range for picker sublabels: "Sep – Nov 2026" when the
+    months share a year, "Dec 2025 – Nov 2026" when they don't. */
+function monthRangeLabel(months: BitAnalyticsMonth[]): string {
+  const first = months[0];
+  const last = months[months.length - 1];
+  if (!first || !last) return "";
+  if (first.monthKey === last.monthKey) return first.label;
+  const sameYear = first.monthKey.slice(0, 4) === last.monthKey.slice(0, 4);
+  return sameYear
+    ? `${monthShortName(first.label)} – ${last.label}`
+    : `${first.label} – ${last.label}`;
+}
+
+function AnalyticsTab({ business }: { business: BitBusiness }) {
   const analytics = useQuery({
     queryKey: ["bit-analytics", business.id],
     queryFn: () => api.getBitAnalytics({ businessId: business.id }),
   });
+  const [timeframe, setTimeframe] = useState<BitTimeframe>("quarter");
   const rootRef = useRef<HTMLDivElement>(null);
   // Chart colours come from the app's theme tokens (the BIT blue
-  // accent, the alert red, axis greys), read off the rendered
-  // scope so the charts follow light/dark mode.
+  // accent, axis greys), read off the rendered scope so the chart
+  // follows light/dark mode.
   const [colors, setColors] = useState({
     accent: "#1e4f8a",
-    red: "#a02c18",
     dim: "#46564c",
     border: "#c9cfc9",
   });
@@ -5686,93 +8211,242 @@ function AnalyticsTab({
       cs.getPropertyValue(name).trim() || fallback;
     setColors({
       accent: pick("--accent", "#1e4f8a"),
-      red: pick("--red", "#a02c18"),
       dim: pick("--dim", "#46564c"),
       border: pick("--border", "#c9cfc9"),
     });
   }, [available]);
 
-  const stats = useMemo(() => {
+  const view = useMemo(() => {
     const data = analytics.data;
     if (!data || !data.available || data.months.length === 0) return null;
     const months = data.months;
+    const latest = months[months.length - 1];
+    if (!latest) return null;
+    const latestYear = Number(latest.monthKey.slice(0, 4));
+    const inYear = months.filter((m) =>
+      m.monthKey.startsWith(`${latestYear}-`),
+    );
+    const firstHalf = inYear.filter((m) => m.monthKey.slice(5) <= "06");
+    const secondHalf = inYear.filter((m) => m.monthKey.slice(5) >= "07");
+    const defs: {
+      id: BitTimeframe;
+      title: string;
+      sub: string;
+      months: BitAnalyticsMonth[];
+    }[] = [
+      {
+        id: "quarter",
+        title: "Past Quarter",
+        sub: monthRangeLabel(months.slice(-3)),
+        months: months.slice(-3),
+      },
+      {
+        id: "firstHalf",
+        title: `1H ${latestYear}`,
+        sub: monthRangeLabel(firstHalf),
+        months: firstHalf,
+      },
+      {
+        id: "secondHalf",
+        title: `2H ${latestYear}`,
+        sub:
+          monthRangeLabel(secondHalf) +
+          (secondHalf.length < 6
+            ? ` · ${secondHalf.length} of 6 months`
+            : ""),
+        months: secondHalf,
+      },
+      {
+        id: "year",
+        title: "Past Year",
+        sub: monthRangeLabel(months.slice(-12)),
+        months: months.slice(-12),
+      },
+    ];
+    const quarterDef = defs[0];
+    let active = defs.find((d) => d.id === timeframe) ?? quarterDef;
+    if (!active || active.months.length === 0) active = quarterDef;
+    if (!active) return null;
+    const tf = active.months;
+
     const sum = (f: (m: BitAnalyticsMonth) => number) =>
-      months.reduce((acc, m) => acc + f(m), 0);
-    const totalRevenue = sum((m) => m.revenue);
-    const totalGross = sum((m) => m.grossProfit);
-    const totalNet = sum((m) => m.netProfit);
-    const totalTx = sum((m) => m.transactions);
-    const totalUnits = sum((m) => m.unitsSold);
-    const totalDays = sum((m) => m.daysOpen);
-    const totalCogs = sum((m) => m.cogs);
-    const totalWaste = sum((m) => m.wasteCost);
-    const totalStockouts = sum((m) => m.stockoutEvents);
-    const best = months.reduce((a, m) => (m.revenue > a.revenue ? m : a));
-    const slowest = months.reduce((a, m) =>
-      m.revenue < a.revenue ? m : a,
-    );
-    const daily = (m: BitAnalyticsMonth) =>
-      m.daysOpen > 0 ? m.transactions / m.daysOpen : 0;
-    const bestDaily = months.reduce((a, m) => (daily(m) > daily(a) ? m : a));
-    const slowestDaily = months.reduce((a, m) =>
-      daily(m) < daily(a) ? m : a,
-    );
-    const shareOf = (keys: string[]) => {
-      const part = months
-        .filter((m) => keys.includes(m.monthKey.slice(5)))
-        .reduce((acc, m) => acc + m.revenue, 0);
-      return totalRevenue > 0 ? (part / totalRevenue) * 100 : 0;
-    };
-    const avgInventoryValue =
-      sum((m) => m.endingInventoryValue) / months.length;
-    const currentInventoryValue = items.reduce((acc, it) => {
-      const cost = data.itemCosts[it.name];
-      return cost != null ? acc + cost * it.onHand : acc;
-    }, 0);
-    const topMenu = [...data.menu]
-      .sort((a, b) => b.revenue - a.revenue)
-      .slice(0, 5);
-    const profitMin = Math.min(0, ...months.map((m) => m.netProfit));
-    const profitMax = Math.max(0, ...months.map((m) => m.netProfit));
-    const chartMonths = months.map((m) => ({
-      ...m,
-      short: m.label.split(" ")[0] ?? m.label,
-    }));
+      tf.reduce((acc, m) => acc + f(m), 0);
+    const revenue = sum((m) => m.revenue);
+    const grossProfit = sum((m) => m.grossProfit);
+    const netProfit = sum((m) => m.netProfit);
+    const transactions = sum((m) => m.transactions);
+    const units = sum((m) => m.unitsSold);
+    const waste = sum((m) => m.wasteCost);
+    const stockouts = sum((m) => m.stockoutEvents);
+    const netMarginPct = revenue > 0 ? (netProfit / revenue) * 100 : 0;
+    const grossMarginPct = revenue > 0 ? (grossProfit / revenue) * 100 : 0;
+    const avgTicket = transactions > 0 ? revenue / transactions : 0;
+    const wastePct = revenue > 0 ? (waste / revenue) * 100 : 0;
     const pct = (n: number) => `${n.toFixed(1)}%`;
+    // Waste is a small share of revenue, so it keeps two decimals
+    // (0.58% reads honestly where 0.6% would round it away).
+    const pct2 = (n: number) => `${n.toFixed(2)}%`;
+
+    const best = tf.reduce((a, m) => (m.revenue > a.revenue ? m : a));
+    const weakest = tf.reduce((a, m) => (m.revenue < a.revenue ? m : a));
+    const lossMonths = tf.filter((m) => m.netProfit < 0);
+    const lossTotal = lossMonths.reduce((acc, m) => acc - m.netProfit, 0);
+    const worstWaste = tf.reduce((a, m) =>
+      m.wasteCost > a.wasteCost ? m : a,
+    );
+    const stockoutMonths = tf.filter((m) => m.stockoutEvents > 0);
+    const monthNames = (list: BitAnalyticsMonth[]) =>
+      list.map((m) => m.label).join(", ");
+
+    // ---- Observations (priority order, first 5 that apply) ----
+    const observations: string[] = [];
+    // a. Strongest vs weakest month.
+    observations.push(
+      `${best.label} was the strongest month at ${fmtMoney(best.revenue)} — ${
+        weakest.revenue > 0
+          ? `${(best.revenue / weakest.revenue).toFixed(1)}× `
+          : ""
+      }${weakest.label}, the weakest at ${fmtMoney(weakest.revenue)}.`,
+    );
+    // b. Loss-making months.
+    if (lossMonths.length > 0) {
+      observations.push(
+        `${lossMonths.length} month${lossMonths.length === 1 ? "" : "s"} lost money — ${monthNames(lossMonths)} — a combined loss of ${fmtMoney(lossTotal)}.`,
+      );
+    } else {
+      const weakestNet = tf.reduce((a, m) =>
+        m.netProfit < a.netProfit ? m : a,
+      );
+      observations.push(
+        `Every month in this period was profitable — even the weakest, ${weakestNet.label}, made ${fmtMoney(weakestNet.netProfit)}.`,
+      );
+    }
+    // c. Margin structure.
+    const grossMargins = tf.map((m) =>
+      m.revenue > 0 ? (m.grossProfit / m.revenue) * 100 : 0,
+    );
+    const netMargins = tf.map((m) =>
+      m.revenue > 0 ? (m.netProfit / m.revenue) * 100 : 0,
+    );
+    observations.push(
+      `Gross margin held in a narrow band (${pct(Math.min(...grossMargins))}–${pct(Math.max(...grossMargins))}) while net margin swung from ${pct(Math.min(...netMargins))} to ${pct(Math.max(...netMargins))} — profit here is volume-driven: the same product margins, spread over fixed costs.`,
+    );
+    // d. Waste.
+    observations.push(
+      `Waste cost ${fmtMoney(waste)} (${pct2(wastePct)} of revenue), worst in ${worstWaste.label} at ${fmtMoney(worstWaste.wasteCost)}.`,
+    );
+    // e. Stockouts. Every claim here is gated to the numbers
+    // shown (Beta 0.05, audit #11): the timeframe's events are
+    // counted from the timeframe itself, and dataset-wide figures
+    // are labelled as dataset-wide in their own sentence — no
+    // unconditional claims about when stockouts happen.
+    if (stockouts > 0) {
+      observations.push(
+        `${stockouts} stockout event${stockouts === 1 ? "" : "s"} in this period, in ${stockoutMonths
+          .map((m) => `${m.label} (${m.stockoutEvents})`)
+          .join(", ")}.`,
+      );
+    } else if (data.stockoutEvents > 0) {
+      observations.push(
+        `No stockouts in this period. Across the full dataset there have been ${data.stockoutEvents} stockout event${data.stockoutEvents === 1 ? "" : "s"} in total.`,
+      );
+    }
+    // f. Momentum.
+    const firstMonth = tf[0];
+    const lastMonth = tf[tf.length - 1];
+    if (firstMonth && lastMonth && tf.length >= 2 && firstMonth.revenue > 0) {
+      const change =
+        ((lastMonth.revenue - firstMonth.revenue) / firstMonth.revenue) * 100;
+      observations.push(
+        `Revenue ${change >= 0 ? "grew" : "fell"} ${pct(Math.abs(change))} from ${firstMonth.label} (${fmtMoney(firstMonth.revenue)}) to ${lastMonth.label} (${fmtMoney(lastMonth.revenue)}) across the period.`,
+      );
+    }
+
+    // ---- Suggestions (conditional rules, first 5 that apply) ----
+    const suggestions: string[] = [];
+    // a. Slow-month plan.
+    if (lossMonths.length > 0) {
+      suggestions.push(
+        `Plan for the slow months: ${monthNames(lossMonths)} lost a combined ${fmtMoney(lossTotal)}. Lower pars, shorter hours or a trimmed slow-season menu in those months would cut the fixed-cost bleed.`,
+      );
+    }
+    // b. Stockout pars. The timeframe count and the dataset-wide
+    // lost-sales estimate stay in separate sentences, the
+    // dataset figure labelled as dataset-wide (Beta 0.05, #11).
+    if (stockouts > 0) {
+      suggestions.push(
+        `Raise pars on the peak-season sellers before the rush: ${stockouts} stockout event${stockouts === 1 ? "" : "s"} in ${monthNames(stockoutMonths)}. Across the full dataset, stockouts cost an estimated ${fmtMoney(data.lostRevenue)} in lost sales (${data.lostUnits.toLocaleString("en-CA")} units).`,
+      );
+    }
+    // c. Waste tightening.
+    if (wastePct >= 0.5) {
+      if (active.id === "year" && data.tubWaste.length > 0) {
+        suggestions.push(
+          `Tighten slow-season pars: waste ran ${pct2(wastePct)} of revenue (${fmtMoney(waste)}). Across the full dataset, the biggest write-offs were ${data.tubWaste
+            .map((w) => `${w.name} (${w.tubs.toFixed(2)} tubs)`)
+            .join(", ")} — order those flavours lighter in the slow months.`,
+        );
+      } else {
+        suggestions.push(
+          `Tighten slow-season pars: waste ran ${pct2(wastePct)} of revenue (${fmtMoney(waste)}), worst in ${worstWaste.label} at ${fmtMoney(worstWaste.wasteCost)} — trim orders heading into the slow weeks.`,
+        );
+      }
+    }
+    // d. Peak preparation.
+    const sortedRevenue = tf.map((m) => m.revenue).sort((a, b) => a - b);
+    const mid = Math.floor(sortedRevenue.length / 2);
+    const medianRevenue =
+      sortedRevenue.length % 2 === 1
+        ? (sortedRevenue[mid] ?? 0)
+        : ((sortedRevenue[mid - 1] ?? 0) + (sortedRevenue[mid] ?? 0)) / 2;
+    if (medianRevenue > 0 && best.revenue >= 2 * medianRevenue) {
+      suggestions.push(
+        `Set peak-season pars by the peak month, not the average month: ${best.label} brought in ${fmtMoney(best.revenue)}, ${(best.revenue / medianRevenue).toFixed(1)}× the typical month (${fmtMoney(medianRevenue)}).`,
+      );
+    }
+    // e. Price lever.
+    const tickets = tf.map((m) =>
+      m.transactions > 0 ? m.revenue / m.transactions : 0,
+    );
+    const ticketSpread = Math.max(...tickets) - Math.min(...tickets);
+    if (ticketSpread < 0.25) {
+      suggestions.push(
+        `The average ticket barely moved across the period (${fmtMoney(Math.min(...tickets))}–${fmtMoney(Math.max(...tickets))}), so a small price increase on the top sellers is the cleanest lever for the slow months — volume, not price, is what swings here.`,
+      );
+    }
+    // f. Always-available fallback.
+    suggestions.push(
+      `Keep the weekly par-restock rhythm: it held waste to ${pct2(wastePct)} of revenue across ${transactions.toLocaleString("en-CA")} transactions in this period.`,
+    );
+
+    const chartMonths = tf.map((m) => ({
+      ...m,
+      short: monthShortName(m.label),
+    }));
+
     return {
       data,
-      months,
-      chartMonths,
-      totalRevenue,
-      totalGross,
-      totalNet,
-      totalTx,
-      totalUnits,
-      totalDays,
-      totalCogs,
-      totalWaste,
-      totalStockouts,
-      grossMarginPct: totalRevenue > 0 ? (totalGross / totalRevenue) * 100 : 0,
-      profitableMonths: months.filter((m) => m.netProfit > 0).length,
-      best,
-      slowest,
-      bestDaily,
-      slowestDaily,
-      bestDailyRate: daily(bestDaily),
-      slowestDailyRate: daily(slowestDaily),
-      avgDailyTx: totalDays > 0 ? totalTx / totalDays : 0,
-      peakToTrough: slowest.revenue > 0 ? best.revenue / slowest.revenue : 0,
-      summerShare: shareOf(["06", "07", "08"]),
-      winterShare: shareOf(["12", "01", "02"]),
-      avgInventoryValue,
-      turnover: avgInventoryValue > 0 ? totalCogs / avgInventoryValue : 0,
-      currentInventoryValue,
-      topMenu,
-      profitMin,
-      profitMax,
+      defs,
+      active,
+      revenue,
+      grossProfit,
+      netProfit,
+      transactions,
+      units,
+      waste,
+      stockouts,
+      netMarginPct,
+      grossMarginPct,
+      avgTicket,
+      wastePct,
       pct,
+      pct2,
+      observations: observations.slice(0, 5),
+      suggestions: suggestions.slice(0, 5),
+      chartMonths,
+      bestKey: best.monthKey,
     };
-  }, [analytics.data, items]);
+  }, [analytics.data, timeframe]);
 
   return (
     <div ref={rootRef} className="flex flex-col gap-3 pt-3">
@@ -5788,58 +8462,91 @@ function AnalyticsTab({
       )}
       {analytics.data && !analytics.data.available && (
         <p className="py-6 text-center text-sm text-[var(--dim)]">
-          No analytics data for this business yet.
+          No analytics for this business yet. Analytics are built
+          from a business&rsquo;s monthly sales results — revenue,
+          profit, waste, and stockouts. Once a month of results is
+          on file, the charts, observations, and suggestions appear
+          here.
         </p>
       )}
-      {stats && (
+      {view && (
         <>
+          {/* Timeframe picker: single-select, one timeframe at a time */}
+          <div
+            className="grid grid-cols-2 gap-2"
+            role="group"
+            aria-label="Analytics timeframe"
+          >
+            {view.defs.map((d) => {
+              const selected = d.id === view.active.id;
+              return (
+                <button
+                  key={d.id}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => setTimeframe(d.id)}
+                  className="rounded-xl border-2 p-3 text-left"
+                  style={
+                    selected
+                      ? {
+                          borderColor: "var(--accent)",
+                          backgroundColor: "var(--accent-soft)",
+                        }
+                      : {
+                          borderColor: "var(--border)",
+                          backgroundColor: "var(--surface)",
+                        }
+                  }
+                >
+                  <span className="block text-base font-bold">{d.title}</span>
+                  <span className="block text-xs text-[var(--dim)]">
+                    {d.sub}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
           <p className="text-sm text-[var(--dim)]">
-            <span
-              className="mr-2 rounded-full px-2 py-0.5 text-xs font-bold"
-              style={{
-                backgroundColor: "var(--accent-soft)",
-                color: "var(--accent)",
-              }}
-            >
-              Sim 01
-            </span>
-            {stats.data.label} — simulation data, {stats.data.periodLabel}.
-            Statistics below are computed from the stored monthly results.
+            {view.data.label ?? "Analytics"}
+            {view.data.periodLabel ? ` · ${view.data.periodLabel}` : ""}
           </p>
 
-          {/* Headline cards */}
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+          {/* Statistics for the selected timeframe */}
+          <div className="grid grid-cols-2 gap-2">
             {[
               {
-                label: "Total revenue",
-                value: fmtMoney(stats.totalRevenue),
-                sub: `${stats.months.length} months · ${stats.totalDays} days open`,
-              },
-              {
-                label: "Gross margin",
-                value: stats.pct(stats.grossMarginPct),
-                sub: `Gross profit ${fmtMoney(stats.totalGross)}`,
+                label: "Revenue",
+                value: fmtMoney(view.revenue),
               },
               {
                 label: "Net profit",
-                value: fmtMoney(stats.totalNet),
-                sub: `Profitable ${stats.profitableMonths} of ${stats.months.length} months`,
-                alert: stats.totalNet < 0,
+                value: fmtMoney(view.netProfit),
+                sub: `Net margin ${view.pct(view.netMarginPct)}`,
+                alert: view.netProfit < 0,
               },
               {
-                label: "Total transactions",
-                value: stats.totalTx.toLocaleString("en-CA"),
-                sub: `${stats.totalUnits.toLocaleString("en-CA")} units sold`,
+                label: "Gross margin",
+                value: view.pct(view.grossMarginPct),
+                sub: `Gross profit ${fmtMoney(view.grossProfit)}`,
               },
               {
-                label: "Avg daily transactions",
-                value: stats.avgDailyTx.toFixed(1),
-                sub: `Best: ${stats.bestDaily.label} · ${stats.bestDailyRate.toFixed(1)}/day`,
+                label: "Transactions",
+                value: view.transactions.toLocaleString("en-CA"),
+                sub: `Avg ticket ${fmtMoney(view.avgTicket)}`,
               },
               {
-                label: "Slowest daily pace",
-                value: `${stats.slowestDailyRate.toFixed(1)}/day`,
-                sub: `${stats.slowestDaily.label} · ${stats.slowestDaily.transactions.toLocaleString("en-CA")} transactions`,
+                label: "Units sold",
+                value: view.units.toLocaleString("en-CA"),
+              },
+              {
+                label: "Waste cost",
+                value: fmtMoney(view.waste),
+                sub: `${view.pct2(view.wastePct)} of revenue`,
+              },
+              {
+                label: "Stockout events",
+                value: String(view.stockouts),
+                alert: view.stockouts > 0,
               },
             ].map((card) => (
               <div
@@ -5863,21 +8570,19 @@ function AnalyticsTab({
                 >
                   {card.value}
                 </p>
-                <p className="mt-0.5 text-xs text-[var(--dim)]">{card.sub}</p>
+                {"sub" in card && card.sub && (
+                  <p className="mt-0.5 text-xs text-[var(--dim)]">{card.sub}</p>
+                )}
               </div>
             ))}
           </div>
 
-          {/* Revenue by month */}
+          {/* Monthly revenue for the selected timeframe */}
           <AnalyticsPanel title="Revenue by month">
-            <p className="mb-1 text-xs text-[var(--dim)]">
-              Best month highlighted: {stats.best.label} (
-              {fmtMoney(stats.best.revenue)})
-            </p>
-            <div style={{ width: "100%", height: 220 }}>
+            <div style={{ width: "100%", height: 180 }}>
               <ResponsiveContainer>
                 <BarChart
-                  data={stats.chartMonths}
+                  data={view.chartMonths}
                   margin={{ top: 8, right: 4, bottom: 0, left: 4 }}
                 >
                   <CartesianGrid
@@ -5908,11 +8613,11 @@ function AnalyticsTab({
                     ]}
                   />
                   <Bar dataKey="revenue" radius={[3, 3, 0, 0]}>
-                    {stats.chartMonths.map((m) => (
+                    {view.chartMonths.map((m) => (
                       <Cell
                         key={m.monthKey}
                         fill={colors.accent}
-                        fillOpacity={m.monthKey === stats.best.monthKey ? 1 : 0.45}
+                        fillOpacity={m.monthKey === view.bestKey ? 1 : 0.45}
                       />
                     ))}
                   </Bar>
@@ -5921,212 +8626,22 @@ function AnalyticsTab({
             </div>
           </AnalyticsPanel>
 
-          {/* Net profit by month */}
-          <AnalyticsPanel title="Net profit by month">
-            <p className="mb-1 text-xs text-[var(--dim)]">
-              Months that lost money are shown in the alert colour.
-            </p>
-            <div style={{ width: "100%", height: 220 }}>
-              <ResponsiveContainer>
-                <BarChart
-                  data={stats.chartMonths}
-                  margin={{ top: 8, right: 4, bottom: 0, left: 4 }}
-                >
-                  <CartesianGrid
-                    stroke={colors.border}
-                    strokeDasharray="3 3"
-                    vertical={false}
-                  />
-                  <XAxis
-                    dataKey="short"
-                    tick={{ fontSize: 11, fill: colors.dim }}
-                    tickLine={{ stroke: colors.border }}
-                    axisLine={{ stroke: colors.border }}
-                    interval={0}
-                  />
-                  <YAxis
-                    domain={[stats.profitMin, stats.profitMax]}
-                    tick={{ fontSize: 11, fill: colors.dim }}
-                    tickLine={false}
-                    axisLine={false}
-                    tickFormatter={(v: number) => fmtMoneyShort(v)}
-                    width={46}
-                  />
-                  <Tooltip
-                    cursor={{ fill: "#888888", fillOpacity: 0.12 }}
-                    formatter={(v) => [
-                      fmtMoney(typeof v === "number" ? v : 0),
-                      "Net profit",
-                    ]}
-                  />
-                  <ReferenceLine y={0} stroke={colors.dim} />
-                  <Bar dataKey="netProfit" radius={[3, 3, 0, 0]}>
-                    {stats.chartMonths.map((m) => (
-                      <Cell
-                        key={m.monthKey}
-                        fill={m.netProfit < 0 ? colors.red : colors.accent}
-                      />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-            </div>
-            <div className="mt-2 overflow-x-auto">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="text-left text-xs text-[var(--dim)]">
-                    <th className="py-1 pr-2 font-semibold">Month</th>
-                    <th className="py-1 pr-2 text-right font-semibold">
-                      Revenue
-                    </th>
-                    <th className="py-1 pr-2 text-right font-semibold">
-                      Net profit
-                    </th>
-                    <th className="py-1 text-right font-semibold">
-                      Transactions
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {stats.months.map((m) => (
-                    <tr
-                      key={m.monthKey}
-                      className="border-t"
-                      style={{ borderColor: "var(--border)" }}
-                    >
-                      <td className="py-1 pr-2 font-semibold">{m.label}</td>
-                      <td className="py-1 pr-2 text-right">
-                        {fmtMoney(m.revenue)}
-                      </td>
-                      <td
-                        className="py-1 pr-2 text-right"
-                        style={
-                          m.netProfit < 0
-                            ? { color: "var(--red)", fontWeight: 700 }
-                            : undefined
-                        }
-                      >
-                        {fmtMoney(m.netProfit)}
-                      </td>
-                      <td className="py-1 text-right">
-                        {m.transactions.toLocaleString("en-CA")}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </AnalyticsPanel>
-
-          {/* Seasonality */}
-          <AnalyticsPanel title="Busy & slow times of year">
-            <AnalyticsStatRow
-              label="Busiest month"
-              value={`${stats.best.label} — ${fmtMoney(stats.best.revenue)}`}
-            />
-            <AnalyticsStatRow
-              label="Slowest month"
-              value={`${stats.slowest.label} — ${fmtMoney(stats.slowest.revenue)}`}
-            />
-            <AnalyticsStatRow
-              label="Peak-to-trough revenue ratio"
-              value={`${stats.peakToTrough.toFixed(1)}×`}
-            />
-            <AnalyticsStatRow
-              label="Jun–Aug share of annual revenue"
-              value={stats.pct(stats.summerShare)}
-            />
-            <AnalyticsStatRow
-              label="Dec–Feb share of annual revenue"
-              value={stats.pct(stats.winterShare)}
-            />
-            <AnalyticsStatRow
-              label="Busiest daily pace"
-              value={`${stats.bestDaily.label} — ${stats.bestDailyRate.toFixed(1)} transactions/day`}
-            />
-            <AnalyticsStatRow
-              label="Slowest daily pace"
-              value={`${stats.slowestDaily.label} — ${stats.slowestDailyRate.toFixed(1)} transactions/day`}
-            />
-          </AnalyticsPanel>
-
-          {/* Top menu items */}
-          <AnalyticsPanel title="Top menu items by revenue">
-            <ol className="flex flex-col">
-              {stats.topMenu.map((item, i) => (
-                <li
-                  key={item.name}
-                  className="flex items-baseline justify-between gap-3 py-1"
-                >
-                  <span className="min-w-0 text-sm">
-                    <span className="font-bold text-[var(--dim)]">
-                      {i + 1}.
-                    </span>{" "}
-                    <span className="font-semibold">{item.name}</span>{" "}
-                    <span className="text-[var(--dim)]">
-                      · {item.units.toLocaleString("en-CA")} sold
-                    </span>
-                  </span>
-                  <span className="shrink-0 text-sm font-bold">
-                    {fmtMoney(item.revenue)}{" "}
-                    <span className="font-semibold text-[var(--dim)]">
-                      (
-                      {stats.pct(
-                        stats.totalRevenue > 0
-                          ? (item.revenue / stats.totalRevenue) * 100
-                          : 0,
-                      )}
-                      )
-                    </span>
-                  </span>
-                </li>
+          {/* Observations */}
+          <AnalyticsPanel title="Observations">
+            <ul className="flex list-disc flex-col gap-1.5 pl-5 text-sm">
+              {view.observations.map((o) => (
+                <li key={o}>{o}</li>
               ))}
-            </ol>
+            </ul>
           </AnalyticsPanel>
 
-          {/* Inventory */}
-          <AnalyticsPanel title="Inventory">
-            <AnalyticsStatRow
-              label="Inventory turnover (annual COGS ÷ avg inventory value)"
-              value={`${stats.turnover.toFixed(1)}×`}
-            />
-            <AnalyticsStatRow
-              label="Average inventory value"
-              value={fmtMoney(stats.avgInventoryValue)}
-            />
-            <AnalyticsStatRow
-              label="Current inventory value (live stock, at cost)"
-              value={fmtMoney(stats.currentInventoryValue)}
-            />
-            <AnalyticsStatRow
-              label="Total waste cost"
-              value={fmtMoney(stats.totalWaste)}
-            />
-            <AnalyticsStatRow
-              label="Stockout events"
-              value={`${stats.totalStockouts} — ${fmtMoney(stats.data.lostRevenue)} lost revenue (${stats.data.lostUnits} units)`}
-              alert={stats.totalStockouts > 0}
-            />
-            <AnalyticsStatRow
-              label="Supplier orders placed"
-              value={String(
-                stats.months.reduce((acc, m) => acc + m.ordersPlaced, 0),
-              )}
-            />
-            {stats.data.tubWaste.length > 0 && (
-              <div className="pt-1">
-                <p className="text-sm font-semibold">
-                  Slow-season tub waste (written off)
-                </p>
-                {stats.data.tubWaste.map((w) => (
-                  <AnalyticsStatRow
-                    key={w.name}
-                    label={w.name}
-                    value={`${w.tubs.toFixed(2)} tubs`}
-                  />
-                ))}
-              </div>
-            )}
+          {/* Suggestions */}
+          <AnalyticsPanel title="Suggestions">
+            <ul className="flex list-disc flex-col gap-1.5 pl-5 text-sm">
+              {view.suggestions.map((s) => (
+                <li key={s}>{s}</li>
+              ))}
+            </ul>
           </AnalyticsPanel>
         </>
       )}
@@ -6145,13 +8660,27 @@ const BIT_TABS: { id: BitTab; label: string }[] = [
 export function BitApp({ onSwitch }: { onSwitch: () => void }) {
   const queryClient = useQueryClient();
   const [tab, setTab] = useState<BitTab>("inventory");
-  const [setupOpen, setSetupOpen] = useState(false);
+  // Add-only setup (Alpha 0.88): true while the "Add New Business"
+  // flow at the bottom of the BIT view is open. There is no
+  // re-run/edit mode for an existing business's setup anymore —
+  // once a business is set up, its setup cannot be erased.
+  const [addOpen, setAddOpen] = useState(false);
   // The active business (Alpha 0.69): null = the first business,
   // exactly the pre-switcher behaviour. Switching swaps every tab
   // — inventory, checks, order email, POS — to the chosen business.
   const [activeBusinessId, setActiveBusinessId] = useState<number | null>(
     null,
   );
+  // Accessibility (audit #5, second half): the Primary vs
+  // Connected settings page, shared with the household side —
+  // opened from the settings drawer, it replaces the BIT content
+  // while open. The policy covers BIT action types too, so it is
+  // reachable from here as well as from HIT.
+  const [policyOpen, setPolicyOpen] = useState(false);
+  // Settings drawer: opened by the gear beside the BIT title; it
+  // holds the Accessibility entry and the Switch to HIT control
+  // (moved out of this strip and the business box).
+  const [settingsOpen, setSettingsOpen] = useState(false);
   const state = useQuery({
     queryKey: ["bit", activeBusinessId],
     queryFn: () => api.getBitState({ businessId: activeBusinessId }),
@@ -6170,36 +8699,61 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
 
   const data = state.data;
   const business = data?.business ?? null;
-  const showWizard = business == null || setupOpen;
+  const showWizard = business == null || addOpen;
 
   return (
     <div className="bit-scope">
-      <div className="flex items-center justify-between gap-2 pt-2">
+      {/* Header strip: the BIT title, enlarged to fill its row,
+          with the settings gear beside it. The title flexes and
+          truncates first — the gear is shrink-0 and is never
+          crowded out. The gear opens the settings drawer from the
+          left, which now holds the Accessibility entry and the
+          Switch to HIT control (moved out of this strip and the
+          business box), so there is always exactly one way back
+          to HIT, whatever state the business side is in. */}
+      <div className="flex items-center gap-2 pt-2">
         <span
-          className="text-xs font-bold tracking-wide"
+          className="min-w-0 flex-1 truncate text-base font-extrabold tracking-wide sm:text-xl"
           style={{ color: "var(--accent)" }}
         >
           BIT — BUSINESS INVENTORY TRACKER
         </span>
-        <button
-          type="button"
-          onClick={onSwitch}
-          className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
-          style={{
-            backgroundColor: "var(--surface-alt)",
-            color: "var(--text)",
-          }}
-        >
-          ⇄ Switch app
-        </button>
+        <GearButton
+          open={settingsOpen}
+          onClick={() => setSettingsOpen(true)}
+        />
       </div>
 
-      {state.isPending && (
+      <SettingsDrawer
+        open={settingsOpen}
+        onClose={() => setSettingsOpen(false)}
+      >
+        <SettingsDrawerItem
+          label="Accessibility"
+          onClick={() => {
+            setSettingsOpen(false);
+            setPolicyOpen(true);
+          }}
+        />
+        <SettingsDrawerItem
+          label="⇄ Switch to HIT"
+          onClick={() => {
+            setSettingsOpen(false);
+            onSwitch();
+          }}
+        />
+      </SettingsDrawer>
+
+      {policyOpen && (
+        <AccountPolicy onClose={() => setPolicyOpen(false)} />
+      )}
+
+      {!policyOpen && state.isPending && (
         <p className="py-8 text-center text-sm text-[var(--dim)]">
           Loading the business side…
         </p>
       )}
-      {state.isError && (
+      {!policyOpen && state.isError && (
         <div className="py-8 text-center">
           <p className="text-sm font-semibold text-[var(--red)]">
             The business side couldn't load.
@@ -6218,70 +8772,94 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
         </div>
       )}
 
-      {data && showWizard && (
+      {!policyOpen && data && showWizard && (
         <BitSetupWizard
-          business={business}
-          businessId={business?.id ?? activeBusinessId}
-          scans={data.scans}
-          onDone={() => setSetupOpen(false)}
-          onCancel={business ? () => setSetupOpen(false) : null}
+          // The wizard only ever creates a NEW business (first
+          // run, or an additional one via "Add New Business"), so
+          // it is never handed an existing business to prefill
+          // from or target — existing setups stay untouched.
+          business={null}
+          businessId={null}
+          scans={addOpen ? [] : data.scans}
+          onDone={(newBusinessId) => {
+            setAddOpen(false);
+            // Land on the business just created; it also appears
+            // in the business switcher alongside the existing
+            // ones, which are completely untouched.
+            setActiveBusinessId(newBusinessId);
+          }}
+          onCancel={business ? () => setAddOpen(false) : null}
           onDismissScan={(scan) => dismissScan.mutate(scan)}
         />
       )}
 
-      {data && business && !showWizard && (
+      {!policyOpen && data && business && !showWizard && (
         <>
-          {data.businesses.length > 1 && (
-            <div className="flex items-center gap-2 pt-2">
-              <label
-                htmlFor="bit-business-switcher"
-                className="shrink-0 text-sm font-bold text-[var(--dim)]"
-              >
-                Business
-              </label>
-              <select
-                id="bit-business-switcher"
-                aria-label="Switch business"
-                value={business.id}
-                onChange={(e) => {
-                  setActiveBusinessId(Number(e.target.value));
-                  setSetupOpen(false);
-                  setTab("inventory");
-                }}
-                className="min-w-0 flex-1 rounded-full border px-3 py-2 text-sm font-bold"
-                style={{
-                  borderColor: "var(--border)",
-                  backgroundColor: "var(--surface)",
-                  color: "var(--text)",
-                }}
-              >
-                {data.businesses.map((b) => (
-                  <option key={b.id} value={b.id}>
-                    {b.name}
-                  </option>
-                ))}
-              </select>
+          {/* The business box: the active business's name and
+              stats, and its business switcher. (The switch control
+              back to HIT lives in the settings drawer now.) */}
+          <div
+            className="mt-2 rounded-2xl border p-3"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+          >
+            <div className="flex items-start justify-between gap-2">
+              <header className="min-w-0">
+                <h2 className="truncate text-2xl font-bold">
+                  {business.name}
+                </h2>
+                <p className="text-sm text-[var(--dim)]">
+                  {typeLabel(business)} · {data.items.length} items ·{" "}
+                  {
+                    data.items.filter(
+                      (i) =>
+                        // ONE par definition app-wide (Beta 0.02,
+                        // audit #3): an item needs ordering when it
+                        // is at or below par AND a par is set
+                        // (par > 0). No-par items (par 0 — e.g. the
+                        // Quartermaster catalogue group) never count.
+                        i.onHand <= i.par && i.par > 0,
+                    ).length
+                  }{" "}
+                  at or below par
+                </p>
+              </header>
             </div>
-          )}
-          <header className="pt-1">
-            <h2 className="truncate text-2xl font-bold">
-              {business.name}
-            </h2>
-            <p className="text-sm text-[var(--dim)]">
-              {typeLabel(business)} · {data.items.length} items ·{" "}
-              {
-                data.items.filter(
-                  (i) =>
-                    i.onHand <= i.par &&
-                    // A requisition business's no-par items (par 0 —
-                    // e.g. the Quartermaster catalogue group) never
-                    // count toward the requisition build.
-                    (!business.usesRequisition || i.par > 0),
-                ).length
-              }{" "}
-              at or below par
-            </p>
-          </header>
+            {data.businesses.length > 1 && (
+              <div className="mt-2 flex items-center gap-2">
+                <label
+                  htmlFor="bit-business-switcher"
+                  className="shrink-0 text-sm font-bold text-[var(--dim)]"
+                >
+                  Business
+                </label>
+                <select
+                  id="bit-business-switcher"
+                  aria-label="Switch business"
+                  value={business.id}
+                  onChange={(e) => {
+                    setActiveBusinessId(Number(e.target.value));
+                    setAddOpen(false);
+                    setTab("inventory");
+                  }}
+                  className="min-w-0 flex-1 rounded-full border px-3 py-2 text-sm font-bold"
+                  style={{
+                    borderColor: "var(--border)",
+                    backgroundColor: "var(--surface)",
+                    color: "var(--text)",
+                  }}
+                >
+                  {data.businesses.map((b) => (
+                    <option key={b.id} value={b.id}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+          </div>
 
           <nav aria-label="Business tracker" className="pt-2">
             <div
@@ -6289,16 +8867,14 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
               style={{ backgroundColor: "var(--surface)" }}
               role="group"
             >
-              {(business.hasAnalytics
-                ? [...BIT_TABS, { id: "analytics" as BitTab, label: "Analytics" }]
-                : BIT_TABS
-              ).map((t) => {
+              {BIT_TABS.map((t) => {
                 const badge =
                   t.id === "order"
                     ? data.items.filter(
-                        (i) =>
-                          i.onHand <= i.par &&
-                          (!business.usesRequisition || i.par > 0),
+                        // Same one par definition as the business-box
+                        // subtitle (Beta 0.02, audit #3): at or below
+                        // par with a par set (par > 0).
+                        (i) => i.onHand <= i.par && i.par > 0,
                       ).length
                     : 0;
                 // Requisition businesses (TFS) call the third tab
@@ -6314,7 +8890,7 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
                     type="button"
                     aria-pressed={tab === t.id}
                     onClick={() => setTab(t.id)}
-                    className="min-w-0 flex-1 truncate rounded-full px-0.5 py-2 text-[11.5px] font-bold"
+                    className="min-w-0 flex-1 truncate rounded-full px-0.5 py-2 text-[12px] font-bold"
                     style={
                       tab === t.id
                         ? {
@@ -6331,15 +8907,29 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
               })}
             </div>
           </nav>
-          <div className="flex justify-end pt-1">
-            <button
-              type="button"
-              className="text-xs font-bold"
-              style={{ color: "var(--accent)" }}
-              onClick={() => setSetupOpen(true)}
-            >
-              Business setup
-            </button>
+          <div className="flex items-center justify-between gap-2 pt-1">
+            {business.hasAnalytics ? (
+              <button
+                type="button"
+                aria-pressed={tab === "analytics"}
+                onClick={() => setTab("analytics")}
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                  ...(tab === "analytics"
+                    ? {
+                        boxShadow:
+                          "0 0 0 2px var(--bg), 0 0 0 4.5px var(--accent)",
+                      }
+                    : {}),
+                }}
+              >
+                Analytics
+              </button>
+            ) : (
+              <span />
+            )}
           </div>
 
           {tab === "rounds" && (
@@ -6353,13 +8943,16 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
             <InventoryTab
               business={business}
               items={data.items}
+              rounds={data.rounds}
               scans={data.scans}
               wasteLog={data.wasteLog}
+              stockEvents={data.stockEvents}
+              manifestImports={data.manifestImports}
               onDismissScan={(scan) => dismissScan.mutate(scan)}
             />
           )}
           {tab === "analytics" && business.hasAnalytics && (
-            <AnalyticsTab business={business} items={data.items} />
+            <AnalyticsTab business={business} />
           )}
           {tab === "order" &&
             (business.usesRequisition ? (
@@ -6378,6 +8971,30 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
                 rounds={data.rounds}
               />
             ))}
+
+          {/* Add New Business (Alpha 0.88): the very last element
+              of the BIT view, below every tab's content. It opens
+              the setup wizard in add-only mode — finishing adds a
+              new business alongside the existing ones; there is
+              no way to erase or reset an existing business's
+              setup. Sized a touch smaller than the old "Business
+              setup" button it replaces, with its text at the
+              app's 12px floor (audit #10). */}
+          <div className="flex justify-center pt-8 pb-2">
+            <button
+              type="button"
+              onClick={() => setAddOpen(true)}
+              className="font-bold"
+              style={{
+                color: "var(--accent)",
+                fontSize: "12px",
+                lineHeight: "16.2px",
+                padding: "7.2px 14.4px",
+              }}
+            >
+              Add New Business
+            </button>
+          </div>
         </>
       )}
     </div>

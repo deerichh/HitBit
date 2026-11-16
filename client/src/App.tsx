@@ -4,17 +4,27 @@ import { ShoppingTab } from "./ShoppingTab";
 import { HitListTab } from "./HitListTab";
 import { MealPlannerTab } from "./MealPlannerTab";
 import { BitApp } from "./BitApp";
+import { HouseholdSetup } from "./HouseholdSetup";
+import { AccountPolicy } from "./AccountPolicy";
+import {
+GearButton,
+SettingsDrawer,
+SettingsDrawerItem,
+} from "./SettingsDrawer";
+import { RecipeVideosSection } from "./RecipeVideosSection";
 
 type Tab = "shopping" | "hit" | "meals";
 type Side = "chooser" | "hit" | "bit";
 
 /** The app's display title, version included. Every place the title
     shows follows from this one constant.
-    The Alpha number is a decimal counter: each app update adds 0.01.
+    The Beta number is a decimal counter: each app update adds 0.01.
     The second decimal digit increments (0.53 → 0.54 → … → 0.59), then
     resets to 0 while the first decimal digit increments (0.59 → 0.60),
-    carrying into the integer at 0.99 → 1.00. */
-export const APP_TITLE = "HitBit - Alpha 0.76";
+    carrying into the integer at 0.99 → 1.00. (The counter ran as
+    Alpha up to 0.99; update 101 renamed it Beta and restarted the
+    numbering at 0.01.) */
+export const APP_TITLE = "HitBit - Beta 0.01";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "meals", label: "Meal Planner" },
@@ -385,8 +395,10 @@ function TruckScene() {
 /**
  * The launch chooser: shown on every fresh launch, before any tabs.
  * Two large tappable choices — HIT (the household side, unchanged)
- * and BIT (the business side, its own data). Each side carries a
- * "Switch app" control in its header that returns here.
+ * and BIT (the business side, its own data). Each side's settings
+ * drawer (the gear beside its title) carries the switch control
+ * that returns here — "Switch to BIT" on the household side,
+ * "Switch to HIT" on the business side.
  */
 function LaunchChooser({ onPick }: { onPick: (side: Side) => void }) {
   return (
@@ -430,11 +442,26 @@ function LaunchChooser({ onPick }: { onPick: (side: Side) => void }) {
 
 export function App() {
   // A fresh launch lands on the chooser; entering a side shows that
-  // side's interface, and each side's "Switch app" control returns
+  // side's interface, and each side's switch control returns
   // here. Component state only — nothing is persisted, so relaunching
   // the app always shows the chooser again.
   const [side, setSide] = useState<Side>("chooser");
   const [tab, setTab] = useState<Tab>("meals");
+  // HIT setup questionnaire (Alpha 0.90): opened from the Setup
+  // entry in the settings drawer; an in-flow page that takes
+  // the place of the tab content while it's open. It never opens
+  // on its own — the household is already set up.
+  const [hitSetupOpen, setHitSetupOpen] = useState(false);
+  // Accessibility (audit #5, second half): the Primary vs
+  // Connected settings page — acting role + undo policy. Opened
+  // from the settings drawer like Household Setup; an in-flow page
+  // that replaces the tab content while open. The account system
+  // lives here, not in the daily flows.
+  const [accountOpen, setAccountOpen] = useState(false);
+  // Settings drawer: opened by the gear beside the app title; it
+  // holds the Accessibility entry, Household Setup, Recipe
+  // Videos, and the Switch control (moved out of the side strip).
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // One random seed per app launch (page load). It lives here, above
   // the tabs, so switching tabs doesn't reshuffle — only relaunching
   // the app does. The Meal Planner uses it to shuffle its meal
@@ -457,28 +484,68 @@ export function App() {
 
         {side === "hit" && (
           <>
-            {/* Side strip: the current side's name + the switch
-                control that returns to the launch chooser. */}
-            <div className="flex items-center justify-between gap-2 pt-2">
+            {/* Side strip: the app title, enlarged to fill its
+                row, with the settings gear beside it. The title
+                flexes and truncates first — the gear is shrink-0
+                and is never crowded out. The gear opens the
+                settings drawer from the left, which now holds the
+                Accessibility entry, Household Setup, Recipe
+                Videos, and the switch control that returns to the
+                launch chooser (all moved out of this strip). */}
+            <div className="flex items-center gap-2 pt-2">
               <span
-                className="text-xs font-bold tracking-wide"
+                className="min-w-0 flex-1 truncate text-2xl font-extrabold sm:text-3xl"
                 style={{ color: "var(--accent)" }}
               >
                 {APP_TITLE}
               </span>
-              <button
-                type="button"
-                onClick={() => setSide("chooser")}
-                className="shrink-0 rounded-full px-3 py-1.5 text-xs font-bold"
-                style={{
-                  backgroundColor: "var(--surface-alt)",
-                  color: "var(--text)",
-                }}
-              >
-                ⇄ Switch app
-              </button>
+              <GearButton
+                open={settingsOpen}
+                onClick={() => setSettingsOpen(true)}
+              />
             </div>
 
+            <SettingsDrawer
+              open={settingsOpen}
+              onClose={() => setSettingsOpen(false)}
+            >
+              <SettingsDrawerItem
+                label="Accessibility"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setAccountOpen(true);
+                  setHitSetupOpen(false);
+                }}
+              />
+              <SettingsDrawerItem
+                label="Household Setup"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setHitSetupOpen(true);
+                  setAccountOpen(false);
+                }}
+              />
+              <SettingsDrawerItem
+                label="⇄ Switch to BIT"
+                onClick={() => {
+                  setSettingsOpen(false);
+                  setHitSetupOpen(false);
+                  setAccountOpen(false);
+                  setSide("chooser");
+                }}
+              />
+              {/* Recipe Videos lives in the drawer now (moved out
+                  of the bottom of the Meal Planner tab): its
+                  collapsible section renders here in full. */}
+              <RecipeVideosSection />
+            </SettingsDrawer>
+
+            {accountOpen ? (
+              <AccountPolicy onClose={() => setAccountOpen(false)} />
+            ) : hitSetupOpen ? (
+              <HouseholdSetup onClose={() => setHitSetupOpen(false)} />
+            ) : (
+              <>
             {/* Tab bar */}
             <nav aria-label="Household lists" className="pt-2">
               <div
@@ -512,6 +579,8 @@ export function App() {
             {tab === "hit" && <HitListTab />}
             {tab === "meals" && (
               <MealPlannerTab suggestionSeed={suggestionSeed} />
+            )}
+              </>
             )}
           </>
         )}

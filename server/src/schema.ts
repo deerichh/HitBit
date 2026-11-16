@@ -219,6 +219,42 @@ export const hitMeta = sqliteTable("hit_meta", {
   refreshedAt: integer("refreshed_at", { mode: "timestamp_ms" }),
 });
 
+// Household setup questionnaire (Alpha 0.90): a single row (id 1)
+// holding the answers saved when the HIT setup questionnaire is
+// finished — household size, stores, allergies/dietary needs,
+// proteins, staples, frequent meals, reminder and sharing choices —
+// as one JSON object, plus when it was last completed. Saving is
+// non-destructive: it only ever upserts this row, and the starter
+// items/meals the finish seeds are added only when not already
+// tracked (dedupe by name, case-insensitive).
+export const householdSetup = sqliteTable("household_setup", {
+  id: integer("id").primaryKey(),
+  answersJson: text("answers_json").notNull().default("{}"),
+  completedAt: integer("completed_at", { mode: "timestamp_ms" }),
+});
+
+// Primary vs Connected accounts (Beta 0.01 batch, audit #5,
+// second half): the single settings row (id 1) for this copy of
+// the app. acting_role names the role THIS copy acts as —
+// "primary" (the Primary user) or "connected" (a Connected
+// account); it defaults to "primary". policy_json is a JSON
+// object mapping each undoable action type to "permanent" or
+// "reversible"; a type with no entry is Reversible (the default
+// for everything). Only the Primary user may edit the policy
+// (enforced in setUndoPolicy); the role itself is this copy's
+// own identity and can be switched from either role. Every
+// undoable record carries the actor role that performed it (the
+// `actor` columns added by the same migration; null on records
+// from before attribution existed — those read as the Primary
+// user's).
+export const accountSettings = sqliteTable("account_settings", {
+  id: integer("id").primaryKey(),
+  actingRole: text("acting_role", { enum: ["primary", "connected"] })
+    .notNull()
+    .default("primary"),
+  policyJson: text("policy_json").notNull().default("{}"),
+});
+
 export const hitAddedItems = sqliteTable("hit_added_items", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   category: text("category").notNull(),
@@ -343,12 +379,28 @@ export const stockAdjustments = sqliteTable("stock_adjustments", {
   item: text("item").notNull(),
   delta: integer("delta").notNull(),
   // "finish-shop" | "quick-adjust" | "usage" | "usage-undo" |
-  // "stocktake" | "purchase-undo" | "receipt"
+  // "stocktake" | "purchase-undo" | "receipt" | "receipt-undo" |
+  // "adjustment-undo"
   source: text("source").notNull(),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
   appliedAt: integer("applied_at", { mode: "timestamp_ms" }),
+  // Undo coverage (Beta 0.01 batch, audit #5): an undone
+  // adjustment no longer counts toward effective stock and is
+  // never sent to the sheet; when it had already been applied, a
+  // compensating adjustment (source "adjustment-undo" /
+  // "receipt-undo") carries the correction instead.
+  undone: integer("undone").notNull().default(0),
+  undoneAt: integer("undone_at", { mode: "timestamp_ms" }),
+  // The receipt scan whose confirmation recorded this adjustment
+  // (source "receipt" only; null for every other source and for
+  // receipt adjustments recorded before this link existed).
+  receiptScanId: integer("receipt_scan_id"),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // recorded this adjustment — "primary" | "connected"; null on
+  // rows from before attribution (read as "primary").
+  actor: text("actor", { enum: ["primary", "connected"] }),
 });
 
 // Sale-watch stars: item names the household wants sale-checked
@@ -500,6 +552,9 @@ export const usageLog = sqliteTable("usage_log", {
   mealName: text("meal_name"),
   pickId: integer("pick_id"),
   pickDate: text("pick_date"),
+  // Attribution (audit #5, Primary vs Connected): the role whose
+  // Eaten tap logged this entry; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -602,6 +657,9 @@ export const purchaseLog = sqliteTable("purchase_log", {
     .$defaultFn(() => new Date()),
   undone: integer("undone").notNull().default(0),
   undoneAt: integer("undone_at", { mode: "timestamp_ms" }),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // confirmed this purchase; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
 });
 
 // One optional expiry date per HIT List item, keyed by item name
@@ -654,6 +712,15 @@ export const receiptScans = sqliteTable("receipt_scans", {
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
+  // Undo coverage (Beta 0.01 batch, audit #5): stamped when a
+  // confirmed scan's stock additions are undone from the scan's
+  // own record (undoReceiptScan). The status stays "confirmed" —
+  // the scan WAS confirmed — and this stamp marks its effect
+  // reversed.
+  undoneAt: integer("undone_at", { mode: "timestamp_ms" }),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // confirmed this scan; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
 });
 
 // Recipe needs (ingredient coverage) additions:
@@ -696,6 +763,12 @@ export const alerts = sqliteTable("alerts", {
   item: text("item"),
   readAt: integer("read_at", { mode: "timestamp_ms" }),
   dismissedAt: integer("dismissed_at", { mode: "timestamp_ms" }),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // dismissed this alert — the dismissal's Undo (restoreAlert)
+  // follows the alert-dismissals policy and the ownership rule
+  // against this role. Null on dismissals from before
+  // attribution (read as "primary").
+  dismissedBy: text("dismissed_by", { enum: ["primary", "connected"] }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -879,6 +952,25 @@ export const bitBusiness = sqliteTable("bit_business", {
   usesRequisition: integer("uses_requisition").notNull().default(0),
   division: text("division"),
   dutyOfficerName: text("duty_officer_name"),
+  // Approver separation (Beta 0.06, audit #15): the requisition's
+  // approver is the District Chief (the form's DC name/signature
+  // line), recorded separately from the Duty Officer who prepared
+  // it — the two names must differ, and no requisition can be
+  // marked sent until an approver is recorded. The recorded-at
+  // stamps say when each name was last recorded (set when the
+  // stored name changes; cleared with the name).
+  approverName: text("approver_name"),
+  approverRecordedAt: integer("approver_recorded_at", {
+    mode: "timestamp_ms",
+  }),
+  dutyOfficerRecordedAt: integer("duty_officer_recorded_at", {
+    mode: "timestamp_ms",
+  }),
+  // Setup questionnaire team size (Alpha 0.90): the band picked on
+  // the wizard's team-size step ("Just me", "2–3", …, "More than
+  // 50") or a custom entry typed through Other. Null for businesses
+  // set up before the step existed.
+  teamSize: text("team_size"),
   updatedAt: integer("updated_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -896,6 +988,15 @@ export const bitRequisitions = sqliteTable("bit_requisitions", {
   status: text("status", { enum: ["outstanding", "closed"] })
     .notNull()
     .default("outstanding"),
+  // Who prepared / approved this requisition, snapshotted from
+  // the business's header fields at send time (Beta 0.06, audit
+  // #15) so the state — Prepared by → Approved by → Sent — stays
+  // on file even if the header names later change. Null on
+  // requisitions sent before the approver step existed.
+  preparedBy: text("prepared_by"),
+  preparedAt: integer("prepared_at", { mode: "timestamp_ms" }),
+  approvedBy: text("approved_by"),
+  approvedAt: integer("approved_at", { mode: "timestamp_ms" }),
   sentAt: integer("sent_at", { mode: "timestamp_ms" }).notNull(),
   closedAt: integer("closed_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
@@ -928,6 +1029,14 @@ export const bitRequisitionLines = sqliteTable("bit_requisition_lines", {
     .notNull()
     .default("pending"),
   qtyReceived: integer("qty_received"),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // checked this line off; null while pending and on check-offs
+  // from before attribution (read as "primary"). The check-off's
+  // Undo follows the requisition-check-offs policy and the
+  // ownership rule against this role.
+  checkedOffBy: text("checked_off_by", {
+    enum: ["primary", "connected"],
+  }),
   supersededBy: integer("superseded_by"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
@@ -1039,6 +1148,17 @@ export const bitWasteLog = sqliteTable("bit_waste_log", {
   })
     .notNull()
     .default("Spoilage"),
+  // Undo coverage (Beta 0.01 batch, audit #5): the quantity
+  // actually deducted from on-hand at log time (the log clamps at
+  // zero, so it can be less than `quantity`), and the undone flag
+  // undoBitWaste sets when it restores exactly that amount and
+  // retires the entry. Null stockDeducted on rows logged before
+  // this column existed — undo falls back to `quantity`.
+  stockDeducted: real("stock_deducted"),
+  undone: integer("undone").notNull().default(0),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // logged this waste entry; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -1061,6 +1181,93 @@ export const bitRounds = sqliteTable("bit_rounds", {
   // JSON array of { freezer, tempC } readings taken during the
   // round (tempC null = not recorded).
   freezerJson: text("freezer_json").notNull().default("[]"),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Per-item count history (Alpha 0.79): one row for EVERY item
+// counted in a finished check — not just the variances — written
+// by finishBitRound alongside the bit_rounds summary. The item's
+// name, category, book count before the check, counted value and
+// par at the time are snapshotted so the Trends view can show
+// counts over time even if the item is later renamed or removed.
+// History starts with the first check finished after Alpha 0.79;
+// nothing is backfilled.
+export const bitItemSnapshots = sqliteTable("bit_item_snapshots", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull().default(1),
+  itemId: integer("item_id"),
+  itemName: text("item_name").notNull(),
+  category: text("category").notNull(),
+  // REAL like bit_items.on_hand: fractional-counting businesses
+  // count in tenths.
+  bookCount: real("book_count").notNull(),
+  counted: real("counted").notNull(),
+  par: integer("par").notNull().default(0),
+  // Variance follow-through (Alpha 0.82): the reason recorded for
+  // this snapshot's variance on the check's Finish summary (null
+  // until the counter picks one; only meaningful when counted ≠
+  // bookCount), and whether this snapshot's counted value came
+  // from the one blind recount allowed per item per round (the
+  // recount replaces `counted`; bookCount never changes).
+  varianceReason: text("variance_reason", {
+    enum: ["Used", "Damaged", "Expired", "Missing", "Counting error"],
+  }),
+  recounted: integer("recounted").notNull().default(0),
+  roundId: integer("round_id").notNull(),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// Dated stock-in / adjustment events (Alpha 0.79): one row each
+// time an item's on-hand changes OUTSIDE a finished check — a
+// requisition Received check-off ("requisition_received") or an
+// Inventory-tab count change ("manual_count") — so usage between
+// checks can be computed as previous count + receipts − current
+// count. `delta` is the signed change applied to on-hand.
+export const bitStockEvents = sqliteTable("bit_stock_events", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull().default(1),
+  itemId: integer("item_id"),
+  itemName: text("item_name").notNull(),
+  delta: real("delta").notNull(),
+  source: text("source", {
+    enum: ["requisition_received", "manual_count"],
+  }).notNull(),
+  // Undo coverage (Beta 0.01 batch, audit #5): an undone event's
+  // stock change has been reversed (a manual count from the
+  // Inventory tab via undoBitStockEvent, a requisition receipt
+  // via undoBitRequisitionCheckOff) and Trends' usage math
+  // excludes it, so the numbers stay consistent with the counts.
+  undone: integer("undone").notNull().default(0),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // made this stock change; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
+  createdAt: integer("created_at", { mode: "timestamp_ms" })
+    .notNull()
+    .$defaultFn(() => new Date()),
+});
+
+// One confirmed manifest import (Beta 0.01 batch, audit #5): the
+// record a manifest import's Undo reverts from. changes_json is
+// an array of { name, itemId, added, priorOnHand } — one entry
+// per line the import touched: `added` lines name the item the
+// import created (undo deletes it), the rest carry the item's
+// on-hand from BEFORE the import set it (undo restores exactly
+// that). Written by importBitManifest for every import that
+// changed anything, whether it came from a file or a photo scan
+// (scan_id set in the scan case).
+export const bitManifestImports = sqliteTable("bit_manifest_imports", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  businessId: integer("business_id").notNull().default(1),
+  scanId: integer("scan_id"),
+  changesJson: text("changes_json").notNull().default("[]"),
+  undone: integer("undone").notNull().default(0),
+  // Attribution (audit #5, Primary vs Connected): the role that
+  // confirmed this import; null reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -1100,6 +1307,10 @@ export const bitPosTransactions = sqliteTable("bit_pos_transactions", {
   matched: integer("matched").notNull().default(1),
   belowPar: integer("below_par").notNull().default(0),
   undone: integer("undone").notNull().default(0),
+  // Attribution (audit #5, Primary vs Connected): the role this
+  // copy was acting as when the sale/sync was applied; null
+  // reads as "primary".
+  actor: text("actor", { enum: ["primary", "connected"] }),
   resolved: integer("resolved").notNull().default(0),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()

@@ -3,10 +3,10 @@
 //
 // The tab opens on the month calendar, which is display-only: no
 // picking happens there. Tapping a day in the month calendar jumps
-// to week view focused on that day; there, the day box shows the
-// day's picks at the top and, below them, one consolidated
-// first-step query — "Plan a…" with tappable Breakfast / Lunch /
-// Dinner / Snack choices. Choosing a type reveals that type's
+// to week view focused on that day; there, the day box opens with
+// one consolidated first-step query — "Plan a…" with tappable
+// Breakfast / Lunch / Dinner / Snack choices — and the day's picks
+// below it. Choosing a type reveals that type's
 // dropdown + suggestions picking flow beneath the choices, and the
 // chosen type defines a new pick's meal type. A
 // day can hold up to 5 picks in any mix of types. Meals and their
@@ -19,9 +19,13 @@
 // from inventory through the pending stock-adjustment queue — no
 // popup, no confirmation step. Once logged, the button stays filled
 // and disabled so a pick can't be logged twice. Month view stays
-// clean — no button there at all: just the compact meal name, plus
-// a plain ✓ beside it once that pick has been marked eaten in week
-// view.
+// clean — no buttons there at all and no meal names: each pick is a
+// single colour-coded letter (B blue breakfast, L yellow lunch,
+// D orange dinner, S red snack), with a small ✓ beside the letter
+// once that pick has been marked eaten in week view. In the day
+// panel each pick also carries a small red ✕ beside its meal type
+// that removes just that one pick (the same clearPick the "Clear
+// pick" button uses — removing a pick never touches inventory).
 
 import {
 Fragment,
@@ -34,7 +38,6 @@ type ReactNode,
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fileToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
-import { RecipeVideosSection } from "./RecipeVideosSection";
 import { buildEatenEntries } from "./UsageFlow";
 import { SourceDropdown } from "./SourceDropdown";
 
@@ -78,9 +81,47 @@ function parseKey(key: string): Date {
   return new Date(y, m - 1, d);
 }
 
+/**
+ * Whole days from today (local) until an expiry date key
+ * ("YYYY-MM-DD"): negative when the date has passed, 0 for today.
+ * The same computation as the HIT List's — the close-to-expiry
+ * window everywhere in the app is 3 days, the row chip's window.
+ */
+function daysUntilExpiry(dateKey: string): number {
+  const [y = 1970, m = 1, d = 1] = dateKey.split("-").map(Number);
+  const target = new Date(y, m - 1, d).getTime();
+  const now = new Date();
+  const today = new Date(
+    now.getFullYear(),
+    now.getMonth(),
+    now.getDate(),
+  ).getTime();
+  return Math.round((target - today) / 86_400_000);
+}
+
 function formatLong(key: string): string {
   const d = parseKey(key);
   return `${WEEKDAYS[(d.getDay() + 6) % 7]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
+}
+
+/**
+ * Derek's workdays — Toronto Fire Services, A platoon, on a 28-day
+ * rotation of 24-hour shifts (source: TPFFA 2026 shift calendar,
+ * verified across three consecutive cycles). A platoon works on
+ * cycle offsets {0, 2, 5, 8, 11, 17, 20} of a 28-day cycle anchored
+ * at 2026-11-06; a date is a workday when its offset from the anchor
+ * (mod 28) is in that set. A workday is the day the 24-hour shift
+ * starts (07:00). Computed at render time — nothing is stored, so
+ * the marker works for any month, past or future.
+ */
+const WORKDAY_ANCHOR_UTC = Date.UTC(2026, 10, 6);
+const WORKDAY_OFFSETS: ReadonlySet<number> = new Set([0, 2, 5, 8, 11, 17, 20]);
+
+function isWorkday(d: Date): boolean {
+  const dayUtc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  const days = Math.round((dayUtc - WORKDAY_ANCHOR_UTC) / 86_400_000);
+  const offset = ((days % 28) + 28) % 28;
+  return WORKDAY_OFFSETS.has(offset);
 }
 
 function statusClasses(status: Status): string {
@@ -267,17 +308,44 @@ function choiceGroupOf(meal: Meal) {
   return groupsOf(meal).find((g) => g.options.length > 1) ?? null;
 }
 
-// Month-view day cells are narrow, so a pick's meal name steps DOWN
-// in size as it gets longer — the same step-down approach as the HIT
-// List item names and the Membership Alternatives formal names —
-// and wraps inside its cell instead of clipping at one fixed size
-// ("Chicken caesar salad" at 10px overflowed its cell).
-function monthNameFontSize(name: string): number {
-  const len = name.length;
-  if (len <= 12) return 10;
-  if (len <= 16) return 9.5;
-  if (len <= 20) return 9;
-  return 8.5;
+/**
+ * Month view shows no meal names: each pick is a single
+ * colour-coded letter — B blue for breakfast, L yellow for lunch,
+ * D orange for dinner, S red for snack. The letter sits on a filled
+ * chip of its colour with a contrasting glyph colour, so every
+ * letter (the yellow especially) stays legible against the day-box
+ * background in light and dark mode alike.
+ */
+const MEAL_TYPE_LETTER: Record<
+  MealType,
+  { letter: string; bg: string; fg: string }
+> = {
+  breakfast: { letter: "B", bg: "#2563eb", fg: "#ffffff" },
+  lunch: { letter: "L", bg: "#f5c518", fg: "#3d2e00" },
+  dinner: { letter: "D", bg: "#e86a17", fg: "#ffffff" },
+  snack: { letter: "S", bg: "#c62f3b", fg: "#ffffff" },
+};
+
+/** Meal-of-day order for the month letters: B → L → D → S. */
+function mealTypeOrder(type: MealType): number {
+  return MEAL_TYPES.findIndex((t) => t.id === type);
+}
+
+/**
+ * Month-letter size steps DOWN as a day box fills up, so every
+ * letter fits inside the locked day box with no overflow or
+ * clipping: one letter is the largest, five letters (the most a
+ * day holds) are the smallest. Alpha 0.91: the whole scale is
+ * HALF the size it was (17px → 8.5px at one pick, stepping down
+ * to 5.75px at five), and the chip padding shrank in proportion,
+ * so the letters always sit inside the fixed-size box.
+ */
+function monthLetterFontSize(count: number): number {
+  if (count <= 1) return 8.5;
+  if (count === 2) return 7.75;
+  if (count === 3) return 7;
+  if (count === 4) return 6.25;
+  return 5.75;
 }
 
 /**
@@ -331,23 +399,29 @@ export function MealPlannerTab({
   // Week view is an accordion: every day has a header row, the
   // selected day's header is expanded to show its day box, and
   // tapping the expanded day's header collapses it back to a slim
-  // row (this flag). Picking a different day, pressing Today, or
-  // switching back to Week view clears it so the newly focused day
-  // starts expanded.
-  const [weekDayCollapsed, setWeekDayCollapsed] = useState(false);
+  // row (this flag). ALL days start COLLAPSED (Derek's review,
+  // Nov 16, 2026): the Week tab opens with every day a slim header
+  // row, and nothing — picking a day elsewhere, pressing Today, or
+  // switching to Week view — expands one on its own. Only tapping
+  // a day's header expands that day.
+  const [weekDayCollapsed, setWeekDayCollapsed] = useState(true);
   // The Meal List block sits between the day panel (the pick-a-meal
-  // box) and the protein stock box: a row of three action buttons
-  // (Add Meal, Scan Recipe, Recipe Generator) first, and directly
-  // below it the collapsible "Meal List" heading, a slim full-width
-  // row. Their panels (the add-meal form, the scan-recipe intake,
-  // and the recipe generator dropdown) open directly under the
-  // block. The calendar header row holds only the [‹] title [›]
-  // group; the toolbar row holds the Month/Week toggle + Today.
+  // box) and the protein stock box: the collapsible "Meal List"
+  // banner, a slim full-width bar carrying the title, the three
+  // action buttons (Add, Scan, Generate) spread across the space
+  // between the title and the meal count, and the count. The
+  // dropdown itself lists only meals. The buttons' panels (the
+  // add-meal form, the scan-recipe intake, and the recipe
+  // generator dropdown) open directly under the block. The
+  // calendar header row holds only the [‹] title [›] group; the
+  // toolbar row holds the Month/Week toggle + Today.
   const [mealListOpen, setMealListOpen] = useState(false);
   // The three action panels are mutually exclusive: at most one of
   // "add" | "scan" | "generator" is open at a time, and tapping the
-  // open panel's button closes it (back to none). The Meal List
-  // toggle below the button row is NOT part of this exclusivity.
+  // open panel's banner button closes it (back to none). The Meal
+  // List toggle in the same banner is NOT part of this
+  // exclusivity, and tapping a banner button never toggles the
+  // dropdown.
   const [openPanel, setOpenPanel] = useState<
     "add" | "scan" | "generator" | null
   >(null);
@@ -476,6 +550,27 @@ export function MealPlannerTab({
     onError: () =>
       setEatenError("That usage couldn't be logged. Try again."),
   });
+  // Undo coverage (audit #5): the Eaten tap's Undo lives on the
+  // pick row itself, beside the "Eaten ✓" it produced — it
+  // reverses the whole tap's deductions (undoPickEaten) instead
+  // of only being reachable from the HIT List's Activity log.
+  const undoEaten = useMutation({
+    mutationFn: async (pickId: number) =>
+      await api.undoPickEaten({ pickId }),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setEatenError(null);
+        queryClient.invalidateQueries({ queryKey: ["usage"] });
+        queryClient.invalidateQueries({ queryKey: ["hit"] });
+        queryClient.invalidateQueries({ queryKey: ["planner"] });
+        queryClient.invalidateQueries({ queryKey: ["list"] });
+        queryClient.invalidateQueries({ queryKey: ["activity"] });
+      } else {
+        setEatenError(res.error ?? "That usage couldn't be undone.");
+      }
+    },
+    onError: () => setEatenError("That usage couldn't be undone. Try again."),
+  });
 
   const data = planner.data;
   // All of a day's picks (up to 5), already in meal-of-day order from
@@ -556,7 +651,6 @@ export function MealPlannerTab({
     setCursor({ year: now.getFullYear(), month: now.getMonth() });
     setWeekAnchor(toKey(now));
     setSelectedDate(toKey(now));
-    setWeekDayCollapsed(false);
   };
 
   const flagSet = useMemo(
@@ -603,22 +697,63 @@ export function MealPlannerTab({
 
   const knownItems = (hit.data?.items ?? []).map((i) => i.item);
 
+  // Use-first meals (Beta 0.03, audit #14): meal id → the
+  // close-to-expiry HIT item the meal uses (its soonest-expiring
+  // match), where "close to expiry" is the app's one window — an
+  // expiry within 3 days or already past, the HIT row chip's set.
+  // A meal "uses" an item when one of its protein options is that
+  // item (by sheet name or label) or one of its ingredients names
+  // it. The picker surfaces these meals first in its suggestions
+  // and badges them; nothing else about picking changes.
+  const useFirstByMealId = useMemo(() => {
+    const map = new Map<number, { item: string; days: number }>();
+    const soon = (hit.data?.items ?? [])
+      .filter((i) => i.expiry != null)
+      .map((i) => ({
+        name: i.item,
+        days: daysUntilExpiry(i.expiry as string),
+      }))
+      .filter((i) => i.days <= 3)
+      .sort((a, b) => a.days - b.days);
+    if (soon.length === 0) return map;
+    const byKey = new Map(
+      soon.map((s) => [s.name.trim().toLowerCase(), s] as const),
+    );
+    for (const meal of data?.meals ?? []) {
+      let best: { item: string; days: number } | undefined;
+      const consider = (raw: string) => {
+        const hitItem = byKey.get(raw.trim().toLowerCase());
+        if (hitItem && (!best || hitItem.days < best.days)) {
+          best = { item: hitItem.name, days: hitItem.days };
+        }
+      };
+      for (const p of meal.proteins) {
+        consider(p.sheetName);
+        consider(p.label);
+      }
+      for (const ing of meal.ingredients) consider(ing.name);
+      if (best) map.set(meal.id, best);
+    }
+    return map;
+  }, [hit.data, data]);
+
   // The day box for the selected date. It renders in week view only:
-  // it opens under the chosen day's header row while the other days
-  // stay slim (and the chosen day's header can collapse it again).
-  // Month view is calendar-only — tapping a month day jumps to week
-  // view focused on that day, where the box lives. It falls back to
-  // below the calendar only when the selected date isn't in the week
-  // on screen (e.g. after paging with the arrows, which move the
-  // period without moving the selection).
+  // it opens under the chosen day's header row when that day is
+  // expanded (every day starts collapsed; tapping the day's header
+  // expands it, tapping again collapses it). Month view is
+  // calendar-only — tapping a month day jumps to week view focused
+  // on that day, where the box lives once the day is expanded. It
+  // falls back to below the calendar only when the selected date
+  // isn't in the week on screen (e.g. after paging with the arrows,
+  // which move the period without moving the selection).
   const selectedInWeek = weekCells.some((c) => c.key === selectedDate);
 
   // Tapping a day in the month calendar: select that date and switch
-  // to week view focused on it (week containing it, day expanded).
+  // to week view focused on it (week containing it; the day starts
+  // collapsed like every other day — tapping its header expands it).
   const openDayInWeek = (key: string) => {
     setSelectedDate(key);
     setWeekAnchor(key);
-    setWeekDayCollapsed(false);
     setView("week");
   };
 
@@ -627,16 +762,30 @@ export function MealPlannerTab({
   const renderEatenButton = (p: Pick) => {
     const m = data?.meals.find((x) => x.id === p.mealId) ?? null;
     if (!m) return null;
+    // Attribution + policy (audit #5): the pick's Eaten tap
+    // carries its actor and undo state — the Undo shows only
+    // when the current role may undo this tap (Reversible type,
+    // ownership satisfied); a Permanent Eaten type shows
+    // "Permanent" instead.
+    const pickUndo = usageLog.data?.pickUndo.find((u) => u.pickId === p.id);
     return (
       <EatenButton
         mealName={p.mealName}
         eaten={eatenPickIds.has(p.id)}
+        actor={pickUndo?.actor ?? null}
+        permanent={pickUndo?.permanent ?? false}
+        canUndo={pickUndo?.canUndo ?? false}
         pending={
           markEaten.isPending && markEaten.variables?.pick.id === p.id
         }
+        undoPending={undoEaten.isPending && undoEaten.variables === p.id}
         onMarkEaten={() => {
           setEatenError(null);
           markEaten.mutate({ pick: p, meal: m });
+        }}
+        onUndoEaten={() => {
+          setEatenError(null);
+          undoEaten.mutate(p.id);
         }}
       />
     );
@@ -650,6 +799,7 @@ export function MealPlannerTab({
       meals={data?.meals ?? []}
       dayPicks={dayPicks}
       flags={flagSet}
+      useFirstByMealId={useFirstByMealId}
       suggestionSeed={effectiveSuggestionSeed}
       saving={setPick.isPending || clearPick.isPending}
       onSave={(mealType, mealId, proteinId, servings, variant, pickId) =>
@@ -682,8 +832,8 @@ export function MealPlannerTab({
           sit on either side of the title in one left-aligned group
           ([‹] November 2026 [›] / [‹] Nov 9 – 15, 2026 [›]) and the
           row holds nothing else; Today sits in the toolbar row
-          below, beside the Month/Week toggle, and Add Meal lives
-          down in the Meal List row. */}
+          below, beside the Month/Week toggle, and the Add button
+          lives in the Meal List banner below. */}
       {view === "month" ? (
         <div className="flex items-center gap-2 pt-2">
           <div className="flex items-center gap-1">
@@ -691,7 +841,7 @@ export function MealPlannerTab({
               type="button"
               aria-label="Previous month"
               onClick={() => moveMonth(-1)}
-              className="min-h-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-1.5 text-[9px] leading-[14px] text-[var(--text)]"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-lg leading-none text-[var(--text)]"
             >
               ‹
             </button>
@@ -702,7 +852,7 @@ export function MealPlannerTab({
               type="button"
               aria-label="Next month"
               onClick={() => moveMonth(1)}
-              className="min-h-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-1.5 text-[9px] leading-[14px] text-[var(--text)]"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-lg leading-none text-[var(--text)]"
             >
               ›
             </button>
@@ -715,7 +865,7 @@ export function MealPlannerTab({
               type="button"
               aria-label="Previous week"
               onClick={() => moveWeek(-1)}
-              className="min-h-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-1.5 text-[9px] leading-[14px] text-[var(--text)]"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-lg leading-none text-[var(--text)]"
             >
               ‹
             </button>
@@ -730,7 +880,7 @@ export function MealPlannerTab({
               type="button"
               aria-label="Next week"
               onClick={() => moveWeek(1)}
-              className="min-h-4 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-1.5 text-[9px] leading-[14px] text-[var(--text)]"
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-[var(--border)] bg-[var(--surface)] text-lg leading-none text-[var(--text)]"
             >
               ›
             </button>
@@ -761,7 +911,6 @@ export function MealPlannerTab({
             aria-pressed={view === "week"}
             onClick={() => {
               setWeekAnchor(selectedDate);
-              setWeekDayCollapsed(false);
               setView("week");
             }}
             className={`px-3 py-1.5 text-sm font-medium ${
@@ -824,8 +973,8 @@ export function MealPlannerTab({
             No meals yet
           </p>
           <p className="mx-auto mt-2 max-w-xs text-sm text-[var(--dim)]">
-            Add your first meal with the Add Meal button in the Meal
-            List row below and it will show up in the picker here.
+            Add your first meal with the Add button in the Meal
+            List banner below and it will show up in the picker here.
           </p>
         </div>
       )}
@@ -835,10 +984,11 @@ export function MealPlannerTab({
           {/* Calendar grid. Month view is the calendar only — no day
               box, no picking; tapping a day switches to week view
               focused on that day. In week view the days form an
-              accordion — every day keeps a header row, the chosen
-              day's box opens under its header while the other days
-              stay slim, and tapping the chosen day's header collapses
-              its box away again. The box is the meal picker when no
+              accordion — every day keeps a header row and ALL days
+              start collapsed (slim header rows only); tapping a
+              day's header expands its box under the header, and
+              tapping the expanded day's header collapses it away
+              again. The box is the meal picker when no
               meal is chosen yet, and the meal / protein / last-eaten /
               ingredients view when one is. */}
           {view === "month" ? (
@@ -870,7 +1020,7 @@ export function MealPlannerTab({
                             aria-label={`${formatLong(cell.key)}${cellPicks.length > 0 ? `: ${cellPicks.map((p) => `${mealTypeLabel(p.mealType)}: ${p.mealName}`).join(", ")}` : ""}`}
                             aria-pressed={isSelected}
                             onClick={() => openDayInWeek(cell.key)}
-                            className={`flex min-h-[64px] flex-col items-stretch rounded-[var(--radius)] border p-1 text-left text-[var(--text)] sm:min-h-[84px] sm:p-1.5 ${
+                            className={`flex h-[64px] flex-col items-stretch overflow-hidden rounded-[var(--radius)] border p-1 text-left text-[var(--text)] sm:h-[84px] sm:p-1.5 ${
                               isSelected
                                 ? "border-[var(--accent)] ring-2 ring-[var(--accent)]"
                                 : "border-[var(--border)]"
@@ -878,48 +1028,93 @@ export function MealPlannerTab({
                               cell.inMonth ? "" : "opacity-45"
                             }`}
                           >
-                            <span
-                              className={`self-start text-sm font-medium ${
-                                isToday
-                                  ? "flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-text)]"
-                                  : ""
-                              }`}
-                            >
-                              {cell.date.getDate()}
-                            </span>
-                            {/* Each pick shows its compact meal name,
-                                stepped down in size the longer it is
-                                so it fits the cell. No Eaten button
-                                here — marking eaten happens in week
-                                view only. A pick that has been marked
-                                eaten gets a plain ✓ beside its name
-                                as a passive marker. */}
-                            {cellPicks.map((p) => (
+                            <span className="flex items-start justify-between">
                               <span
-                                key={p.id}
-                                className="mt-0.5 flex items-start gap-1"
+                                className={`text-sm font-medium ${
+                                  isToday
+                                    ? "flex h-6 w-6 items-center justify-center rounded-full bg-[var(--accent)] text-[var(--accent-text)]"
+                                    : ""
+                                }`}
                               >
-                                <span
-                                  className="min-w-0 flex-1 leading-tight font-semibold break-words"
-                                  style={{
-                                    fontSize: monthNameFontSize(p.mealName),
-                                  }}
-                                >
-                                  {p.mealName}
-                                </span>
-                                {eatenPickIds.has(p.id) && (
-                                  <span
-                                    role="img"
-                                    aria-label={`${p.mealName} eaten — usage logged`}
-                                    title="Eaten — usage logged"
-                                    className="shrink-0 text-[10px] leading-tight font-bold"
-                                    style={{ color: "var(--ok-text)" }}
-                                  >
-                                    ✓
-                                  </span>
-                                )}
+                                {cell.date.getDate()}
                               </span>
-                            ))}
+                              {isWorkday(cell.date) && (
+                                <span
+                                  aria-hidden="true"
+                                  title="Workday"
+                                  className="text-xs font-bold"
+                                  style={{ color: "var(--red)" }}
+                                >
+                                  W
+                                </span>
+                              )}
+                            </span>
+                            {/* Picks show as colour-coded letters
+                                only — no meal names in the month
+                                box. One letter per pick, ordered
+                                B → L → D → S, on a filled chip of
+                                the type's colour so the letter
+                                stays legible (yellow included). The
+                                day box is a LOCKED size (fixed
+                                height, overflow hidden): adding or
+                                removing picks never grows, shrinks,
+                                or shifts it, and the letter size
+                                steps down as the box fills so every
+                                letter always fits inside it. No
+                                Eaten button here — marking eaten
+                                happens in week view only; a pick
+                                marked eaten gets a small ✓ beside
+                                its letter as a passive marker. */}
+                            {cellPicks.length > 0 && (
+                              <span className="mt-1 flex flex-wrap items-center gap-0.5">
+                                {[...cellPicks]
+                                  .sort(
+                                    (a, b) =>
+                                      mealTypeOrder(a.mealType) -
+                                      mealTypeOrder(b.mealType),
+                                  )
+                                  .map((p) => {
+                                    const spec = MEAL_TYPE_LETTER[p.mealType];
+                                    const eaten = eatenPickIds.has(p.id);
+                                    const fontSize = monthLetterFontSize(
+                                      cellPicks.length,
+                                    );
+                                    return (
+                                      <span
+                                        key={p.id}
+                                        role="img"
+                                        aria-label={`${mealTypeLabel(p.mealType)}: ${p.mealName}${eaten ? " — eaten, usage logged" : ""}`}
+                                        title={`${mealTypeLabel(p.mealType)}: ${p.mealName}${eaten ? " — eaten" : ""}`}
+                                        className="flex shrink-0 items-center justify-center rounded leading-none font-extrabold"
+                                        style={{
+                                          backgroundColor: spec.bg,
+                                          color: spec.fg,
+                                          fontSize,
+                                          minWidth: fontSize + 4.5,
+                                          height: fontSize + 4.5,
+                                          padding: "0 1px",
+                                        }}
+                                      >
+                                        {spec.letter}
+                                        {eaten && (
+                                          <span
+                                            aria-hidden="true"
+                                            style={{
+                                              fontSize: Math.max(
+                                                4.5,
+                                                fontSize - 2,
+                                              ),
+                                              marginLeft: 0.5,
+                                            }}
+                                          >
+                                            ✓
+                                          </span>
+                                        )}
+                                      </span>
+                                    );
+                                  })}
+                              </span>
+                            )}
                           </button>
                         );
                       })}
@@ -934,8 +1129,9 @@ export function MealPlannerTab({
                   const cellPicks = picksByDate.get(cell.key) ?? [];
                   const isToday = cell.key === toKey(new Date());
                   const isSelected = cell.key === selectedDate;
-                  // Accordion: the selected day is expanded unless
-                  // the user collapsed it; every other day is a slim
+                  // Accordion: every day starts collapsed; the
+                  // selected day is expanded only once its header
+                  // has been tapped, and every other day is a slim
                   // collapsed header row. Tapping a collapsed day
                   // expands it (and selects it); tapping the expanded
                   // day's header collapses it back to a slim row.
@@ -1011,19 +1207,33 @@ export function MealPlannerTab({
                         <span className="flex min-w-0 items-center gap-2">
                           {cellPicks.length > 0 ? (
                             <span className="flex min-w-0 flex-wrap items-center justify-end gap-1">
-                              {cellPicks.map((p) => (
+                              {cellPicks.map((p) => {
+                                // The meal's title is colour-coded
+                                // with its meal type's Month-view
+                                // colour (Breakfast blue, Lunch
+                                // yellow, Dinner orange, Snack red) —
+                                // the same filled-chip pairing the
+                                // Month letters use, so the title
+                                // stays legible on its colour.
+                                const spec = MEAL_TYPE_LETTER[p.mealType];
+                                return (
                                 <span
                                   key={p.id}
                                   className="flex items-center gap-1"
                                 >
-                                  <span className="truncate rounded-md bg-[var(--ok-bg)] px-2 py-1 text-sm font-medium text-[var(--ok-text)]"
-                                >
-                                  {p.mealName}
-                                </span>
+                                  <span
+                                    className="truncate rounded-md px-2 py-1 text-sm font-semibold"
+                                    style={{
+                                      backgroundColor: spec.bg,
+                                      color: spec.fg,
+                                    }}
+                                  >
+                                    {p.mealName}
+                                  </span>
                                   {renderEatenButton(p)}
                                 </span>
-
-                              ))}
+                                );
+                              })}
                             </span>
                           ) : (
                             <span className="text-sm text-[var(--dim)]">
@@ -1046,6 +1256,16 @@ export function MealPlannerTab({
                           >
                             {isExpanded ? "▾" : "▸"}
                           </button>
+                          {isWorkday(cell.date) && (
+                            <span
+                              aria-hidden="true"
+                              title="Workday"
+                              className="shrink-0 self-start text-xs font-bold"
+                              style={{ color: "var(--red)" }}
+                            >
+                              W
+                            </span>
+                          )}
                         </span>
                       </div>
                       {isExpanded && (
@@ -1065,70 +1285,83 @@ export function MealPlannerTab({
       {data && (
         <>
           {/* Meal List block: below the pick-a-meal box (day panel),
-              above the protein stock box. A row of three action
-              buttons — Add Meal, Scan Recipe, Recipe Generator, left
-              to right — comes first; directly under it, the Meal
-              List collapse toggle, a slim full-width row of its own.
-              The meal list, the add-meal form, the recipe generator,
-              and the scan-recipe panel each open directly under the
-              block. */}
+              above the protein stock box. The banner bar carries
+              the "Meal List" title on the left and the meal count
+              with the collapse chevron on the right; between them,
+              spread to fill the space, sit the three action
+              buttons — Add, Scan, Generate. The title/count area
+              is the dropdown toggle (unchanged); each action
+              button opens its panel directly under the banner
+              WITHOUT toggling the dropdown open or closed. The
+              dropdown itself lists only meals. The add-meal form,
+              the recipe generator, and the scan-recipe panel each
+              open directly under the banner. */}
           <div className="mt-2">
-            <div className="flex items-stretch gap-2">
+            <div className="flex w-full min-w-0 items-center gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-[var(--text)]">
               <button
                 type="button"
-                aria-expanded={addMealOpen}
-                onClick={() => togglePanel("add")}
-                className={
-                  addMealOpen
-                    ? "min-w-0 flex-1 rounded-[var(--radius)] bg-[var(--accent)] px-2 py-2 text-sm font-medium text-[var(--accent-text)]"
-                    : "min-w-0 flex-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-sm font-medium text-[var(--text)]"
-                }
+                aria-expanded={mealListOpen}
+                aria-controls="meal-list"
+                onClick={() => setMealListOpen((v) => !v)}
+                className="shrink-0 text-left"
               >
-                {addMealOpen ? "Close" : "Add Meal"}
+                <span className="text-sm font-semibold">Meal List</span>
               </button>
+              <span className="flex min-w-0 flex-1 items-center justify-between gap-1 px-1">
+                <button
+                  type="button"
+                  aria-expanded={addMealOpen}
+                  onClick={() => togglePanel("add")}
+                  className={
+                    addMealOpen
+                      ? "rounded-full bg-[var(--accent)] px-2.5 py-1 text-xs font-semibold text-[var(--accent-text)]"
+                      : "rounded-full border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--text)]"
+                  }
+                >
+                  {addMealOpen ? "Close" : "Add"}
+                </button>
+                <button
+                  type="button"
+                  aria-expanded={scanOpen}
+                  aria-controls="scan-recipe-panel"
+                  onClick={() => togglePanel("scan")}
+                  className={
+                    scanOpen
+                      ? "rounded-full bg-[var(--accent)] px-2.5 py-1 text-xs font-semibold text-[var(--accent-text)]"
+                      : "rounded-full border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--text)]"
+                  }
+                >
+                  {scanOpen ? "Close" : "Scan"}
+                </button>
+                <button
+                  type="button"
+                  aria-expanded={generatorOpen}
+                  aria-controls="recipe-generator-panel"
+                  onClick={() => togglePanel("generator")}
+                  className={
+                    generatorOpen
+                      ? "rounded-full bg-[var(--accent)] px-2.5 py-1 text-xs font-semibold text-[var(--accent-text)]"
+                      : "rounded-full border border-[var(--border)] bg-[var(--surface)] px-2.5 py-1 text-xs font-semibold text-[var(--text)]"
+                  }
+                >
+                  {generatorOpen ? "Close" : "Generate"}
+                </button>
+              </span>
               <button
                 type="button"
-                aria-expanded={scanOpen}
-                aria-controls="scan-recipe-panel"
-                onClick={() => togglePanel("scan")}
-                className={
-                  scanOpen
-                    ? "min-w-0 flex-1 rounded-[var(--radius)] bg-[var(--accent)] px-2 py-2 text-sm font-medium text-[var(--accent-text)]"
-                    : "min-w-0 flex-1 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-2 py-2 text-sm font-medium text-[var(--text)]"
-                }
+                aria-expanded={mealListOpen}
+                aria-controls="meal-list"
+                aria-label="Toggle meal list"
+                onClick={() => setMealListOpen((v) => !v)}
+                className="flex shrink-0 items-center gap-2 text-xs text-[var(--dim)]"
               >
-                {scanOpen ? "Close" : "Scan Recipe"}
-              </button>
-              <button
-                type="button"
-                aria-expanded={generatorOpen}
-                aria-controls="recipe-generator-panel"
-                onClick={() => togglePanel("generator")}
-                className={
-                  generatorOpen
-                    ? "shrink-0 rounded-[var(--radius)] bg-[var(--accent)] px-2 py-1 text-center text-[13px] leading-[1.15] font-medium whitespace-nowrap text-[var(--accent-text)]"
-                    : "shrink-0 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-center text-[13px] leading-[1.15] font-medium whitespace-nowrap text-[var(--text)]"
-                }
-              >
-                {generatorOpen ? "Close" : "Recipe Generator"}
-              </button>
-            </div>
-            <button
-              type="button"
-              aria-expanded={mealListOpen}
-              aria-controls="meal-list"
-              onClick={() => setMealListOpen((v) => !v)}
-              className="mt-2 flex w-full min-w-0 items-center justify-between gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-left text-[var(--text)]"
-            >
-              <span className="text-sm font-semibold">Meal List</span>
-              <span className="flex items-center gap-2 text-xs text-[var(--dim)]">
                 <span>
                   {data.meals.length}{" "}
                   {data.meals.length === 1 ? "meal" : "meals"}
                 </span>
                 <span aria-hidden="true">{mealListOpen ? "▾" : "▸"}</span>
-              </span>
-            </button>
+              </button>
+            </div>
             <MealIdeas
               meals={data.meals}
               knownItems={knownItems}
@@ -1163,7 +1396,6 @@ export function MealPlannerTab({
           />
         </>
       )}
-      {data && <RecipeVideosSection />}
       {activeMatch && activeMatchKey !== closedMatchKey && (
         <HeartMatchPopup
           mealName={activeMatch.mealName}
@@ -1259,35 +1491,85 @@ function HeartMatchPopup({
  * usage logged it reads "Eaten ✓". Tapping it
  * logs the meal's protein usage immediately — no popup. Once the
  * pick has usage logged it renders filled and disabled, so the
- * same pick can't be logged twice (undo lives in the HIT List's
- * Usage log). Month view has no button: it shows a plain ✓ beside
- * the meal name of a pick that has been marked eaten here.
+ * same pick can't be logged twice — and an Undo beside it (audit
+ * #5) reverses the tap's deductions right here on the pick row,
+ * returning the pick to its un-eaten state. Month view has no
+ * button: it shows a plain ✓ beside the meal name of a pick that
+ * has been marked eaten here.
  */
 function EatenButton({
   mealName,
   eaten,
+  actor,
+  permanent,
+  canUndo,
   pending,
+  undoPending,
   onMarkEaten,
+  onUndoEaten,
 }: {
   mealName: string;
   eaten: boolean;
+  /** Attribution (audit #5): the role whose Eaten tap logged
+      this pick's usage; null until the usage log reports it. */
+  actor: "primary" | "connected" | null;
+  /** True when the Eaten action type is set Permanent. */
+  permanent: boolean;
+  /** True when the current role may undo this tap. */
+  canUndo: boolean;
   pending: boolean;
+  undoPending: boolean;
   onMarkEaten: () => void;
+  onUndoEaten: () => void;
 }) {
   if (eaten) {
     return (
-      <button
-        type="button"
-        disabled
-        aria-label={`${mealName} eaten — protein usage logged`}
-        className="min-h-0 shrink-0 rounded-full px-2 py-0.5 text-xs font-bold"
-        style={{
-          backgroundColor: "var(--accent)",
-          color: "var(--accent-text)",
-        }}
-      >
-        Eaten ✓
-      </button>
+      <span className="flex shrink-0 items-center gap-1">
+        <button
+          type="button"
+          disabled
+          aria-label={`${mealName} eaten — protein usage logged`}
+          // min-h-6 (audit #10): a 24px hit height inside the
+          // planner's pick rows — the week rows' compact layout
+          // doesn't take the full 32px line without growing them.
+          className="min-h-6 shrink-0 rounded-full px-2 py-0.5 text-xs font-bold"
+          style={{
+            backgroundColor: "var(--accent)",
+            color: "var(--accent-text)",
+          }}
+        >
+          Eaten ✓
+        </button>
+        {actor && (
+          <span className="text-xs text-[var(--dim)]">
+            {actor === "connected" ? "Connected account" : "Primary"}
+          </span>
+        )}
+        {canUndo && (
+          <button
+            type="button"
+            disabled={undoPending}
+            aria-label={`Undo marking ${mealName} as eaten — restore the deducted stock`}
+            onClick={(e) => {
+              e.stopPropagation();
+              onUndoEaten();
+            }}
+            className="min-h-6 shrink-0 rounded-full border px-2 py-0.5 text-xs font-bold disabled:opacity-50"
+            style={{
+              borderColor: "var(--border)",
+              color: "var(--accent)",
+              backgroundColor: "var(--surface)",
+            }}
+          >
+            {undoPending ? "Undoing…" : "Undo"}
+          </button>
+        )}
+        {!canUndo && permanent && (
+          <span className="text-xs font-bold text-[var(--dim)]">
+            Permanent
+          </span>
+        )}
+      </span>
     );
   }
   return (
@@ -1299,7 +1581,7 @@ function EatenButton({
         e.stopPropagation();
         onMarkEaten();
       }}
-      className="min-h-0 shrink-0 rounded-full border px-2 py-0.5 text-xs font-bold disabled:opacity-50"
+      className="min-h-6 shrink-0 rounded-full border px-2 py-0.5 text-xs font-bold disabled:opacity-50"
       style={{
         borderColor: "var(--ok-text)",
         color: "var(--ok-text)",
@@ -1312,11 +1594,13 @@ function EatenButton({
 }
 
 /**
- * The day box (week view). The day's existing picks display at the
- * top, grouped by meal of the day, each with its full display —
- * protein, servings, Eaten button, Change / Clear. Below them a
- * single first-step query asks "Plan a…" with four tappable
- * choices — Breakfast, Lunch, Dinner, Snack. Choosing one reveals
+ * The day box (week view). Section order: the date, then the
+ * "Plan a…" section, then the day's chosen meals (Derek's review,
+ * Nov 16, 2026). A single first-step query asks "Plan a…" with four
+ * tappable choices — Breakfast, Lunch, Dinner, Snack. Below it the
+ * day's existing picks display, grouped by meal of the day, each
+ * with its full display — protein, servings, Eaten button,
+ * Change / Clear. Choosing one of the "Plan a…" choices reveals
  * that meal type's picking flow beneath the choices: the
  * choose-meal dropdown filtered to that type, the launch-shuffled
  * suggestions, then the protein / style / servings flow once a meal
@@ -1336,6 +1620,7 @@ function DayPanel({
   dayPicks,
   embedded,
   flags,
+  useFirstByMealId,
   suggestionSeed,
   saving,
   onSave,
@@ -1350,6 +1635,8 @@ function DayPanel({
   dayPicks: Pick[];
   embedded?: boolean;
   flags: Set<string>;
+  /** Meal id → the close-to-expiry item it uses (Beta 0.03). */
+  useFirstByMealId: Map<number, { item: string; days: number }>;
   suggestionSeed: number;
   saving: boolean;
   onSave: (
@@ -1419,44 +1706,14 @@ function DayPanel({
         </p>
       )}
 
-      {/* The day's existing picks, at the top, grouped by meal of
-          the day in Breakfast → Snack order, each with its full
-          display. */}
-      {MEAL_TYPES.map((t) => {
-        const picks = dayPicks.filter((p) => p.mealType === t.id);
-        if (picks.length === 0) return null;
-        return (
-          <div
-            key={t.id}
-            className="mt-4 border-t border-[var(--border)] pt-3"
-          >
-            <h3 className="text-lg font-semibold">{t.label}</h3>
-            {picks.map((p) => (
-              <DayPick
-                key={p.id}
-                pick={p}
-                meal={meals.find((m) => m.id === p.mealId) ?? null}
-                dateKey={dateKey}
-                flags={flags}
-                saving={saving}
-                usageLogged={loggedPickIds.includes(p.id)}
-                noDeduction={noDeductionPickIds.includes(p.id)}
-                onStartChange={startChange}
-                onClear={onClear}
-                onSave={onSave}
-                onToggleFlag={onToggleFlag}
-                renderEatenButton={renderEatenButton}
-              />
-            ))}
-          </div>
-        );
-      })}
-
-      {/* Step 1 of picking: the "Plan a…" query. Tapping a choice
-          reveals that type's picking flow beneath it; tapping the
-          chosen type again folds the flow away. Once the day is
-          full the query hides — a pick can still be changed from
-          its display above, which re-opens the picker on its own. */}
+      {/* Section order in the day box (Derek's review, Nov 16,
+          2026): the date first, then the "Plan a…" section, then
+          the chosen meals. Step 1 of picking: the "Plan a…" query.
+          Tapping a choice reveals that type's picking flow beneath
+          it; tapping the chosen type again folds the flow away.
+          Once the day is full the query hides — a pick can still be
+          changed from its display below, which re-opens the picker
+          on its own. */}
       {!atCap && (
         <div className="mt-4 border-t border-[var(--border)] pt-3">
           <p className="text-lg font-semibold">Plan a…</p>
@@ -1496,6 +1753,7 @@ function DayPanel({
           typePicks={dayPicks.filter((p) => p.mealType === activeType)}
           favouriteIds={favouriteIds}
           flags={flags}
+          useFirstByMealId={useFirstByMealId}
           suggestionSeed={suggestionSeed}
           saving={saving}
           changingPick={changingPick}
@@ -1505,13 +1763,47 @@ function DayPanel({
           onFinishChange={() => setChangeRequest(null)}
         />
       )}
+
+      {/* The day's chosen meals, below the "Plan a…" section,
+          grouped by meal of the day in Breakfast → Snack order,
+          each with its full display. */}
+      {MEAL_TYPES.map((t) => {
+        const picks = dayPicks.filter((p) => p.mealType === t.id);
+        if (picks.length === 0) return null;
+        return (
+          <div
+            key={t.id}
+            className="mt-4 border-t border-[var(--border)] pt-3"
+          >
+            <h3 className="text-lg font-semibold">{t.label}</h3>
+            {picks.map((p) => (
+              <DayPick
+                key={p.id}
+                pick={p}
+                meal={meals.find((m) => m.id === p.mealId) ?? null}
+                dateKey={dateKey}
+                flags={flags}
+                saving={saving}
+                usageLogged={loggedPickIds.includes(p.id)}
+                noDeduction={noDeductionPickIds.includes(p.id)}
+                onStartChange={startChange}
+                onClear={onClear}
+                onSave={onSave}
+                onToggleFlag={onToggleFlag}
+                renderEatenButton={renderEatenButton}
+              />
+            ))}
+          </div>
+        );
+      })}
     </section>
   );
 }
 
 /**
- * One of the day's existing picks, displayed at the top of the day
- * box under its meal type: meal name with protein and style, the
+ * One of the day's existing picks, displayed in the day box's
+ * chosen-meals section (below "Plan a…") under its meal type: meal
+ * name with protein and style, the
  * Eaten button, the stock status, the style and servings
  * quick-editors, ingredients, notes, and Change / Clear. "Change
  * meal" hands the pick to the day box's picker below the "Plan a…"
@@ -1559,7 +1851,20 @@ function DayPick({
     <div className="mt-2">
       <div className="flex flex-wrap items-center gap-2">
         <p className="text-lg font-medium">
-          {p.mealName}
+          {/* The meal's title is colour-coded with its meal type's
+              Month-view colour (Breakfast blue, Lunch yellow,
+              Dinner orange, Snack red) — the same filled-chip
+              pairing the Month letters use, so the title stays
+              legible on its colour in both modes. */}
+          <span
+            className="rounded-md px-2 py-0.5 font-semibold"
+            style={{
+              backgroundColor: MEAL_TYPE_LETTER[p.mealType].bg,
+              color: MEAL_TYPE_LETTER[p.mealType].fg,
+            }}
+          >
+            {p.mealName}
+          </span>
           {p.proteinLabel && (
             <span className="text-[var(--dim)]">
               {" "}
@@ -1571,6 +1876,27 @@ function DayPick({
           )}
         </p>
         {renderEatenButton(p)}
+        {/* Small red ✕ beside the pick (under its meal-type
+            heading): removes just this one pick from the day.
+            Removing a pick never changes inventory — only the
+            Eaten confirmation deducts stock. */}
+        <button
+          type="button"
+          aria-label={`Remove ${mealTypeLabel(p.mealType)} pick: ${p.mealName}`}
+          title={`Remove this ${mealTypeLabel(p.mealType).toLowerCase()} pick`}
+          disabled={saving}
+          onClick={() => onClear(p.id)}
+          className="flex min-h-0 shrink-0 items-center justify-center rounded-full leading-none font-extrabold disabled:opacity-40"
+          style={{
+            width: 24,
+            height: 24,
+            backgroundColor: "var(--red)",
+            color: "#ffffff",
+            fontSize: 13,
+          }}
+        >
+          ✕
+        </button>
       </div>
       {pMeal ? (
         <>
@@ -1724,6 +2050,7 @@ function MealTypePicker({
   typePicks,
   favouriteIds,
   flags,
+  useFirstByMealId,
   suggestionSeed,
   saving,
   changingPick,
@@ -1738,6 +2065,8 @@ function MealTypePicker({
   typePicks: Pick[];
   favouriteIds: Set<number>;
   flags: Set<string>;
+  /** Meal id → the close-to-expiry item it uses (Beta 0.03). */
+  useFirstByMealId: Map<number, { item: string; days: number }>;
   suggestionSeed: number;
   saving: boolean;
   /** The pick being changed, pre-filled into the picker; null
@@ -1790,9 +2119,18 @@ function MealTypePicker({
   // so it stays the same while the app is open — switching days or
   // tabs doesn't reshuffle — and a fresh seed on the next launch
   // gives a new random five, in a new random order.
-  const suggestions = useMemo(
-    () => shuffledWithSeed(typeMeals, suggestionSeed).slice(0, 5),
-    [typeMeals, suggestionSeed],
+  // Use-first priority (Beta 0.03, audit #14): meals that use a
+  // close-to-expiry item are pulled ahead of the rest — the shuffle
+  // order is kept within each group — so they are always among the
+  // five shown, first, and badged. Suggestions still only suggest.
+  const suggestions = useMemo(() => {
+    const shuffled = shuffledWithSeed(typeMeals, suggestionSeed);
+    const useFirst = shuffled.filter((m) => useFirstByMealId.has(m.id));
+    const rest = shuffled.filter((m) => !useFirstByMealId.has(m.id));
+    return [...useFirst, ...rest].slice(0, 5);
+  }, [typeMeals, suggestionSeed, useFirstByMealId]);
+  const anyUseFirstSuggestion = suggestions.some((m) =>
+    useFirstByMealId.has(m.id),
   );
 
   const chosenMeal = meals.find((m) => m.id === chosenMealId) ?? null;
@@ -1854,30 +2192,32 @@ function MealTypePicker({
               value=""
               disabled
               style={{ minHeight: "1rem" }}
-              className="w-full appearance-none rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 pr-[22px] text-[10px] leading-[14px] text-[var(--text)] disabled:opacity-60"
+              className="w-full appearance-none rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 pr-[22px] text-[12px] leading-[16px] text-[var(--text)] disabled:opacity-60"
             >
               <option value="">Choose a {typeLower}…</option>
             </select>
             <span
               aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] text-[var(--dim)]"
+              className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[12px] text-[var(--dim)]"
             >
               ▾
             </span>
           </div>
           <p className="mt-2 text-sm text-[var(--dim)]">
             No {typeLower} meals on the list yet — add one with the Add
-            Meal button in the Meal List row and it will show up here.
+            button in the Meal List banner below and it will show up here.
           </p>
         </>
       ) : (
         <>
-          {/* Week-view choices render at half size (Derek's
-              request): the dropdown and the tappable suggestions
-              below it carry halved font size, padding, minimum
-              height, and gaps. The dropdown still renders 25%
-              larger than the suggestions: the decision takes
-              priority over the suggestion. */}
+          {/* Week-view choices once rendered at half size; the
+              touch-target audit (Beta 0.01, audit #10) raised
+              them to the app's floors instead: the dropdown text
+              sits at the 12px text floor, and the tappable
+              suggestion rows carry 12px text on the 32px control
+              line. The dropdown still renders larger than the
+              suggestions: the decision takes priority over the
+              suggestion. */}
           <div className="relative mt-1">
             <select
               id={`meal-dropdown-${type}`}
@@ -1890,7 +2230,7 @@ function MealTypePicker({
                 if (m) selectMeal(m);
               }}
               style={{ minHeight: "1rem" }}
-              className="w-full appearance-none rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 pr-[22px] text-[10px] leading-[14px] text-[var(--text)]"
+              className="w-full appearance-none rounded border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 pr-[22px] text-[12px] leading-[16px] text-[var(--text)]"
             >
               <option value="" disabled>
                 Choose a {typeLower}…
@@ -1903,19 +2243,21 @@ function MealTypePicker({
             </select>
             <span
               aria-hidden="true"
-              className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[10px] text-[var(--dim)]"
+              className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 text-[12px] text-[var(--dim)]"
             >
               ▾
             </span>
           </div>
 
           <p className="mt-2 text-sm font-medium text-[var(--dim)]">
-            …or one of these suggested picks — randomly shuffled for
-            this visit
+            {anyUseFirstSuggestion
+              ? "…or one of these suggested picks — ones that use food expiring soon come first"
+              : "…or one of these suggested picks — randomly shuffled for this visit"}
           </p>
-          <ul className="mt-[3px] space-y-[3px]">
+          <ul className="mt-1 space-y-1">
             {suggestions.map((m) => {
               const isFavourite = favouriteIds.has(m.id);
+              const useFirst = useFirstByMealId.get(m.id);
               const countWord = pickCountWord(m);
               return (
                 <li key={m.id}>
@@ -1923,8 +2265,7 @@ function MealTypePicker({
                     type="button"
                     aria-pressed={chosenMealId === m.id}
                     onClick={() => selectMeal(m)}
-                    style={{ minHeight: "1rem" }}
-                    className={`flex w-full items-center justify-between gap-1 rounded px-1.5 py-1 text-left text-[8px] leading-3 font-medium ${mealStatusClasses(m.status)} ${
+                    className={`flex w-full items-center justify-between gap-1 rounded px-2 py-1.5 text-left text-[12px] leading-4 font-medium ${mealStatusClasses(m.status)} ${
                       chosenMealId === m.id
                         ? "ring-2 ring-[var(--accent)]"
                         : ""
@@ -1933,12 +2274,26 @@ function MealTypePicker({
                     <span>
                       {m.name}
                       {isFavourite && (
-                        <span className="ml-1 rounded-full bg-[var(--surface)] px-1 py-[1px] text-[6px] leading-2 font-semibold text-[var(--accent)]">
+                        <span className="ml-1 rounded-full bg-[var(--surface)] px-1.5 py-0.5 text-[12px] leading-4 font-semibold text-[var(--accent)]">
                           ★ Favourite
                         </span>
                       )}
+                      {useFirst && (
+                        <span
+                          className="ml-1 rounded-full px-1.5 py-0.5 text-[12px] leading-4 font-semibold"
+                          style={{
+                            backgroundColor: "var(--amber-soft)",
+                            color: "var(--amber)",
+                          }}
+                        >
+                          Uses {useFirst.item} ·{" "}
+                          {useFirst.days < 0
+                            ? "expired"
+                            : "expiring soon"}
+                        </span>
+                      )}
                     </span>
-                    <span className="flex shrink-0 flex-col items-end text-[6px] leading-2 font-normal">
+                    <span className="flex shrink-0 flex-col items-end text-[12px] leading-4 font-normal">
                       <span>{mealStatusWord(m)}</span>
                       <span>
                         {countWord
@@ -3532,7 +3887,7 @@ function applyWebRecipe(
  * inventory-built recipe. A keeper can be saved to the Meal List
  * (ingredients re-based to 2 people, like every other meal), and a
  * cooking video can be requested — Muse makes the reel externally
- * and it lands in the Recipe videos section below the generator.
+ * and it lands in the Recipe videos section in Settings.
  */
 function RecipeGenerator({
   inventory,
@@ -3743,8 +4098,8 @@ function RecipeGenerator({
       setVideoStatus(res.status);
       setMessage(
         res.status === "ready"
-          ? "That recipe's video is ready — watch it in Recipe videos below."
-          : "Video requested — Muse will make the cooking video and it'll show up in Recipe videos below.",
+          ? "That recipe's video is ready — watch it in Recipe videos, in Settings."
+          : "Video requested — Muse will make the cooking video and it'll show up in Recipe videos, in Settings.",
       );
       queryClient.invalidateQueries({ queryKey: ["videos"] });
     },
@@ -3966,8 +4321,8 @@ function RecipeGenerator({
             ) : (
               <span className="rounded-lg bg-[var(--surface)] px-4 py-2 text-sm font-medium text-[var(--dim)]">
                 {videoStatus === "ready"
-                  ? "Video ready — see Recipe videos below"
-                  : "Video requested — see Recipe videos below"}
+                  ? "Video ready — see Recipe videos in Settings"
+                  : "Video requested — see Recipe videos in Settings"}
               </span>
             )}
           </div>
@@ -4154,10 +4509,12 @@ function InventoryPanel({
 type OptionDraft = { label: string; sheetName: string };
 
 /**
- * The Meal List dropdown body and the add-meal form. Both toggles —
- * "Meal List" and "Add Meal" — sit in the Meal List block, between
- * the day panel (the pick-a-meal box) and the protein stock box,
- * and the list and the form each render directly under that block.
+ * The Meal List dropdown body and the add-meal form. The "Meal
+ * List" banner sits in the Meal List block, between the day panel
+ * (the pick-a-meal box) and the protein stock box, and carries the
+ * Add, Scan, and Generate buttons between its title and its meal
+ * count; the dropdown's list holds only meals, and the list and
+ * the form each render directly under the banner.
  */
 function MealIdeas({
   meals,
@@ -4193,7 +4550,7 @@ function MealIdeas({
   // Cooking videos for saved meals: the request snapshot carries the
   // meal's name, type, protein, and ingredients (for 2 people, the
   // planner's convention); Muse makes the video externally and it
-  // lands in the Recipe videos section below the generator.
+  // lands in the Recipe videos section in Settings.
   const videos = useQuery({
     queryKey: ["videos"],
     queryFn: () => api.getRecipeVideos({}),
@@ -4387,7 +4744,7 @@ function MealIdeas({
                 if (video?.status === "ready") {
                   return (
                     <span className="text-sm font-medium text-[var(--ok-text)]">
-                      Cooking video ready — watch it in Recipe videos below
+                      Cooking video ready — watch it in Recipe videos, in Settings
                     </span>
                   );
                 }

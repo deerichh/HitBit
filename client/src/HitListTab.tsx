@@ -1,7 +1,15 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+useEffect,
+useLayoutEffect,
+useMemo,
+useRef,
+useState,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ApiResponse } from "./api";
+import { ActorTag } from "./AccountPolicy";
 import { RefreshProgress } from "./RefreshProgress";
+import { INFO_BUTTON_STYLE, useHoldInfo } from "./popupHooks";
 
 type HitData = ApiResponse<typeof api, "getHitList">;
 type HitItem = HitData["items"][number];
@@ -69,6 +77,307 @@ function nameFontSize(name: string): number {
   if (len <= 24) return 12;
   if (len <= 28) return 11;
   return 10.5;
+}
+
+// Store names get the same shrink-to-fit treatment as item names:
+// the standard size is 13px (the row's text-xs), and longer store
+// names step down so the FULL store name shows on the one-line row
+// instead of being truncated with an ellipsis (e.g. "Real Canadian
+// Superstore" in search results at phone width).
+function storeFontSize(store: string): number {
+  const len = store.length;
+  if (len <= 14) return 13;
+  if (len <= 18) return 12;
+  if (len <= 22) return 11;
+  if (len <= 26) return 10.5;
+  return 10;
+}
+
+// The acronym fallback's size ladder: the acronym is the primary
+// label and the bracketed full name sits beside it faded. The
+// largest size whose minimum footprint (acronym + "(...)") fits
+// the label's space is used, stepping down when space is tight so
+// the fallback itself never spills past the star / stock stepper.
+const FALLBACK_SIZES = [12, 11, 10, 9];
+
+/** The store name's acronym: the first letter of each word,
+    uppercased ("Real Canadian Superstore" → "RCS"). A single-word
+    name has no useful acronym and returns "". */
+function storeAcronym(store: string): string {
+  const words = store.trim().split(/\s+/).filter(Boolean);
+  if (words.length < 2) return "";
+  return words.map((w) => (w[0] ?? "").toUpperCase()).join("");
+}
+
+let measureCtx: CanvasRenderingContext2D | null = null;
+function textWidth(text: string, font: string): number {
+  if (!measureCtx) {
+    measureCtx = document.createElement("canvas").getContext("2d");
+  }
+  if (!measureCtx) return text.length * 7;
+  measureCtx.font = font;
+  return measureCtx.measureText(text).width;
+}
+
+/**
+ * The row's store label. Starts at the length-based tier above,
+ * then measures the row's left-hand group (item name + any chips +
+ * this label) against the space the flex row actually gives it and
+ * steps the font down in half-pixel decrements until the whole
+ * group fits — so the complete store name is always visible on the
+ * one line, never ellipsized and never spilling under the star /
+ * stock stepper on the right. Re-fits when the group resizes (e.g.
+ * the stocktake controls change the space available). 6.5px is the
+ * floor: below that the label would be unreadable.
+ *
+ * If the name STILL cannot fit at the 6.5px floor (the extreme
+ * corner: a very long item name plus chips plus the longest store
+ * label), the label falls back to the store's acronym at a
+ * readable size, followed by the full name in brackets, faded,
+ * cut off to whatever fits in the remaining space and finished
+ * with "..." before the closing bracket — "RCS (Real Canadian
+ * Supersto...)". The bracketed part is kept ONLY when at least
+ * the first 3 letters of the name fit inside it ("RCS (Rea...)");
+ * if fewer than 3 letters would fit — including the zero-room
+ * "RCS (...)" case — the brackets are removed altogether and
+ * just the acronym shows. A single-word store has no acronym, so
+ * it shows just the faded bracketed name, cut off the same way
+ * (and subject to the same 3-letter rule). Rows that fit at any
+ * size down to the floor never see the fallback.
+ *
+ * A small, visually quiet info (ⓘ) button sits beside the label
+ * inside the label's own space — the fitting below measures the
+ * label INCLUDING the button, so the row stays one line with
+ * nothing clipped and the star / stock stepper unmoved. The ⓘ is
+ * HOLD-TO-SHOW (Beta 0.04, audit #6): pressing it opens a small
+ * popup anchored to the label showing the complete store name at
+ * readable size, the popup stays up while the button is held,
+ * and on release it fades away, gone within 2 seconds. The
+ * button is a real <button> with text selection and the OS touch
+ * callout disabled (popupHooks), so holding it can never summon
+ * the phone's copy/paste menu — the updates 95–97 failure came
+ * from holding selectable TEXT, not a button.
+ */
+function StoreName({ store, fitKey }: { store: string; fitKey: string }) {
+  const ref = useRef<HTMLSpanElement | null>(null);
+  const [size, setSize] = useState<number>(() => storeFontSize(store));
+  const [fallback, setFallback] = useState(false);
+  // In fallback mode: how many leading characters of the full name
+  // the bracketed part shows before the "...", and the ladder size
+  // the fallback renders at.
+  const [shown, setShown] = useState(store.length);
+  const [fbSize, setFbSize] = useState(FALLBACK_SIZES[0] ?? 12);
+  const acronym = storeAcronym(store);
+  // Full-name popup: hold-to-show on the info button beside the
+  // label (Beta 0.04, audit #6 — see popupHooks).
+  const hold = useHoldInfo();
+
+  const infoButton = (
+    <button
+      type="button"
+      data-store-info-btn=""
+      aria-label={`Show full store name: ${store}`}
+      {...hold.buttonProps}
+      className="hit24 inline-flex shrink-0 items-center justify-center rounded-full leading-none"
+      style={{
+        width: 18,
+        height: 18,
+        // Overrides the global 2rem button minimum in theme.css so
+        // the button stays small enough to live inside the label's
+        // existing space. The visible box — and so the label-fit
+        // measurement, which includes this button — stays 18×18;
+        // the .hit24 overlay (theme.css, audit #10) grows the
+        // tappable area to 24×24 without touching the layout, so
+        // the row stays one line at the same height.
+        minHeight: 18,
+        padding: 0,
+        fontSize: 13,
+        color: "var(--dim)",
+        backgroundColor: "transparent",
+        ...INFO_BUTTON_STYLE,
+      }}
+    >
+      ⓘ
+    </button>
+  );
+
+  const fullNamePopup = hold.visible ? (
+    <span
+      role="tooltip"
+      data-store-full-name=""
+      className="pointer-events-none absolute bottom-full left-0 z-50 mb-1 whitespace-nowrap rounded-lg border px-2.5 py-1.5 font-semibold shadow-lg"
+      style={{
+        backgroundColor: "var(--surface)",
+        color: "var(--text)",
+        borderColor: "var(--border)",
+        fontSize: 13,
+        boxShadow: "0 6px 20px rgba(0,0,0,0.22)",
+        opacity: hold.fading ? 0 : 1,
+        transition: "opacity 0.7s ease",
+      }}
+    >
+      {store}
+    </span>
+  ) : null;
+
+  useLayoutEffect(() => {
+    const el = ref.current;
+    const parent = el?.parentElement;
+    if (!el || !parent) return;
+    let cancelled = false;
+    const fit = () => {
+      const groupRight = parent.getBoundingClientRect().right;
+      const rect = el.getBoundingClientRect();
+      const available = groupRight - rect.left;
+      if (!fallback) {
+        // Measure with layout boxes, not scrollWidth: a flex row's
+        // scrollWidth does not reliably include content that its
+        // items overflow with. The space this label may use is from
+        // its own left edge to the group's right edge; scale the
+        // font by the overflow ratio (converges in a step or two),
+        // with small decrements as a fallback.
+        let s = storeFontSize(store);
+        el.style.fontSize = `${s}px`;
+        for (let guard = 0; guard < 12 && s > 6.5; guard++) {
+          const r = el.getBoundingClientRect();
+          const avail = groupRight - r.left;
+          if (r.width <= avail + 1) break;
+          const scaled = Math.floor(s * (avail / r.width) * 2) / 2;
+          s = Math.max(6.5, scaled < s ? scaled : s - 0.5);
+          el.style.fontSize = `${s}px`;
+        }
+        const endRect = el.getBoundingClientRect();
+        const endAvail = groupRight - endRect.left;
+        if (!cancelled) {
+          if (endRect.width > endAvail + 1) {
+            // Even the 6.5px floor overflows: switch to the
+            // acronym + faded bracketed-name fallback.
+            setFallback(true);
+          } else {
+            setSize(s);
+          }
+        }
+        return;
+      }
+      // Fallback mode. The info button lives inside this label's
+      // space, so reserve its width (plus the flex gap before it)
+      // from everything the fallback renders.
+      const btnEl = el.querySelector("[data-store-info-btn]");
+      const btnReserve = btnEl
+        ? btnEl.getBoundingClientRect().width + 4
+        : 0;
+      const textAvail = Math.max(0, available - btnReserve);
+      // First, if the full name would now fit at the floor (the
+      // group gained room), drop back to it.
+      const family = getComputedStyle(el).fontFamily;
+      if (
+        textWidth(store, `400 6.5px ${family}`) <= textAvail + 1 &&
+        textAvail > 0
+      ) {
+        if (!cancelled) setFallback(false);
+        return;
+      }
+      // Pick the largest ladder size whose minimum footprint —
+      // acronym + the 4px flex gap + "(...)" — fits the space
+      // this label has, so the fallback itself stays inside the
+      // group and never spills past the star / stock stepper.
+      // Then show the longest prefix of the full name whose
+      // "(prefix...)" fits what remains after the acronym; if the
+      // whole name fits inside the brackets, it shows in full
+      // with no "...".
+      let chosen = FALLBACK_SIZES[FALLBACK_SIZES.length - 1] ?? 9;
+      let bracketAvail = 0;
+      for (const s of FALLBACK_SIZES) {
+        const acronymW = acronym
+          ? textWidth(acronym, `600 ${s}px ${family}`) + 4
+          : 0;
+        bracketAvail = Math.max(0, textAvail - acronymW);
+        chosen = s;
+        if (acronymW + textWidth("(...)", `400 ${s}px ${family}`) <= textAvail)
+          break;
+      }
+      const font = `400 ${chosen}px ${family}`;
+      let n = 0;
+      if (textWidth(`(${store})`, font) <= bracketAvail) {
+        n = store.length;
+      } else {
+        let lo = 0;
+        let hi = store.length;
+        while (lo < hi) {
+          const mid = Math.ceil((lo + hi) / 2);
+          if (textWidth(`(${store.slice(0, mid)}...)`, font) <= bracketAvail)
+            lo = mid;
+          else hi = mid - 1;
+        }
+        n = lo;
+      }
+      if (!cancelled) {
+        if (n !== shown) setShown(n);
+        if (chosen !== fbSize) setFbSize(chosen);
+      }
+    };
+    fit();
+    const ro = new ResizeObserver(fit);
+    ro.observe(parent);
+    return () => {
+      cancelled = true;
+      ro.disconnect();
+    };
+  }, [store, fitKey, fallback, shown, fbSize, acronym]);
+
+  if (fallback) {
+    const truncated = shown < store.length;
+    // Bracket rule: keep the faded bracketed name only when the
+    // whole name fits inside it or at least its first 3 letters
+    // fit before the "...". Fewer than 3 letters (including 0 —
+    // the "(...)" case) drops the brackets altogether, leaving
+    // just the acronym (for a single-word store, just nothing
+    // beyond what the info button's popup reveals).
+    const showBracket = !truncated || shown >= 3;
+    return (
+      <span
+        ref={ref}
+        data-hold-info-root=""
+        className="relative flex min-w-0 select-none items-center gap-1 whitespace-nowrap"
+        title={store}
+      >
+        {fullNamePopup}
+        {acronym && (
+          <span
+            data-acronym=""
+            className="shrink-0 font-semibold text-[var(--text)]"
+            style={{ fontSize: fbSize }}
+          >
+            {acronym}
+          </span>
+        )}
+        {showBracket && (
+          <span
+            data-bracketed-name=""
+            className="shrink-0 text-[var(--dim)]"
+            style={{ fontSize: fbSize, opacity: 0.6 }}
+          >
+            ({store.slice(0, shown)}
+            {truncated ? "...)" : ")"}
+          </span>
+        )}
+        {infoButton}
+      </span>
+    );
+  }
+
+  return (
+    <span
+      ref={ref}
+      data-hold-info-root=""
+      className="relative inline-flex select-none items-center gap-1 whitespace-nowrap text-[var(--dim)]"
+      style={{ fontSize: size }}
+    >
+      {fullNamePopup}
+      {store}
+      {infoButton}
+    </span>
+  );
 }
 
 function formatSynced(iso: string | null): string {
@@ -210,7 +519,7 @@ function PriceInfoBlock({
           {info.regularStore ? ` at ${info.regularStore}` : ""}
         </p>
       ) : (
-        <p className="text-xs text-[var(--dim)]">No current price found.</p>
+        <p className="text-xs text-[var(--dim)]">No verified price found yet</p>
       )}
       {info.altName && info.altPriceCents != null && (
         <p className="mt-0.5 text-xs text-[var(--dim)]">
@@ -739,7 +1048,7 @@ function AddItemForm({
       </button>
       <p className="mt-2 text-center text-xs text-[var(--dim)]">
         The item appears right away, a price check starts automatically,
-        and the add is queued for the sync updates to Vanessa&rsquo;s app.
+        and it will also appear in Vanessa&rsquo;s app.
       </p>
     </form>
   );
@@ -766,6 +1075,31 @@ function fractionBoxStyle(inStock: number, total: number) {
     color: "var(--red)",
     border: "1px solid var(--red)",
   };
+}
+
+/** The counted-last stamp (audit #16) for the HIT List page:
+    "Last counted: Sat Nov 15 · today" / "· yesterday" /
+    "· 3 days ago", from the most recent daily stock snapshot
+    date ("YYYY-MM-DD"); "Not counted yet" when no snapshot
+    exists yet. */
+function hitCountedLabel(dateKey: string | null): string {
+  if (!dateKey) return "Not counted yet";
+  const [y = 1970, m = 1, d = 1] = dateKey.split("-").map(Number);
+  const date = new Date(y, m - 1, d);
+  if (Number.isNaN(date.getTime())) return "Not counted yet";
+  const startOfDay = (x: Date) =>
+    new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round(
+    (startOfDay(new Date()) - startOfDay(date)) / 86_400_000,
+  );
+  const rel =
+    days <= 0 ? "today" : days === 1 ? "yesterday" : `${days} days ago`;
+  const label = date.toLocaleDateString("en-CA", {
+    weekday: "short",
+    month: "short",
+    day: "numeric",
+  });
+  return `Last counted: ${label} · ${rel}`;
 }
 
 export function HitListTab() {
@@ -911,6 +1245,17 @@ export function HitListTab() {
       queryClient.invalidateQueries({ queryKey: ["planner"] });
     },
   });
+  // Undo coverage (audit #5): a stepper tap's or stocktake
+  // correction's own Undo, restoring the item's prior count.
+  const undoAdjustment = useMutation({
+    mutationFn: async (id: number) => await api.undoStockAdjustment({ id }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["activity"] });
+      queryClient.invalidateQueries({ queryKey: ["hit"] });
+      queryClient.invalidateQueries({ queryKey: ["list"] });
+      queryClient.invalidateQueries({ queryKey: ["planner"] });
+    },
+  });
   // Stocktake confirm: records the differences as pending stock
   // adjustments (source "stocktake") for the auto-scan to apply.
   const recordStocktake = useMutation({
@@ -1041,13 +1386,30 @@ export function HitListTab() {
   }, [stocktakeKick]);
 
   // ---- Expiry --------------------------------------------------------
+  // ONE "expiring soon" set (Beta 0.03, audit #4): the header count
+  // and the panel list are exactly the items the row ⚠ chip flags —
+  // an expiry within 3 days or already past (expiryChip is the one
+  // definition) — ordered soonest-expiry first. Items with later
+  // dates are not counted or listed here; their dates still show on
+  // their own rows (see the row's "Expires …" line below).
   const expiringItems = allItems
-    .filter((i) => i.expiry != null)
+    .filter((i) => expiryChip(i.expiry) != null)
     .sort((a, b) => (a.expiry ?? "").localeCompare(b.expiry ?? ""));
-  const itemsWithoutExpiry = allItems.filter((i) => i.expiry == null);
+  const datedItems = allItems.filter((i) => i.expiry != null);
+  // The Add-or-change picker's current selection's existing date,
+  // so the picker can offer Clear for an already-dated item.
+  const newExpiryCurrent = newExpiryItem
+    ? (allItems.find((i) => i.item === newExpiryItem)?.expiry ?? null)
+    : null;
 
   return (
     <div>
+      {/* Counted-last stamp (audit #16): at the top of the page,
+          from the daily stock snapshots — the last day the
+          household's stock was counted into the app. */}
+      <p className="pt-2 text-sm font-semibold text-[var(--dim)]">
+        {hitCountedLabel(hit.data?.lastCountedDate ?? null)}
+      </p>
       {/* Inventory summary */}
       <section className="pt-2">
         <div
@@ -1134,16 +1496,14 @@ export function HitListTab() {
           <p className="mt-2 text-sm text-[var(--dim)]">
             {hit.data?.pendingSyncCount}{" "}
             {hit.data?.pendingSyncCount === 1 ? "item" : "items"} added
-            here will be included in the next sync update to
-            Vanessa&rsquo;s app.
+            here will also appear in Vanessa&rsquo;s app.
           </p>
         )}
         {(hit.data?.pendingStockCount ?? 0) > 0 && (
           <p className="mt-2 text-sm text-[var(--dim)]">
             Stock changes on {hit.data?.pendingStockCount}{" "}
             {hit.data?.pendingStockCount === 1 ? "item are" : "items are"}{" "}
-            counted here and waiting to be written to the sheet on the
-            next auto-scan.
+            counted here — the shared sheet catches up automatically.
           </p>
         )}
         {showForm && (
@@ -1250,9 +1610,8 @@ export function HitListTab() {
                 </ul>
               )}
               <p className="mt-2 text-xs text-[var(--dim)]">
-                Confirming records the differences as pending stock
-                changes — the auto-scan writes them to the sheet, like
-                the +/− steppers and purchases.
+                Confirming records the differences as stock
+                changes, like the +/− steppers and purchases.
               </p>
               {stocktakeError && (
                 <p
@@ -1368,8 +1727,15 @@ export function HitListTab() {
           </p>
         </div>
       ) : filtered.length === 0 ? (
+        // The no-match message names the active filter that caused
+        // it (Beta 0.05, audit #7): the search text, the
+        // "Low & out only" filter, or both.
         <p className="py-12 text-center text-sm text-[var(--dim)]">
-          Nothing matches that search.
+          {q && showLowOnly
+            ? `Nothing matches “${query.trim()}” with “Low & out only” on.`
+            : showLowOnly
+              ? "Nothing is low or out right now — turn off “Low & out only” to see the whole list."
+              : `Nothing matches “${query.trim()}”.`}
         </p>
       ) : (
         groups.map((group) => {
@@ -1434,7 +1800,7 @@ export function HitListTab() {
               {!isCollapsed && (
                 <ul
                   id={panelId}
-                  className="mt-1.5 divide-y overflow-hidden rounded-2xl"
+                  className="mt-1.5 divide-y rounded-2xl"
                   style={{
                     backgroundColor: "var(--surface)",
                     border: "1px solid var(--border)",
@@ -1444,11 +1810,22 @@ export function HitListTab() {
                 >
                   {group.items.map((item) => {
                     const pill = stockPill(item.stock);
+                    // A dated item outside the chip's 3-day window
+                    // (Beta 0.03, audit #4): not counted or listed
+                    // as expiring soon, but its date still shows on
+                    // its own row, under the one-line row with the
+                    // other extra info.
+                    const farExpiry =
+                      item.expiry != null &&
+                      expiryChip(item.expiry) == null
+                        ? item.expiry
+                        : null;
                     const hasExtraInfo =
                       (item.forecastDays != null && item.stock > 0) ||
                       !!item.formalName ||
                       !!item.sku ||
-                      !!item.priceInfo;
+                      !!item.priceInfo ||
+                      farExpiry != null;
                     return (
                       <li
                         key={`${item.category}-${item.item}`}
@@ -1485,7 +1862,7 @@ export function HitListTab() {
                                   color: "var(--amber)",
                                 }}
                               >
-                                Pending sync
+                                Not in sheet yet
                               </span>
                             )}
                             {item.pendingDelta !== 0 && (
@@ -1495,16 +1872,17 @@ export function HitListTab() {
                                   backgroundColor: "var(--amber-soft)",
                                   color: "var(--amber)",
                                 }}
-                                title={`${item.pendingDelta > 0 ? `+${item.pendingDelta}` : item.pendingDelta} pending — counted here now; the auto-scan writes it to the sheet`}
+                                title={`${item.pendingDelta > 0 ? `+${item.pendingDelta}` : item.pendingDelta} pending — counted here now; the sheet catches up automatically`}
                               >
                                 {item.pendingDelta > 0
                                   ? `+${item.pendingDelta}`
                                   : item.pendingDelta}
                               </span>
                             )}
-                            <span className="min-w-0 truncate text-xs text-[var(--dim)]">
-                              {item.store}
-                            </span>
+                            <StoreName
+                              store={item.store}
+                              fitKey={`${item.item}|${item.pendingSync ? 1 : 0}|${item.pendingDelta}|${item.expiry ?? ""}|${stocktakeOn ? 1 : 0}`}
+                            />
                           </div>
                           <div className="flex shrink-0 items-center gap-1">
                             <button
@@ -1528,6 +1906,12 @@ export function HitListTab() {
                               }
                               className="rounded-full px-0.5 py-0.5 text-base leading-none"
                               style={{
+                                // Explicit 24px hit width inside the
+                                // locked one-line row (audit #10);
+                                // the global button floor already
+                                // gives it 32px of height, so the row
+                                // height is unchanged.
+                                minWidth: 24,
                                 color: item.watched
                                   ? "var(--amber)"
                                   : "var(--dim)",
@@ -1698,6 +2082,11 @@ export function HitListTab() {
                         </div>
                         {hasExtraInfo && (
                           <div className="mt-1">
+                            {farExpiry && (
+                              <p className="text-xs text-[var(--dim)]">
+                                Expires {formatExpiryDate(farExpiry)}
+                              </p>
+                            )}
                             {item.forecastDays != null && item.stock > 0 && (
                               <p className="text-xs text-[var(--dim)]">
                                 Runs out in ~{item.forecastDays}{" "}
@@ -1742,9 +2131,11 @@ export function HitListTab() {
           <span className="text-base font-semibold">Expiring soon</span>
           <span className="flex items-center gap-2 text-sm text-[var(--dim)]">
             <span>
-              {expiringItems.length === 0
-                ? "no dates set"
-                : `${expiringItems.length} ${expiringItems.length === 1 ? "item" : "items"}`}
+              {expiringItems.length > 0
+                ? `${expiringItems.length} ${expiringItems.length === 1 ? "item" : "items"}`
+                : datedItems.length > 0
+                  ? "none due soon"
+                  : "no dates set"}
             </span>
             <span aria-hidden="true">{expiringOpen ? "▾" : "▸"}</span>
           </span>
@@ -1760,11 +2151,34 @@ export function HitListTab() {
           >
             {expiringItems.length === 0 ? (
               <p className="px-4 py-3 text-sm text-[var(--dim)]">
-                No expiry dates set yet. Add one below for anything
-                that goes off — items within 3 days of their date get
-                a ⚠ chip on their row.
+                {datedItems.length === 0 ? (
+                  <>
+                    No expiry dates set yet. Add one below for anything
+                    that goes off — items within 3 days of their date get
+                    a ⚠ chip on their row.
+                  </>
+                ) : (
+                  <>
+                    Nothing is due within 3 days. Items with later dates
+                    show them on their own rows — they&apos;ll be listed
+                    here as their dates approach.
+                  </>
+                )}
               </p>
             ) : (
+              <>
+                {/* Use-first list (Beta 0.03, audit #14): the chip's
+                    set, soonest-expiry first, presented as the items
+                    to reach for before anything else. */}
+                <div className="px-4 pt-3 pb-1">
+                  <p className="text-sm font-bold text-[var(--text)]">
+                    Use these first
+                  </p>
+                  <p className="text-xs text-[var(--dim)]">
+                    Expiring within 3 days or already past — soonest
+                    first.
+                  </p>
+                </div>
               <ul className="divide-y divide-[var(--border)]">
                 {expiringItems.map((i) => {
                   const days = i.expiry
@@ -1830,6 +2244,7 @@ export function HitListTab() {
                   );
                 })}
               </ul>
+              </>
             )}
             {/* Add expiry row */}
             <div
@@ -1847,7 +2262,7 @@ export function HitListTab() {
                   htmlFor="expiry-add-item"
                   className={fieldLabelClass}
                 >
-                  Add expiry
+                  Add or change expiry
                 </label>
                 <select
                   id="expiry-add-item"
@@ -1857,9 +2272,16 @@ export function HitListTab() {
                   style={fieldInputStyle}
                 >
                   <option value="">Choose an item…</option>
-                  {itemsWithoutExpiry.map((i) => (
+                  {/* Every item is listed (Beta 0.03): an item whose
+                      date is still far off is no longer listed in
+                      the panel above, so this picker is where its
+                      date is changed or cleared. */}
+                  {allItems.map((i) => (
                     <option key={i.item} value={i.item}>
                       {i.item}
+                      {i.expiry
+                        ? ` — expires ${formatExpiryDate(i.expiry)}`
+                        : ""}
                     </option>
                   ))}
                 </select>
@@ -1897,6 +2319,32 @@ export function HitListTab() {
               >
                 Add
               </button>
+              {newExpiryCurrent && (
+                <button
+                  type="button"
+                  aria-label={`Clear the expiry date for ${newExpiryItem}`}
+                  disabled={setExpiry.isPending}
+                  onClick={() => {
+                    setExpiry.mutate(
+                      { item: newExpiryItem, date: null },
+                      {
+                        onSuccess: () => {
+                          setNewExpiryItem("");
+                          setNewExpiryDate("");
+                        },
+                      },
+                    );
+                  }}
+                  className="rounded-full px-4 py-1.5 text-sm font-bold disabled:opacity-50"
+                  style={{
+                    backgroundColor: "var(--surface)",
+                    color: "var(--accent)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  Clear
+                </button>
+              )}
             </div>
           </div>
         )}
@@ -1914,9 +2362,10 @@ export function HitListTab() {
           <span className="text-base font-semibold">Activity</span>
           <span className="flex items-center gap-2 text-sm text-[var(--dim)]">
             <span>
-              {(activity.data?.entries ?? []).filter((e) => !e.undone)
-                .length}{" "}
-              entries
+              {/* The header counts exactly what the list below
+                  shows (Beta 0.02, audit #12): undone entries stay
+                  visible, marked as undone, and are counted too. */}
+              {(activity.data?.entries ?? []).length} entries
             </span>
             <span aria-hidden="true">{activityOpen ? "▾" : "▸"}</span>
           </span>
@@ -1933,8 +2382,9 @@ export function HitListTab() {
             {(activity.data?.entries ?? []).length === 0 ? (
               <p className="px-4 py-4 text-sm text-[var(--dim)]">
                 Nothing yet. Meals marked &ldquo;Eaten ✓&rdquo; on the
-                Meal Planner calendar and purchases confirmed on the
-                Shopping List will show up here.
+                Meal Planner calendar, purchases confirmed on the
+                Shopping List, and stock changes from the steppers or
+                a stocktake will show up here.
               </p>
             ) : (
               <ul className="divide-y divide-[var(--border)]">
@@ -1953,21 +2403,36 @@ export function HitListTab() {
                                   backgroundColor: "var(--ok-bg)",
                                   color: "var(--ok-text)",
                                 }
-                              : {
-                                  backgroundColor: "var(--amber-soft)",
-                                  color: "var(--amber)",
-                                }
+                              : e.kind === "adjusted"
+                                ? {
+                                    backgroundColor: "var(--accent-soft)",
+                                    color: "var(--accent)",
+                                  }
+                                : {
+                                    backgroundColor: "var(--amber-soft)",
+                                    color: "var(--amber)",
+                                  }
                           }
                         >
-                          {e.kind === "purchased" ? "Purchased" : "Used"}
+                          {e.kind === "purchased"
+                            ? "Purchased"
+                            : e.kind === "adjusted"
+                              ? e.source === "Stocktake"
+                                ? "Stocktake"
+                                : "Adjusted"
+                              : "Used"}
                         </span>
                         {e.item}
                         <span className="ml-2 font-normal text-[var(--dim)]">
                           {e.kind === "purchased"
                             ? `+${e.quantity}`
-                            : e.usedSome
-                              ? "used some"
-                              : `−${e.quantity}`}
+                            : e.kind === "adjusted"
+                              ? e.quantity >= 0
+                                ? `+${e.quantity}`
+                                : `−${Math.abs(e.quantity)}`
+                              : e.usedSome
+                                ? "used some"
+                                : `−${e.quantity}`}
                         </span>
                         {e.undone && (
                           <span className="ml-2 text-xs font-bold text-[var(--dim)]">
@@ -1986,23 +2451,38 @@ export function HitListTab() {
                           hour: "numeric",
                           minute: "2-digit",
                         })}
+                        {/* Attribution (audit #5): the role that
+                            performed this entry, and "Permanent"
+                            when its action type is set Permanent. */}
+                        <ActorTag actor={e.actor} permanent={e.permanent} />
                       </p>
                     </div>
-                    {!e.undone && (
+                    {!e.undone && e.permanent && (
+                      <span className="shrink-0 rounded-full px-3 py-1 text-xs font-bold text-[var(--dim)]">
+                        Permanent
+                      </span>
+                    )}
+                    {!e.undone && e.canUndo && (
                       <button
                         type="button"
                         aria-label={
                           e.kind === "purchased"
                             ? `Undo the purchase of ${e.item}`
-                            : `Undo usage of ${e.item}`
+                            : e.kind === "adjusted"
+                              ? `Undo the stock change for ${e.item}`
+                              : `Undo usage of ${e.item}`
                         }
                         disabled={
-                          undoUsage.isPending || undoPurchase.isPending
+                          undoUsage.isPending ||
+                          undoPurchase.isPending ||
+                          undoAdjustment.isPending
                         }
                         onClick={() =>
                           e.kind === "purchased"
                             ? undoPurchase.mutate(e.refId)
-                            : undoUsage.mutate(e.refId)
+                            : e.kind === "adjusted"
+                              ? undoAdjustment.mutate(e.refId)
+                              : undoUsage.mutate(e.refId)
                         }
                         className="shrink-0 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
                         style={{
@@ -2025,14 +2505,13 @@ export function HitListTab() {
       {allItems.length > 0 && (
         <p className="mt-4 text-center text-xs text-[var(--dim)]">
           Tap − or + beside an item&rsquo;s stock to use one or add
-          one — the count changes here right away and is written to
-          the sheet on the next auto-scan. The ★ stars an item for
-          sale checks whatever its stock. Items added here appear
-          right away, get an automatic price check, and are queued
-          for Vanessa&rsquo;s app sync. Refreshing also starts a
+          one — the count changes here right away. The ★ stars an
+          item for sale checks whatever its stock. Items added here
+          appear right away and get an automatic price check.
+          Refreshing also starts a
           stocktake, walking the whole list to correct the counts;
-          the Activity log below covers both usage and purchases,
-          each with an Undo.
+          the Activity log below covers usage, purchases and stock
+          changes, each with an Undo.
         </p>
       )}
     </div>

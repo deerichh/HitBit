@@ -133,12 +133,13 @@ function VideoCard({ entry }: { entry: VideoEntry }) {
 }
 
 /**
- * Recipe videos — collapsible section that lives directly below the
- * Recipe generator at the bottom of the Meal Planner tab (it used to
- * be its own top-level Media tab). Collapsed by default, styled like
- * the Meal List / Protein stock collapsibles. Expanded it shows
- * exactly what the Media tab showed: every recipe with a video
- * requested or ready — name, meal type, protein, people, ingredients,
+ * Recipe videos — collapsible section that lives in the settings
+ * drawer (the gear beside the app title), moved there from the
+ * bottom of the Meal Planner tab (before that it was its own
+ * top-level Media tab). Collapsed by default, styled like the Meal
+ * List / Protein stock collapsibles. Expanded it shows exactly what
+ * the Media tab showed: every recipe with a video requested or
+ * ready — name, meal type, protein, people, ingredients,
  * walkthrough, and the embedded player when a video URL is stored.
  */
 export function RecipeVideosSection() {
@@ -198,9 +199,10 @@ export function RecipeVideosSection() {
                 No cooking videos yet
               </p>
               <p className="mx-auto mt-2 max-w-xs text-sm text-[var(--dim)]">
-                Generate a recipe above and tap “Make the cooking
-                video”, or use the same button on any meal in the Meal
-                List — the recipe and its video will live here.
+                Generate a recipe in the Meal Planner and tap “Make
+                the cooking video”, or use the same button on any meal
+                in the Meal List — the recipe and its video will live
+                here.
               </p>
             </div>
           ) : (

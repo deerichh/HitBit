@@ -229,6 +229,42 @@
   }
 }
 
+/* Touch-target floor (Beta 0.01, audit #10): standalone controls
+   meet the app's 32px line and controls inside locked one-line
+   rows get at least a 24px (WCAG AA) hit area. Controls that must
+   stay visually small inside those locked rows — the 18×18 ⓘ
+   buttons, the Shopping Savings / Source pills, the reusable
+   Source pill — keep their layout box and grow only their
+   TAPPABLE area, via an invisible ::after overlay. The layout
+   never changes, so one-line row heights and the HIT label-fit
+   measurement are untouched. .hit24 grows an 18px box to 24×24;
+   .hit24y / .hit24y-lg grow a wide-but-short pill's height to
+   24px / 24.5px. */
+.hit24, .hit24y, .hit24y-lg {
+  position: relative;
+}
+.hit24::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+}
+.hit24y::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -2.5px;
+  bottom: -2.5px;
+}
+.hit24y-lg::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -4px;
+  bottom: -4px;
+}
+
 /* Heart popup entrance (Meal Planner tab). */
 @keyframes heart-pop {
   0% { transform: scale(0.6); opacity: 0; }
@@ -360,6 +396,55 @@
 @media (prefers-reduced-motion: reduce) {
   .scene-cloud-a, .scene-cloud-b, .scene-smoke, .scene-truck,
   .scene-wheel, .scene-road-dash, .scene-scenery, .scene-puff {
+    animation: none;
+  }
+}
+
+/* Settings drawer (SettingsDrawer.tsx): the panel slides in from
+   the left edge of the screen and the backdrop fades in. Under
+   prefers-reduced-motion both appear without motion. */
+@keyframes settings-drawer-in {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(0); }
+}
+.settings-drawer-panel {
+  animation: settings-drawer-in 0.25s ease-out;
+}
+@keyframes settings-backdrop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.settings-drawer-backdrop {
+  animation: settings-backdrop-in 0.2s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  .settings-drawer-panel, .settings-drawer-backdrop {
+    animation: none;
+  }
+}
+
+/* Settings gear (SettingsDrawer.tsx GearButton): the gear idles
+   with a slow STEPPED rotation — it ticks one tooth (45°) at a
+   time like a working gear — and a tap gives it a fuller, fast
+   continuous spin while the drawer opens (.gear-icon-spin).
+   Under prefers-reduced-motion the gear sits still. */
+@keyframes gear-tick {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.gear-icon {
+  transform-origin: 50% 50%;
+  animation: gear-tick 16s steps(8) infinite;
+}
+@keyframes gear-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.gear-icon-spin {
+  animation: gear-spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .gear-icon, .gear-icon-spin {
     animation: none;
   }
 }

@@ -186,6 +186,11 @@ async function loadStockMaps(ctx: Ctx): Promise<StockMaps> {
   const pendingDelta = new Map<string, number>();
   for (const a of adjRows) {
     if (a.appliedAt != null) continue;
+    // An undone adjustment (audit #5 undo coverage) no longer
+    // counts: undoing a still-pending adjustment reverses it
+    // exactly by excluding it here and from the pending list the
+    // auto-scan applies.
+    if (a.undone === 1) continue;
     const key = a.item.trim().toLowerCase();
     pendingDelta.set(key, (pendingDelta.get(key) ?? 0) + a.delta);
   }
@@ -197,6 +202,116 @@ async function loadStockMaps(ctx: Ctx): Promise<StockMaps> {
     if (!effective.has(key)) effective.set(key, Math.max(0, delta));
   }
   return { effective, pendingDelta };
+}
+
+/**
+ * HIT-restock → Shopping List settle (Alpha 0.91): when a HIT List
+ * stock INCREASE has already been recorded by the caller (the
+ * + stepper's quick-adjust or a stocktake correction), and the
+ * item is currently on the Shopping List, the shopping entry is
+ * settled as Purchased with the increase as the purchased
+ * quantity. The caller has ALREADY applied the stock change, so
+ * this helper records NO stock adjustment of its own — it only
+ * writes the purchase-log entry (linked to the caller's own
+ * adjustment, so the Activity log's Undo reverses exactly that
+ * restock) and stamps the item's shopping rows Purchased ✓
+ * (creating the checked row for a list row that has none yet, so
+ * an item the user never struck off still settles). If the item
+ * is not on the Shopping List, nothing happens. If the item was
+ * already settled by an earlier restock, the increase is added to
+ * that restock's purchase-log quantity instead of writing a
+ * second entry; an item settled through the Shopping List's own
+ * Purchased confirmation is left exactly as it is.
+ */
+async function settleShoppingPurchaseFromRestock(
+  ctx: Ctx,
+  canonicalName: string,
+  quantity: number,
+  adjustmentId: number | null,
+): Promise<void> {
+  if (quantity <= 0) return;
+  const db = ctx.db<typeof schema>();
+  const nameKey = canonicalName.trim().toLowerCase();
+  const [listRows, checkedRows] = await Promise.all([
+    db.select().from(schema.listItems),
+    db.select().from(schema.checkedItems),
+  ]);
+  const onList = listRows.filter(
+    (r) => r.item.trim().toLowerCase() === nameKey,
+  );
+  if (onList.length === 0) return;
+  const itemRows = checkedRows.filter(
+    (r) => itemNameOfKey(r.itemKey).trim().toLowerCase() === nameKey,
+  );
+  const already = itemRows.some((r) => r.restockedAt != null);
+  const statements: BatchItem<"sqlite">[] = [];
+  if (!already) {
+    // Attribution (audit #5): the settle is part of the restock
+    // action, so its purchase entry carries the acting role.
+    const { role } = await loadAccountSettings(ctx);
+    statements.push(
+      db.insert(schema.purchaseLog).values({
+        item: canonicalName,
+        quantity,
+        adjustmentId,
+        actor: role,
+      }),
+    );
+    // Stamp every existing checked row for the item, and create a
+    // settled row for each list row that has none yet.
+    const existingKeys = new Set(itemRows.map((r) => r.itemKey));
+    for (const row of itemRows) {
+      statements.push(
+        db
+          .update(schema.checkedItems)
+          .set({ checked: 1, restockedAt: new Date() })
+          .where(eq(schema.checkedItems.itemKey, row.itemKey)),
+      );
+    }
+    for (const row of onList) {
+      const key = itemKey(row.section, row.item);
+      if (existingKeys.has(key)) continue;
+      statements.push(
+        db.insert(schema.checkedItems).values({
+          itemKey: key,
+          checked: 1,
+          restockedAt: new Date(),
+        }),
+      );
+    }
+  } else if (adjustmentId != null) {
+    // Already settled: fold this increase into the purchase entry
+    // of the restock that settled it when that entry is the
+    // item's latest open one and links back to a HIT-side
+    // adjustment (quick-adjust / stocktake) — never into a
+    // Shopping List Purchased confirmation's own entry.
+    const [logRows, adjRows] = await Promise.all([
+      db.select().from(schema.purchaseLog),
+      db.select().from(schema.stockAdjustments),
+    ]);
+    const adjSource = new Map(adjRows.map((a) => [a.id, a.source]));
+    const candidates = logRows
+      .filter(
+        (r) =>
+          r.item.trim().toLowerCase() === nameKey &&
+          r.undone === 0 &&
+          r.adjustmentId != null &&
+          (adjSource.get(r.adjustmentId) === "quick-adjust" ||
+            adjSource.get(r.adjustmentId) === "stocktake"),
+      )
+      .sort((a, b) => b.id - a.id);
+    const latest = candidates[0];
+    if (latest) {
+      statements.push(
+        db
+          .update(schema.purchaseLog)
+          .set({ quantity: latest.quantity + quantity })
+          .where(eq(schema.purchaseLog.id, latest.id)),
+      );
+    }
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
 }
 
 /**
@@ -292,6 +407,180 @@ function matchExistingByName(
   return null;
 }
 
+// ---- Primary vs Connected accounts (Beta 0.01 batch, audit #5,
+// second half) ------------------------------------------------------
+// This copy of the app acts as one of two roles: the Primary user
+// or a Connected account (account_settings, a single row; the
+// role defaults to Primary). Every undoable action type has a
+// policy — Permanent or Reversible — stored as a JSON map; a type
+// with no stored entry is Reversible, so everything starts
+// Reversible. Only the Primary user may edit the policy
+// (setUndoPolicy refuses otherwise). Enforcement (undoGate): a
+// Permanent type's actions offer no Undo at all; a Reversible
+// action can be undone by the Primary user whoever performed it,
+// while a Connected account can undo only actions a Connected
+// account performed. Records carry the performing role in their
+// `actor` column; a null actor (records from before attribution)
+// reads as the Primary user's.
+type ActorRole = "primary" | "connected";
+type UndoMode = "permanent" | "reversible";
+
+const UNDO_POLICY_TYPES = [
+  "purchases",
+  "stockAdjustments",
+  "eaten",
+  "receiptScans",
+  "bitCountChanges",
+  "wasteLog",
+  "manifestImports",
+  "requisitionCheckOffs",
+  "alertDismissals",
+  "posSyncs",
+] as const;
+type UndoPolicyType = (typeof UNDO_POLICY_TYPES)[number];
+
+const undoPolicyShape = z.object({
+  purchases: z.enum(["permanent", "reversible"]),
+  stockAdjustments: z.enum(["permanent", "reversible"]),
+  eaten: z.enum(["permanent", "reversible"]),
+  receiptScans: z.enum(["permanent", "reversible"]),
+  bitCountChanges: z.enum(["permanent", "reversible"]),
+  wasteLog: z.enum(["permanent", "reversible"]),
+  manifestImports: z.enum(["permanent", "reversible"]),
+  requisitionCheckOffs: z.enum(["permanent", "reversible"]),
+  alertDismissals: z.enum(["permanent", "reversible"]),
+  posSyncs: z.enum(["permanent", "reversible"]),
+});
+type UndoPolicy = z.infer<typeof undoPolicyShape>;
+
+function defaultUndoPolicy(): UndoPolicy {
+  return {
+    purchases: "reversible",
+    stockAdjustments: "reversible",
+    eaten: "reversible",
+    receiptScans: "reversible",
+    bitCountChanges: "reversible",
+    wasteLog: "reversible",
+    manifestImports: "reversible",
+    requisitionCheckOffs: "reversible",
+    alertDismissals: "reversible",
+    posSyncs: "reversible",
+  };
+}
+
+function parseUndoPolicy(json: string): UndoPolicy {
+  const policy = defaultUndoPolicy();
+  try {
+    const parsed: unknown = JSON.parse(json || "{}");
+    if (parsed != null && typeof parsed === "object") {
+      const rec = parsed as Record<string, unknown>;
+      for (const t of UNDO_POLICY_TYPES) {
+        const v = rec[t];
+        if (v === "permanent" || v === "reversible") {
+          policy[t] = v;
+        }
+      }
+    }
+  } catch {
+    // A malformed stored policy reads as all-Reversible.
+  }
+  return policy;
+}
+
+async function loadAccountSettings(
+  ctx: Ctx,
+): Promise<{ role: ActorRole; policy: UndoPolicy }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db.select().from(schema.accountSettings);
+  const row = rows[0];
+  if (!row) return { role: "primary", policy: defaultUndoPolicy() };
+  return {
+    role: row.actingRole === "connected" ? "connected" : "primary",
+    policy: parseUndoPolicy(row.policyJson),
+  };
+}
+
+/** The role a record was performed by; null (pre-attribution)
+    reads as the Primary user's. */
+function actorOf(actor: ActorRole | null | undefined): ActorRole {
+  return actor === "connected" ? "connected" : "primary";
+}
+
+/**
+ * The one enforcement point for every Undo (audit #5): returns
+ * null when the undo may proceed, or the refusal message when it
+ * may not — the type is set Permanent, or a Connected account is
+ * trying to undo the Primary user's action.
+ */
+function undoGate(
+  settings: { role: ActorRole; policy: UndoPolicy },
+  type: UndoPolicyType,
+  actor: ActorRole | null | undefined,
+): string | null {
+  if (settings.policy[type] === "permanent") {
+    return "This kind of action is set to Permanent by the Primary user, so it can't be undone.";
+  }
+  if (settings.role === "connected" && actorOf(actor) === "primary") {
+    return "A Connected account can only undo its own actions — only the Primary user can undo this one.";
+  }
+  return null;
+}
+
+/** The display trio every undoable record's read carries: who
+    performed it, whether its type is Permanent, and whether the
+    current role may undo it right now (not undone, not
+    Permanent, ownership satisfied). */
+function undoMeta(
+  settings: { role: ActorRole; policy: UndoPolicy },
+  type: UndoPolicyType,
+  actor: ActorRole | null | undefined,
+  undone: boolean,
+): { actor: ActorRole; permanent: boolean; canUndo: boolean } {
+  return {
+    actor: actorOf(actor),
+    permanent: settings.policy[type] === "permanent",
+    canUndo: !undone && undoGate(settings, type, actor) == null,
+  };
+}
+
+const undoMetaShape = z.object({
+  actor: z.enum(["primary", "connected"]),
+  permanent: z.boolean(),
+  canUndo: z.boolean(),
+});
+
+// Household setup questionnaire (Alpha 0.90): the saved answer set
+// for the HIT setup questionnaire, and the starter-meal table the
+// finish seeds from — for each preset "meals you make often" entry,
+// the meal type it belongs to and the tracked protein it is built
+// around (seeded as the meal's single protein group, pointing at
+// the HIT List item of the same name). Custom (Other) meals seed
+// as plain dinners with no protein group.
+const householdSetupAnswers = z.object({
+  householdSize: z.string().max(80).default(""),
+  stores: z.array(z.string().min(1).max(80)).max(24).default([]),
+  allergies: z.array(z.string().min(1).max(80)).max(24).default([]),
+  proteins: z.array(z.string().min(1).max(80)).max(24).default([]),
+  staples: z.array(z.string().min(1).max(80)).max(24).default([]),
+  meals: z.array(z.string().min(1).max(80)).max(24).default([]),
+  reminders: z.string().max(80).default(""),
+  sharing: z.string().max(80).default(""),
+});
+
+const SETUP_STARTER_MEALS: Record<
+  string,
+  { mealType: "breakfast" | "lunch" | "dinner" | "snack"; protein?: string }
+> = {
+  "chicken stir-fry": { mealType: "dinner", protein: "Chicken Breast" },
+  "spaghetti bolognese": { mealType: "dinner", protein: "Ground Beef" },
+  "taco night": { mealType: "dinner", protein: "Ground Beef" },
+  "pancake breakfast": { mealType: "breakfast", protein: "Eggs" },
+  "caesar salad": { mealType: "lunch", protein: "Chicken Breast" },
+  "veggie omelette": { mealType: "breakfast", protein: "Eggs" },
+  "bbq burgers": { mealType: "dinner", protein: "Frozen Burgers" },
+  "tomato soup & toast": { mealType: "lunch" },
+};
+
 const priceInfoShape = z.object({
   status: z.enum(["pending", "done", "failed"]),
   salePriceCents: z.number().nullable(),
@@ -308,6 +597,11 @@ const priceInfoShape = z.object({
 
 const hitListResponse = z.object({
   refreshedAt: z.string().nullable(),
+  // Counted-last stamp (audit #16): the most recent daily stock
+  // snapshot date ("YYYY-MM-DD", Toronto) — the last day the
+  // household's stock was counted into the app. Null when no
+  // snapshot exists yet; the page then reads "Not counted yet".
+  lastCountedDate: z.string().nullable(),
   totalItems: z.number(),
   inStock: z.number(),
   outOfStock: z.number(),
@@ -1546,7 +1840,21 @@ const recipeOut = z.object({
 
 type RecipeOut = z.infer<typeof recipeOut>;
 
-type InvItem = { name: string; stock: number };
+type InvItem = { name: string; stock: number; expiry: string | null };
+
+/**
+ * Whole days from today (UTC calendar days) until an expiry date
+ * key ("YYYY-MM-DD"): negative when the date has passed, 0 for
+ * today. Server-side companion to the client's daysUntilExpiry —
+ * used only to weigh recipe-generation picks, never for display.
+ */
+function daysUntilExpiryUtc(dateKey: string): number {
+  const [y = 1970, m = 1, d = 1] = dateKey.split("-").map(Number);
+  const target = Date.UTC(y, m - 1, d);
+  const now = new Date();
+  const today = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate());
+  return Math.round((target - today) / 86_400_000);
+}
 
 /**
  * Keyword match against an inventory item name. Multi-word keywords
@@ -1577,7 +1885,18 @@ function poolPick(
       keywords.some((k) => nameMatches(i.name, k)),
   );
   if (matches.length === 0) return null;
-  return matches[rotate % matches.length] ?? null;
+  // Use-first priority (Beta 0.03, audit #14): when any match is
+  // close to expiry — within the app's one 3-day window or already
+  // past, the HIT row chip's set — the pick comes from those
+  // matches, soonest-expiry first, with the variant rotation
+  // applied within the group so "Generate another" still varies.
+  const soon = matches
+    .filter(
+      (i) => i.expiry != null && daysUntilExpiryUtc(i.expiry) <= 3,
+    )
+    .sort((a, b) => (a.expiry ?? "").localeCompare(b.expiry ?? ""));
+  const pool = soon.length > 0 ? soon : matches;
+  return pool[rotate % pool.length] ?? null;
 }
 
 function proteinBase(protein: string): { quantity: number; unit: string | null } {
@@ -1930,6 +2249,11 @@ const bitItemShape = z.object({
   // whose needs profile includes expiry tracking; null otherwise.
   expiryDate: z.string().nullable(),
   tags: z.array(z.string()),
+  // This item's own last-counted stamp (Beta 0.06 batch, audit
+  // #16): the newest check snapshot's time for this item (ISO),
+  // from bit_item_snapshots; null when no finished check has ever
+  // counted it. Filled by getBitState; bitRowToItem leaves null.
+  lastCountedAt: z.string().nullable(),
 });
 
 const bitWasteLogShape = z.object({
@@ -1940,6 +2264,36 @@ const bitWasteLogShape = z.object({
   quantity: z.number(),
   reason: z.enum(["Spoilage", "Expired", "Breakage", "Other"]),
   createdAt: z.string(),
+  // Undo coverage (audit #5): true once undoBitWaste has
+  // restored the entry's stock and retired the entry.
+  undone: z.boolean(),
+  // Attribution + policy (audit #5, Primary vs Connected).
+  ...undoMetaShape.shape,
+});
+
+const bitStockEventShape = z.object({
+  id: z.number(),
+  itemId: z.number().nullable(),
+  itemName: z.string(),
+  // The signed change the Inventory-tab count edit applied.
+  delta: z.number(),
+  createdAt: z.string(),
+  undone: z.boolean(),
+  // Attribution + policy (audit #5, Primary vs Connected).
+  ...undoMetaShape.shape,
+});
+
+const bitManifestImportShape = z.object({
+  id: z.number(),
+  scanId: z.number().nullable(),
+  // Item names the import added (new items) vs set the count of
+  // (existing items) — the record its Undo reverts.
+  addedNames: z.array(z.string()),
+  updatedNames: z.array(z.string()),
+  createdAt: z.string(),
+  undone: z.boolean(),
+  // Attribution + policy (audit #5, Primary vs Connected).
+  ...undoMetaShape.shape,
 });
 
 const bitManifestLineShape = z.object({
@@ -1996,12 +2350,25 @@ const bitRequisitionLineShape = z.object({
   category: z.string(),
   status: z.enum(["pending", "received", "not_received"]),
   qtyReceived: z.number().nullable(),
+  // Attribution + policy (audit #5, Primary vs Connected) for
+  // the line's check-off: who checked it off (null while
+  // pending), whether requisition check-offs are set Permanent,
+  // and whether the current role may undo the check-off.
+  ...undoMetaShape.shape,
 });
 
 const bitRequisitionShape = z.object({
   id: z.number(),
   reqNo: z.string(),
   status: z.enum(["outstanding", "closed"]),
+  // Approver separation (audit #15): who prepared it (the Duty
+  // Officer) and who approved it (the District Chief), with the
+  // dates each was recorded — snapshotted at send time. Null on
+  // requisitions sent before the approver step existed.
+  preparedBy: z.string().nullable(),
+  preparedAt: z.string().nullable(),
+  approvedBy: z.string().nullable(),
+  approvedAt: z.string().nullable(),
   sentAt: z.string(),
   closedAt: z.string().nullable(),
   lines: z.array(bitRequisitionLineShape),
@@ -2062,11 +2429,16 @@ type BitRequisitionLineRow =
 function bitRequisitionToShape(
   req: BitRequisitionRow,
   lines: BitRequisitionLineRow[],
+  settings: { role: ActorRole; policy: UndoPolicy },
 ): z.infer<typeof bitRequisitionShape> {
   return {
     id: req.id,
     reqNo: req.reqNo,
     status: req.status,
+    preparedBy: req.preparedBy,
+    preparedAt: req.preparedAt?.toISOString() ?? null,
+    approvedBy: req.approvedBy,
+    approvedAt: req.approvedAt?.toISOString() ?? null,
     sentAt: req.sentAt.toISOString(),
     closedAt: req.closedAt?.toISOString() ?? null,
     lines: lines
@@ -2086,6 +2458,12 @@ function bitRequisitionToShape(
         category: l.category,
         status: l.status,
         qtyReceived: l.qtyReceived,
+        ...undoMeta(
+          settings,
+          "requisitionCheckOffs",
+          l.checkedOffBy,
+          l.status === "pending",
+        ),
       })),
   };
 }
@@ -2320,6 +2698,48 @@ function bitParseManifestLines(
         supplier: typeof l.supplier === "string" ? l.supplier : "",
       }))
       .filter((l) => l.name.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+/** One recorded change of a manifest import (bit_manifest_imports
+    .changes_json): the item the import touched, whether the
+    import created it, and — for items it already found — the
+    on-hand from before the import set it. */
+type BitManifestImportChange = {
+  name: string;
+  itemId: number | null;
+  added: boolean;
+  priorOnHand: number | null;
+};
+
+function bitParseManifestImportChanges(
+  json: string | null | undefined,
+): BitManifestImportChange[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter(
+        (c): c is Record<string, unknown> =>
+          typeof c === "object" && c !== null,
+      )
+      .map((c) => ({
+        name: typeof c.name === "string" ? c.name : "",
+        itemId:
+          typeof c.itemId === "number" && Number.isFinite(c.itemId)
+            ? c.itemId
+            : null,
+        added: c.added === true,
+        priorOnHand:
+          typeof c.priorOnHand === "number" &&
+          Number.isFinite(c.priorOnHand)
+            ? c.priorOnHand
+            : null,
+      }))
+      .filter((c) => c.name.length > 0);
   } catch {
     return [];
   }
@@ -2636,6 +3056,8 @@ const bitPosTransactionShape = z.object({
   belowPar: z.boolean(),
   undone: z.boolean(),
   createdAt: z.string(),
+  // Attribution + policy (audit #5, Primary vs Connected).
+  ...undoMetaShape.shape,
 });
 
 const bitPosUnmatchedShape = z.object({
@@ -2797,6 +3219,10 @@ async function applyBitPosSaleInternal(
   const businessId = args.businessId;
   const source = args.source.trim() || "POS";
   const externalId = args.externalId?.trim() || null;
+  // Attribution (audit #5): every transaction this sale/sync
+  // writes carries the role this copy is acting as — the POS
+  // syncs policy and ownership rule follow it on Undo.
+  const { role: posActor } = await loadAccountSettings(ctx);
   if (externalId) {
     const existing = await db
       .select()
@@ -2846,6 +3272,7 @@ async function applyBitPosSaleInternal(
           belowPar: 0,
           undone: 0,
           resolved: 0,
+          actor: posActor,
           createdAt: now,
         }),
       );
@@ -2904,6 +3331,7 @@ async function applyBitPosSaleInternal(
           belowPar,
           undone: 0,
           resolved: 0,
+          actor: posActor,
           createdAt: now,
         }),
       );
@@ -2922,6 +3350,7 @@ async function applyBitPosSaleInternal(
           belowPar: 0,
           undone: 0,
           resolved: 0,
+          actor: posActor,
           createdAt: now,
         }),
       );
@@ -3845,6 +4274,7 @@ function bitRowToItem(r: BitItemRow): z.infer<typeof bitItemShape> {
     sku: r.sku,
     expiryDate: r.expiryDate,
     tags: bitParseStringArray(r.tagsJson),
+    lastCountedAt: null,
   };
 }
 
@@ -4331,12 +4761,14 @@ export const Actions = {
       // Record the adjustment first so its id can link the
       // purchase-log row (the Activity log's purchase entry, whose
       // Undo reverses exactly this adjustment).
+      const { role } = await loadAccountSettings(ctx);
       const [adj] = await db
         .insert(schema.stockAdjustments)
         .values({
           item: name,
           delta: args.quantity,
           source: "finish-shop",
+          actor: role,
         })
         .returning({ id: schema.stockAdjustments.id });
       const statements: BatchItem<"sqlite">[] = [
@@ -4344,6 +4776,7 @@ export const Actions = {
           item: name,
           quantity: args.quantity,
           adjustmentId: adj?.id ?? null,
+          actor: role,
         }),
       ];
       // Stamp every checked row for the item, so its row in any
@@ -4371,7 +4804,7 @@ export const Actions = {
 
   getHitList: defineAction({
     description:
-      "Returns the household inventory: cached HIT List rows from the sheet merged with items added in the app (which carry their formal name/SKU and price-check results), with totals, the last refresh time, and how many app-added items are still waiting to be included in the sync updates to Vanessa's app. Stock counts are effective stock (sheet count + app-side adjustments not yet applied to the sheet); each item also carries its sheet count, pending delta, sale-watch star state, a run-out forecast in days when snapshot history supports one, and its optional app-side expiry date. watchedItems lists every starred item so sale scans can include them regardless of stock.",
+      "Returns the household inventory: cached HIT List rows from the sheet merged with items added in the app (which carry their formal name/SKU and price-check results), with totals, the last refresh time, the most recent daily stock snapshot date (lastCountedDate — the counted-last stamp; null when no snapshot exists), and how many app-added items are still waiting to be included in the sync updates to Vanessa's app. Stock counts are effective stock (sheet count + app-side adjustments not yet applied to the sheet); each item also carries its sheet count, pending delta, sale-watch star state, a run-out forecast in days when snapshot history supports one, and its optional app-side expiry date. watchedItems lists every starred item so sale scans can include them regardless of stock.",
     request: z.object({}),
     response: hitListResponse,
     handler: async (ctx): Promise<z.infer<typeof hitListResponse>> => {
@@ -4481,6 +4914,15 @@ export const Actions = {
         refreshedAt: meta?.refreshedAt
           ? meta.refreshedAt.toISOString()
           : null,
+        // Snapshot dates are "YYYY-MM-DD" keys, so the max string
+        // is the most recent counted day.
+        lastCountedDate:
+          snapRows.length > 0
+            ? snapRows.reduce(
+                (max, r) => (r.date > max ? r.date : max),
+                snapRows[0]?.date ?? "",
+              ) || null
+            : null,
         totalItems: merged.length,
         inStock: merged.filter((r) => r.stock > 0).length,
         outOfStock: merged.filter((r) => r.stock === 0).length,
@@ -4684,6 +5126,265 @@ export const Actions = {
     },
   }),
 
+  getHouseholdSetup: defineAction({
+    description:
+      "Returns the household setup questionnaire answers saved by the last completed HIT setup (household size, stores, allergies/dietary needs, proteins, staples, frequent meals, reminder and sharing choices) and when it was completed, or null when setup has never been finished.",
+    request: z.object({}),
+    response: z.object({
+      setup: z
+        .object({
+          answers: householdSetupAnswers,
+          completedAt: z.string().nullable(),
+        })
+        .nullable(),
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{
+      setup: {
+        answers: z.infer<typeof householdSetupAnswers>;
+        completedAt: string | null;
+      } | null;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.householdSetup);
+      const row = rows[0];
+      if (!row) return { setup: null };
+      let answers: z.infer<typeof householdSetupAnswers> =
+        householdSetupAnswers.parse({});
+      try {
+        answers = householdSetupAnswers.parse(
+          JSON.parse(row.answersJson || "{}"),
+        );
+      } catch {
+        // A malformed stored blob reads as an empty answer set
+        // rather than failing the whole read.
+        answers = householdSetupAnswers.parse({});
+      }
+      return {
+        setup: {
+          answers,
+          completedAt: row.completedAt
+            ? row.completedAt.toISOString()
+            : null,
+        },
+      };
+    },
+  }),
+
+  completeHouseholdSetup: defineAction({
+    description:
+      "Finishes the HIT setup questionnaire NON-DESTRUCTIVELY: saves the answers as the household setup profile (upserting the single household_setup row), then seeds starter content ADDITIVELY — each chosen protein and staple becomes a HIT List item (through the app-added items store, so it shows in the HIT List and syncs like any app add) and each chosen frequent meal becomes a meal idea, but ONLY when that name is not already tracked (dedupe by name, case-insensitive, against the sheet items, the app-added items, and the existing meals). Nothing is ever removed, overwritten, or reset: existing HIT List items, meals, and planner picks are untouched. Seeded items start at stock 0 with no price check (they are questionnaire starters, not price-checked adds). Returns the names actually added so the finish screen can say exactly what was new.",
+    request: z.object({ answers: householdSetupAnswers }),
+    response: z.object({
+      ok: z.literal(true),
+      addedItems: z.array(z.string()),
+      addedMeals: z.array(z.string()),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: true;
+      addedItems: string[];
+      addedMeals: string[];
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const answers = args.answers;
+      const now = new Date();
+      const existingSetup = await db.select().from(schema.householdSetup);
+      if (existingSetup.length > 0) {
+        await db
+          .update(schema.householdSetup)
+          .set({ answersJson: JSON.stringify(answers), completedAt: now })
+          .where(eq(schema.householdSetup.id, 1));
+      } else {
+        await db.insert(schema.householdSetup).values({
+          id: 1,
+          answersJson: JSON.stringify(answers),
+          completedAt: now,
+        });
+      }
+      // Additive seeding, deduped by name (case-insensitive) against
+      // everything already tracked.
+      const [sheetRows, addedRows, mealRows] = await Promise.all([
+        db.select().from(schema.hitItems),
+        db.select().from(schema.hitAddedItems),
+        db.select().from(schema.meals),
+      ]);
+      const trackedKeys = new Set<string>();
+      for (const r of sheetRows) trackedKeys.add(r.item.trim().toLowerCase());
+      for (const r of addedRows) trackedKeys.add(r.item.trim().toLowerCase());
+      const store = answers.stores[0]?.trim() || "Grocery Store";
+      const addedItems: string[] = [];
+      const seedItem = async (
+        name: string,
+        category: string,
+      ): Promise<void> => {
+        const clean = name.trim();
+        if (!clean) return;
+        const key = clean.toLowerCase();
+        if (trackedKeys.has(key)) return;
+        trackedKeys.add(key);
+        await db.insert(schema.hitAddedItems).values({
+          category,
+          item: clean,
+          stock: 0,
+          store,
+          formalName: null,
+          sku: null,
+          priceStatus: "done",
+          priceCheckStartedAt: null,
+        });
+        addedItems.push(clean);
+      };
+      for (const p of answers.proteins) await seedItem(p, "Freezer");
+      for (const s of answers.staples) await seedItem(s, "Misc.");
+      const mealKeys = new Set(
+        mealRows.map((m) => m.name.trim().toLowerCase()),
+      );
+      const addedMeals: string[] = [];
+      let sortOrder = mealRows.length;
+      for (const mealName of answers.meals) {
+        const clean = mealName.trim();
+        if (!clean) continue;
+        const key = clean.toLowerCase();
+        if (mealKeys.has(key)) continue;
+        mealKeys.add(key);
+        const starter = SETUP_STARTER_MEALS[key];
+        const inserted = await db
+          .insert(schema.meals)
+          .values({
+            name: clean,
+            mealType: starter?.mealType ?? "dinner",
+            sortOrder: sortOrder++,
+          })
+          .returning({ id: schema.meals.id });
+        const meal = inserted[0];
+        if (meal && starter?.protein) {
+          await db.insert(schema.mealProteins).values({
+            mealId: meal.id,
+            label: starter.protein,
+            sheetName: starter.protein,
+            groupIndex: 0,
+            sortOrder: 0,
+          });
+        }
+        addedMeals.push(clean);
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const, addedItems, addedMeals };
+    },
+  }),
+
+  getAccountSettings: defineAction({
+    description:
+      "Returns the Primary vs Connected account settings (Beta 0.01 batch, audit #5): the role THIS copy of the app is acting as ('primary' — the Primary user — or 'connected' — a Connected account; Primary until changed) and the full undo policy — for each undoable action type (purchases, stockAdjustments, eaten, receiptScans, bitCountChanges, wasteLog, manifestImports, requisitionCheckOffs, alertDismissals, posSyncs) whether its actions are 'permanent' (no Undo is offered) or 'reversible' (the Undo works). Every type defaults to 'reversible'.",
+    request: z.object({}),
+    response: z.object({
+      role: z.enum(["primary", "connected"]),
+      policy: undoPolicyShape,
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{ role: ActorRole; policy: UndoPolicy }> => {
+      return await loadAccountSettings(ctx);
+    },
+  }),
+
+  setActingRole: defineAction({
+    description:
+      "Sets the role THIS copy of the app acts as — 'primary' (the Primary user) or 'connected' (a Connected account). The role is this copy's own identity, so it can be switched from either role; it decides which actions this copy may undo (a Connected account undoes only its own actions; the Primary user undoes anyone's) and whether the undo policy below can be edited (Primary only). New undoable actions are stamped with the role in force when they happen.",
+    request: z.object({
+      role: z.enum(["primary", "connected"]),
+    }),
+    response: z.object({
+      ok: z.literal(true),
+      role: z.enum(["primary", "connected"]),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: true; role: ActorRole }> => {
+      const db = ctx.db<typeof schema>();
+      const existing = await db.select().from(schema.accountSettings);
+      if (existing.length > 0) {
+        await db
+          .update(schema.accountSettings)
+          .set({ actingRole: args.role })
+          .where(eq(schema.accountSettings.id, 1));
+      } else {
+        await db.insert(schema.accountSettings).values({
+          id: 1,
+          actingRole: args.role,
+          policyJson: "{}",
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const, role: args.role };
+    },
+  }),
+
+  setUndoPolicy: defineAction({
+    description:
+      "Sets one undoable action type's policy — 'permanent' (its actions apply with no Undo offered and their records read as permanent) or 'reversible' (the Undo works, under the ownership rule). Editable ONLY while this copy acts as the Primary user: a Connected account's attempt is refused and nothing changes — connected-account actions stay reversible unless the Primary user changes the type here.",
+    request: z.object({
+      type: z.enum([
+        "purchases",
+        "stockAdjustments",
+        "eaten",
+        "receiptScans",
+        "bitCountChanges",
+        "wasteLog",
+        "manifestImports",
+        "requisitionCheckOffs",
+        "alertDismissals",
+        "posSyncs",
+      ]),
+      mode: z.enum(["permanent", "reversible"]),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      policy: undoPolicyShape.nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      error: string | null;
+      policy: UndoPolicy | null;
+    }> => {
+      const settings = await loadAccountSettings(ctx);
+      if (settings.role !== "primary") {
+        return {
+          ok: false,
+          error:
+            "Only the Primary user can change the undo policy — this copy is acting as a Connected account.",
+          policy: null,
+        };
+      }
+      const policy = { ...settings.policy, [args.type]: args.mode };
+      const db = ctx.db<typeof schema>();
+      const existing = await db.select().from(schema.accountSettings);
+      if (existing.length > 0) {
+        await db
+          .update(schema.accountSettings)
+          .set({ policyJson: JSON.stringify(policy) })
+          .where(eq(schema.accountSettings.id, 1));
+      } else {
+        await db.insert(schema.accountSettings).values({
+          id: 1,
+          actingRole: settings.role,
+          policyJson: JSON.stringify(policy),
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true, error: null, policy };
+    },
+  }),
+
   recheckItemPrice: defineAction({
     description:
       "Re-runs the automatic Flipp/website price check for an item that was added in the app (e.g. after a failed check, or in a new flyer week).",
@@ -4858,7 +5559,7 @@ export const Actions = {
 
   adjustStock: defineAction({
     description:
-      "Adjusts one HIT List item's stock by exactly +1 or −1 from the app (the HIT List steppers and the barcode stock-bump). Any other delta is rejected — larger corrections go through their own dedicated flows, not this one. Records a pending stock adjustment (source 'quick-adjust') the auto-scan will write to the sheet; the app's effective stock changes immediately and never goes below 0.",
+      "Adjusts one HIT List item's stock by exactly +1 or −1 from the app (the HIT List steppers and the barcode stock-bump). Any other delta is rejected — larger corrections go through their own dedicated flows, not this one. Records a pending stock adjustment (source 'quick-adjust') the auto-scan will write to the sheet; the app's effective stock changes immediately and never goes below 0. A +1 increase also settles the item's Shopping List entry as Purchased (quantity = the increase) when the item is currently on the Shopping List — the settle adds no stock of its own, since this adjustment already applied the increase.",
     request: z.object({
       item: z.string().min(1).max(120),
       delta: z
@@ -4908,11 +5609,29 @@ export const Actions = {
         hitRows.find((r) => r.item.trim().toLowerCase() === key)?.item ??
         addedRows.find((r) => r.item.trim().toLowerCase() === key)?.item ??
         args.item;
-      await db.insert(schema.stockAdjustments).values({
-        item: canonical,
-        delta: args.delta,
-        source: "quick-adjust",
-      });
+      const { role } = await loadAccountSettings(ctx);
+      const [adj] = await db
+        .insert(schema.stockAdjustments)
+        .values({
+          item: canonical,
+          delta: args.delta,
+          source: "quick-adjust",
+          actor: role,
+        })
+        .returning({ id: schema.stockAdjustments.id });
+      // Alpha 0.91: a stock INCREASE on the HIT List settles the
+      // item's Shopping List entry as Purchased (quantity = the
+      // increase) when the item is currently on the list. The
+      // adjustment above already applied the increase, so the
+      // settle records no stock of its own.
+      if (args.delta > 0) {
+        await settleShoppingPurchaseFromRestock(
+          ctx,
+          canonical,
+          args.delta,
+          adj?.id ?? null,
+        );
+      }
       ctx.invalidateQueries();
       return { ok: true, error: null, stock: next };
     },
@@ -4941,7 +5660,7 @@ export const Actions = {
         .orderBy(asc(schema.stockAdjustments.id));
       return {
         pending: rows
-          .filter((r) => r.appliedAt == null)
+          .filter((r) => r.appliedAt == null && r.undone === 0)
           .map((r) => ({
             id: r.id,
             item: r.item,
@@ -5065,6 +5784,7 @@ export const Actions = {
           };
         }
       }
+      const { role } = await loadAccountSettings(ctx);
       let logged = 0;
       for (const entry of args.entries) {
         const usedSome = entry.usedSome;
@@ -5080,6 +5800,7 @@ export const Actions = {
           mealName: args.mealName,
           pickId: args.pickId,
           pickDate: args.pickDate,
+          actor: role,
         });
         if (deducted > 0) {
           await db.insert(schema.stockAdjustments).values({
@@ -5116,6 +5837,21 @@ export const Actions = {
           pickDate: z.string().nullable(),
           createdAt: z.string(),
           undone: z.boolean(),
+          // Attribution + policy (audit #5, Primary vs
+          // Connected) for the entry's Eaten type.
+          ...undoMetaShape.shape,
+        }),
+      ),
+      // Per-pick undo state for the Meal Planner's pick-row
+      // Undo (audit #5): for each pick with active usage, who
+      // performed the Eaten tap (a tap counts as the Primary
+      // user's when any of its entries is), whether Eaten is
+      // set Permanent, and whether the current role may undo
+      // the tap as a whole.
+      pickUndo: z.array(
+        z.object({
+          pickId: z.number(),
+          ...undoMetaShape.shape,
         }),
       ),
       loggedPickIds: z.array(z.number()),
@@ -5129,11 +5865,40 @@ export const Actions = {
     }),
     handler: async (ctx) => {
       const db = ctx.db<typeof schema>();
+      const settings = await loadAccountSettings(ctx);
       const rows = await db
         .select()
         .from(schema.usageLog)
         .orderBy(desc(schema.usageLog.id));
       const active = rows.filter((r) => r.undone === 0);
+      // Per-pick undo state (audit #5): a pick's Eaten tap is
+      // undone as a whole, so its actor is the Primary user when
+      // ANY of its active entries is the Primary user's, and its
+      // canUndo requires every entry to pass the gate.
+      const pickUndoMap = new Map<
+        number,
+        { actor: ActorRole; canUndo: boolean }
+      >();
+      for (const r of active) {
+        if (r.pickId == null) continue;
+        const cur = pickUndoMap.get(r.pickId) ?? {
+          actor: "connected" as ActorRole,
+          canUndo: true,
+        };
+        if (actorOf(r.actor) === "primary") cur.actor = "primary";
+        if (undoGate(settings, "eaten", r.actor) != null) {
+          cur.canUndo = false;
+        }
+        pickUndoMap.set(r.pickId, cur);
+      }
+      const pickUndo = [...pickUndoMap.entries()].map(
+        ([pickId, v]) => ({
+          pickId,
+          actor: v.actor,
+          permanent: settings.policy.eaten === "permanent",
+          canUndo: v.canUndo && settings.policy.eaten !== "permanent",
+        }),
+      );
       const loggedPickIds = [
         ...new Set(
           active
@@ -5178,7 +5943,9 @@ export const Actions = {
           pickDate: r.pickDate,
           createdAt: r.createdAt.toISOString(),
           undone: r.undone === 1,
+          ...undoMeta(settings, "eaten", r.actor, r.undone === 1),
         })),
+        pickUndo,
         loggedPickIds,
         noDeductionPickIds,
         learnedByItem,
@@ -5207,6 +5974,8 @@ export const Actions = {
       const row = rows[0];
       if (!row) return { ok: false, error: "That usage entry no longer exists." };
       if (row.undone === 1) return { ok: false, error: "That entry is already undone." };
+      const gate = undoGate(await loadAccountSettings(ctx), "eaten", row.actor);
+      if (gate) return { ok: false, error: gate };
       await db
         .update(schema.usageLog)
         .set({ undone: 1, undoneAt: new Date() })
@@ -5223,9 +5992,69 @@ export const Actions = {
     },
   }),
 
+  undoPickEaten: defineAction({
+    description:
+      "Undoes a Meal Planner pick's whole 'Eaten' tap from the pick row itself (Beta 0.01 batch, audit #5): every non-undone usage-log entry logged for the pick is marked undone and each deduction is reversed with a pending stock adjustment (+units, source 'usage-undo') through the existing queue — the same reversal undoUsage performs per entry, applied to the tap as a whole. The pick returns to its un-eaten state and can be marked eaten again. A pick with no active usage logged reports an error and changes nothing.",
+    request: z.object({ pickId: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      undoneCount: z.number(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; undoneCount: number; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.usageLog)
+        .where(eq(schema.usageLog.pickId, args.pickId));
+      const active = rows.filter((r) => r.undone === 0);
+      if (active.length === 0) {
+        return {
+          ok: false,
+          undoneCount: 0,
+          error: "That pick has no logged usage to undo.",
+        };
+      }
+      // Policy + ownership (audit #5): the tap is undone as a
+      // whole, so every entry it logged must be undoable by the
+      // current role — a Permanent Eaten type blocks it, and a
+      // Connected account can't undo a tap the Primary user made.
+      const settings = await loadAccountSettings(ctx);
+      for (const row of active) {
+        const gate = undoGate(settings, "eaten", row.actor);
+        if (gate) return { ok: false, undoneCount: 0, error: gate };
+      }
+      const statements: BatchItem<"sqlite">[] = [];
+      for (const row of active) {
+        statements.push(
+          db
+            .update(schema.usageLog)
+            .set({ undone: 1, undoneAt: new Date() })
+            .where(eq(schema.usageLog.id, row.id)),
+        );
+        if (row.deducted > 0) {
+          statements.push(
+            db.insert(schema.stockAdjustments).values({
+              item: row.item,
+              delta: row.deducted,
+              source: "usage-undo",
+            }),
+          );
+        }
+      }
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, undoneCount: active.length, error: null };
+    },
+  }),
+
   recordStocktake: defineAction({
     description:
-      "Records the confirmed result of a HIT List stocktake: for each counted item whose counted value differs from its current effective stock, records ONE pending stock adjustment for the full difference (source 'stocktake', any size — unlike adjustStock, which stays clamped to ±1) through the same queue the auto-scan applies to the sheet. Items whose count matches their effective stock record nothing, and an empty or all-matching counts list records nothing. The sheet itself is never written here.",
+      "Records the confirmed result of a HIT List stocktake: for each counted item whose counted value differs from its current effective stock, records ONE pending stock adjustment for the full difference (source 'stocktake', any size — unlike adjustStock, which stays clamped to ±1) through the same queue the auto-scan applies to the sheet. Items whose count matches their effective stock record nothing, and an empty or all-matching counts list records nothing. The sheet itself is never written here. A counted INCREASE for an item currently on the Shopping List also settles that shopping entry as Purchased (quantity = the increase), adding no stock beyond the stocktake adjustment itself.",
     request: z.object({
       counts: z
         .array(
@@ -5308,16 +6137,44 @@ export const Actions = {
           });
         }
       }
-      if (changes.length > 0) {
-        const statements: BatchItem<"sqlite">[] = changes.map((ch) =>
+      // Alpha 0.91: a counted INCREASE for an item currently on
+      // the Shopping List also settles that shopping entry as
+      // Purchased (quantity = the increase). The settle needs each
+      // increase's own adjustment id, so increases are inserted
+      // one by one; the remaining changes keep the batch insert.
+      // Either way the stocktake adjustment is the only stock
+      // recorded — the settle adds none of its own.
+      const increases = changes.filter((ch) => ch.delta > 0);
+      const others = changes.filter((ch) => ch.delta <= 0);
+      const { role } = await loadAccountSettings(ctx);
+      if (others.length > 0) {
+        const statements: BatchItem<"sqlite">[] = others.map((ch) =>
           db.insert(schema.stockAdjustments).values({
             item: ch.item,
             delta: ch.delta,
             source: "stocktake",
+            actor: role,
           }),
         );
         const [first, ...rest] = statements;
         if (first) await db.batch([first, ...rest]);
+      }
+      for (const ch of increases) {
+        const [adj] = await db
+          .insert(schema.stockAdjustments)
+          .values({
+            item: ch.item,
+            delta: ch.delta,
+            source: "stocktake",
+            actor: role,
+          })
+          .returning({ id: schema.stockAdjustments.id });
+        await settleShoppingPurchaseFromRestock(
+          ctx,
+          ch.item,
+          ch.delta,
+          adj?.id ?? null,
+        );
       }
       ctx.invalidateQueries();
       return { ok: true, recorded: changes.length, changes, error: null };
@@ -5326,29 +6183,36 @@ export const Actions = {
 
   getActivityLog: defineAction({
     description:
-      "Returns the HIT List Activity log: usage entries (Eaten deductions and 'used some' markers from usage_log) AND purchase confirmations (from purchase_log, written by confirmPurchased) merged newest-first, up to 40 entries, each labelled by kind ('used' | 'purchased') with item, quantity, source, time, and undone state. Undone entries are included and flagged; an undone entry cannot be undone again (undoUsage / undoPurchase refuse it).",
+      "Returns the HIT List Activity log: usage entries (Eaten deductions and 'used some' markers from usage_log), purchase confirmations (from purchase_log, written by confirmPurchased), AND direct stock adjustments from the HIT List +/− steppers and stocktakes (stock_adjustments with source 'quick-adjust' / 'stocktake') merged newest-first, up to 40 entries, each labelled by kind ('used' | 'purchased' | 'adjusted') with item, quantity, source, time, and undone state. A stepper/stocktake adjustment that settled a Shopping List purchase is represented by its purchase entry alone (the purchase entry's Undo reverses that adjustment), so it is not listed twice. Undone entries are included and flagged; an undone entry cannot be undone again (undoUsage / undoPurchase / undoStockAdjustment refuse it).",
     request: z.object({}),
     response: z.object({
       entries: z.array(
         z.object({
-          // "usage-<id>" or "purchase-<id>".
+          // "usage-<id>", "purchase-<id>" or "adjustment-<id>".
           key: z.string(),
-          kind: z.enum(["used", "purchased"]),
+          kind: z.enum(["used", "purchased", "adjusted"]),
           refId: z.number(),
           item: z.string(),
           // Units deducted (used) or bought (purchased); 0 for a
-          // "used some" marker entry.
+          // "used some" marker entry. For "adjusted" entries the
+          // SIGNED delta of the stock change.
           quantity: z.number(),
           usedSome: z.boolean(),
           source: z.string(),
           createdAt: z.string(),
           undone: z.boolean(),
+          // Attribution + policy (audit #5, Primary vs
+          // Connected): who performed the entry, whether its
+          // action type is set Permanent, and whether the
+          // current role may undo it.
+          ...undoMetaShape.shape,
         }),
       ),
     }),
     handler: async (ctx) => {
       const db = ctx.db<typeof schema>();
-      const [usageRows, purchaseRows] = await Promise.all([
+      const settings = await loadAccountSettings(ctx);
+      const [usageRows, purchaseRows, adjustmentRows] = await Promise.all([
         db
           .select()
           .from(schema.usageLog)
@@ -5359,7 +6223,20 @@ export const Actions = {
           .from(schema.purchaseLog)
           .orderBy(desc(schema.purchaseLog.id))
           .limit(40),
+        db
+          .select()
+          .from(schema.stockAdjustments)
+          .orderBy(desc(schema.stockAdjustments.id))
+          .limit(60),
       ]);
+      // Adjustments a purchase entry points at are that
+      // purchase's stock change — the purchase entry (and its
+      // Undo) speaks for them.
+      const purchaseAdjustmentIds = new Set(
+        purchaseRows
+          .map((r) => r.adjustmentId)
+          .filter((v): v is number => v != null),
+      );
       const merged = [
         ...usageRows.map((r) => ({
           key: `usage-${r.id}`,
@@ -5371,6 +6248,7 @@ export const Actions = {
           source: r.source,
           createdAt: r.createdAt.toISOString(),
           undone: r.undone === 1,
+          ...undoMeta(settings, "eaten", r.actor, r.undone === 1),
           ts: r.createdAt.getTime(),
         })),
         ...purchaseRows.map((r) => ({
@@ -5383,13 +6261,107 @@ export const Actions = {
           source: "Shopping List purchase",
           createdAt: r.createdAt.toISOString(),
           undone: r.undone === 1,
+          ...undoMeta(settings, "purchases", r.actor, r.undone === 1),
           ts: r.createdAt.getTime(),
         })),
+        ...adjustmentRows
+          .filter(
+            (r) =>
+              (r.source === "quick-adjust" || r.source === "stocktake") &&
+              !purchaseAdjustmentIds.has(r.id),
+          )
+          .map((r) => ({
+            key: `adjustment-${r.id}`,
+            kind: "adjusted" as const,
+            refId: r.id,
+            item: r.item,
+            quantity: r.delta,
+            usedSome: false,
+            source: r.source === "stocktake" ? "Stocktake" : "Stock stepper",
+            createdAt: r.createdAt.toISOString(),
+            undone: r.undone === 1,
+            ...undoMeta(
+              settings,
+              "stockAdjustments",
+              r.actor,
+              r.undone === 1,
+            ),
+            ts: r.createdAt.getTime(),
+          })),
       ]
         .sort((a, b) => b.ts - a.ts)
         .slice(0, 40)
         .map(({ ts: _ts, ...entry }) => entry);
       return { entries: merged };
+    },
+  }),
+
+  undoStockAdjustment: defineAction({
+    description:
+      "Undoes one HIT List stock adjustment from the Activity log (a +/− stepper tap, source 'quick-adjust', or a stocktake correction, source 'stocktake'): marks the adjustment undone so the item's stock returns to exactly what it was before it. A still-pending adjustment is simply retired (it stops counting toward effective stock and is never written to the sheet); one the auto-scan already applied to the sheet gets a compensating pending adjustment for the opposite delta (source 'adjustment-undo') so the next auto-scan corrects the sheet. An adjustment that settled a Shopping List purchase is refused — its Undo is the purchase entry's own. An already-undone adjustment records nothing and reports an error.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.stockAdjustments)
+        .where(eq(schema.stockAdjustments.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return { ok: false, error: "That adjustment no longer exists." };
+      }
+      if (row.source !== "quick-adjust" && row.source !== "stocktake") {
+        return { ok: false, error: "That entry can't be undone here." };
+      }
+      if (row.undone === 1) {
+        return { ok: false, error: "That adjustment is already undone." };
+      }
+      const adjGate = undoGate(
+        await loadAccountSettings(ctx),
+        "stockAdjustments",
+        row.actor,
+      );
+      if (adjGate) return { ok: false, error: adjGate };
+      // A restock that settled a Shopping List purchase is undone
+      // from the purchase entry, which also clears the Purchased
+      // stamps — undoing the adjustment alone would strand them.
+      const purchaseRows = await db
+        .select()
+        .from(schema.purchaseLog)
+        .where(eq(schema.purchaseLog.adjustmentId, args.id));
+      if (purchaseRows.some((r) => r.undone === 0)) {
+        return {
+          ok: false,
+          error:
+            "That change settled a purchase — undo it from the purchase entry instead.",
+        };
+      }
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.stockAdjustments)
+          .set({ undone: 1, undoneAt: new Date() })
+          .where(eq(schema.stockAdjustments.id, args.id)),
+      ];
+      if (row.appliedAt != null) {
+        statements.push(
+          db.insert(schema.stockAdjustments).values({
+            item: row.item,
+            delta: -row.delta,
+            source: "adjustment-undo",
+          }),
+        );
+      }
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
     },
   }),
 
@@ -5417,6 +6389,12 @@ export const Actions = {
       if (row.undone === 1) {
         return { ok: false, error: "That purchase is already undone." };
       }
+      const purchaseGate = undoGate(
+        await loadAccountSettings(ctx),
+        "purchases",
+        row.actor,
+      );
+      if (purchaseGate) return { ok: false, error: purchaseGate };
       const statements: BatchItem<"sqlite">[] = [
         db
           .update(schema.purchaseLog)
@@ -5431,7 +6409,11 @@ export const Actions = {
           .from(schema.stockAdjustments)
           .where(eq(schema.stockAdjustments.id, row.adjustmentId));
         const adj = adjRows[0];
-        if (adj && adj.appliedAt == null) {
+        if (adj && adj.undone === 1) {
+          // The adjustment's own Undo already reversed its stock
+          // effect — never reverse the same change twice.
+          reversed = true;
+        } else if (adj && adj.appliedAt == null) {
           // Still pending: deleting the row reverses it exactly.
           statements.push(
             db
@@ -6776,7 +7758,7 @@ export const Actions = {
 
   generateRecipe: defineAction({
     description:
-      "Generates one recipe from the live inventory: built around the chosen protein (a HIT List item name) and the chosen meal type, with supporting ingredients drawn only from items currently in stock, quantities written for 2 people, and short numbered steps. variant rotates the template and ingredient picks so asking again gives a different combination. When the protein is out of stock the recipe still generates but proteinInStock is false so the app can flag it clearly. For proteins in the curated web recipe table (WEB_RECIPES — RecipeTin Eats / BBC Good Food / Allrecipes), the response also carries the chosen web recipe as `source` and the state of its page load: the parsed page (webRecipe) when already read, 'pending' with a webLoadId to poll via getWebRecipeLoad while a background task reads the page, or 'failed' when the page couldn't be read — the inventory-built body above is the fallback in the pending/failed cases and is replaced by the web recipe in the app once the load lands.",
+      "Generates one recipe from the live inventory: built around the chosen protein (a HIT List item name) and the chosen meal type, with supporting ingredients drawn only from items currently in stock — close-to-expiry items (expiry within 3 days or already past, the app's one use-first window) are weighed first for every ingredient slot — quantities written for 2 people, and short numbered steps. variant rotates the template and ingredient picks so asking again gives a different combination. When the protein is out of stock the recipe still generates but proteinInStock is false so the app can flag it clearly. For proteins in the curated web recipe table (WEB_RECIPES — RecipeTin Eats / BBC Good Food / Allrecipes), the response also carries the chosen web recipe as `source` and the state of its page load: the parsed page (webRecipe) when already read, 'pending' with a webLoadId to poll via getWebRecipeLoad while a background task reads the page, or 'failed' when the page couldn't be read — the inventory-built body above is the fallback in the pending/failed cases and is replaced by the web recipe in the app once the load lands.",
     request: z.object({
       protein: z.string().min(1).max(120),
       mealType: mealTypeEnum,
@@ -6788,6 +7770,10 @@ export const Actions = {
       const db = ctx.db<typeof schema>();
       const hitRows = await db.select().from(schema.hitItems);
       const addedRows = await db.select().from(schema.hitAddedItems);
+      const expiryRows = await db.select().from(schema.itemExpiries);
+      const expiryByKey = new Map(
+        expiryRows.map((r) => [r.item.trim().toLowerCase(), r.expiryDate]),
+      );
       const { effective } = await loadStockMaps(ctx);
       const inventory: InvItem[] = [];
       const seenInv = new Set<string>();
@@ -6798,6 +7784,7 @@ export const Actions = {
         inventory.push({
           name: r.item,
           stock: effective.get(key) ?? r.stock,
+          expiry: expiryByKey.get(key) ?? null,
         });
       }
       for (const r of addedRows) {
@@ -6807,6 +7794,7 @@ export const Actions = {
         inventory.push({
           name: r.item,
           stock: effective.get(key) ?? r.stock,
+          expiry: expiryByKey.get(key) ?? null,
         });
       }
       const proteinKey = args.protein.trim().toLowerCase();
@@ -7553,11 +8541,18 @@ export const Actions = {
           ),
           note: z.string().nullable(),
           confirmedUnits: z.number().nullable(),
+          // True once a confirmed scan's stock additions have
+          // been undone from the scan's own record (audit #5).
+          undone: z.boolean(),
+          // Attribution + policy (audit #5, Primary vs
+          // Connected) for the scan's confirmation.
+          ...undoMetaShape.shape,
         }),
       ),
     }),
     handler: async (ctx) => {
       const db = ctx.db<typeof schema>();
+      const settings = await loadAccountSettings(ctx);
       const rows = await db
         .select()
         .from(schema.receiptScans)
@@ -7604,6 +8599,13 @@ export const Actions = {
               r.status === "confirmed"
                 ? matched.reduce((sum, l) => sum + l.quantity, 0)
                 : null,
+            undone: r.undoneAt != null,
+            ...undoMeta(
+              settings,
+              "receiptScans",
+              r.actor,
+              r.undoneAt != null,
+            ),
           };
         }),
       };
@@ -7828,11 +8830,16 @@ export const Actions = {
           quantity: l.quantity,
         };
       });
+      const { role } = await loadAccountSettings(ctx);
       const statements: BatchItem<"sqlite">[] = resolved.map((l) =>
         db.insert(schema.stockAdjustments).values({
           item: l.item,
           delta: l.quantity,
           source: "receipt",
+          // Link each adjustment to this scan so the scan's own
+          // Undo (undoReceiptScan) reverses exactly these rows.
+          receiptScanId: args.id,
+          actor: role,
         }),
       );
       statements.push(
@@ -7842,6 +8849,9 @@ export const Actions = {
             status: "confirmed",
             linesJson: JSON.stringify(confirmedLines),
             updatedAt: new Date(),
+            // Attribution (audit #5): the confirming role is the
+            // scan's actor — its Undo follows it.
+            actor: role,
           })
           .where(eq(schema.receiptScans.id, args.id)),
       );
@@ -7852,9 +8862,135 @@ export const Actions = {
     },
   }),
 
+  undoReceiptScan: defineAction({
+    description:
+      "Undoes a confirmed receipt scan from the scan's own record (Beta 0.01 batch, audit #5): reverses exactly the stock additions its confirmation recorded and stamps the scan undone (its status stays 'confirmed' — the scan was confirmed; its effect is what is reversed). Adjustments linked to the scan are marked undone — a still-pending one simply stops counting, one already applied to the sheet gets a compensating pending adjustment (source 'receipt-undo'). Scans confirmed before adjustments carried the link fall back to their confirmed lines: a matching still-pending receipt adjustment is retired per line, otherwise a compensating adjustment is recorded. Only a confirmed, not-yet-undone scan can be undone.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return { ok: false, error: "That receipt scan no longer exists." };
+      }
+      if (row.status !== "confirmed") {
+        return { ok: false, error: "That scan wasn't confirmed." };
+      }
+      if (row.undoneAt != null) {
+        return { ok: false, error: "That scan is already undone." };
+      }
+      const scanGate = undoGate(
+        await loadAccountSettings(ctx),
+        "receiptScans",
+        row.actor,
+      );
+      if (scanGate) return { ok: false, error: scanGate };
+      const statements: BatchItem<"sqlite">[] = [];
+      const linked = await db
+        .select()
+        .from(schema.stockAdjustments)
+        .where(eq(schema.stockAdjustments.receiptScanId, args.id));
+      const activeLinked = linked.filter((a) => a.undone === 0);
+      if (activeLinked.length > 0) {
+        for (const adj of activeLinked) {
+          statements.push(
+            db
+              .update(schema.stockAdjustments)
+              .set({ undone: 1, undoneAt: new Date() })
+              .where(eq(schema.stockAdjustments.id, adj.id)),
+          );
+          if (adj.appliedAt != null) {
+            statements.push(
+              db.insert(schema.stockAdjustments).values({
+                item: adj.item,
+                delta: -adj.delta,
+                source: "receipt-undo",
+              }),
+            );
+          }
+        }
+      } else {
+        // Legacy scan (confirmed before adjustments carried the
+        // scan link): reverse from the confirmed lines stored on
+        // the scan. Per line, retire a matching still-pending
+        // unlinked receipt adjustment when one is there;
+        // otherwise record the compensating adjustment (which is
+        // also the right correction when the original was already
+        // applied to the sheet).
+        let lines: { item: string | null; quantity: number }[] = [];
+        if (row.linesJson) {
+          try {
+            const parsed: unknown = JSON.parse(row.linesJson);
+            if (Array.isArray(parsed)) {
+              lines = parsed as typeof lines;
+            }
+          } catch {
+            lines = [];
+          }
+        }
+        const pool = (
+          await db
+            .select()
+            .from(schema.stockAdjustments)
+            .where(eq(schema.stockAdjustments.source, "receipt"))
+        ).filter(
+          (a) =>
+            a.receiptScanId == null && a.undone === 0 && a.appliedAt == null,
+        );
+        for (const line of lines) {
+          if (line.item == null || line.quantity <= 0) continue;
+          const key = line.item.trim().toLowerCase();
+          const idx = pool.findIndex(
+            (a) =>
+              a.item.trim().toLowerCase() === key &&
+              a.delta === line.quantity,
+          );
+          const match = idx >= 0 ? pool[idx] : undefined;
+          if (match) {
+            pool.splice(idx, 1);
+            statements.push(
+              db
+                .update(schema.stockAdjustments)
+                .set({ undone: 1, undoneAt: new Date() })
+                .where(eq(schema.stockAdjustments.id, match.id)),
+            );
+          } else {
+            statements.push(
+              db.insert(schema.stockAdjustments).values({
+                item: line.item,
+                delta: -line.quantity,
+                source: "receipt-undo",
+              }),
+            );
+          }
+        }
+      }
+      statements.push(
+        db
+          .update(schema.receiptScans)
+          .set({ undoneAt: new Date(), updatedAt: new Date() })
+          .where(eq(schema.receiptScans.id, args.id)),
+      );
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
   dismissReceiptScan: defineAction({
     description:
-      "Dismisses a receipt scan that is still pending or proposed: marks it 'dismissed' and records nothing into the inventory. A confirmed scan can't be dismissed (its stock was already recorded — undo paths live in the HIT List Activity log).",
+      "Dismisses a receipt scan that is still pending or proposed: marks it 'dismissed' and records nothing into the inventory. A confirmed scan can't be dismissed (its stock was already recorded — undoReceiptScan on the scan's own record reverses it).",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({
       ok: z.boolean(),
@@ -7921,7 +9057,7 @@ export const Actions = {
 
   getAlerts: defineAction({
     description:
-      "Returns the in-app alerts feed for the strip at the top of the Shopping List tab: non-dismissed alerts newest first (up to 30) with kind, title, body, optional item, time, and read state, plus the unread count the strip shows. Reading this does NOT mark alerts read — the app calls markAlertsRead when the user opens the list.",
+      "Returns the in-app alerts feed for the strip at the top of the Shopping List tab: non-dismissed alerts newest first (up to 30) with kind, title, body, optional item, time, and read state, plus the unread count the strip shows, plus the recently dismissed alerts (up to 10, newest first) so a dismissal can be undone with restoreAlert. The banner count stays the non-dismissed list alone — dismissed alerts are listed separately and never counted. Reading this does NOT mark alerts read — the app calls markAlertsRead when the user opens the list.",
     request: z.object({}),
     response: z.object({
       unreadCount: z.number(),
@@ -7936,25 +9072,48 @@ export const Actions = {
           createdAt: z.string(),
         }),
       ),
+      dismissed: z.array(
+        z.object({
+          id: z.number(),
+          kind: z.enum(["sale", "scan", "info"]),
+          title: z.string(),
+          body: z.string(),
+          item: z.string().nullable(),
+          read: z.boolean(),
+          createdAt: z.string(),
+          // Attribution + policy (audit #5, Primary vs
+          // Connected) for the dismissal: who dismissed it,
+          // whether alert dismissals are set Permanent, and
+          // whether the current role may restore it.
+          ...undoMetaShape.shape,
+        }),
+      ),
     }),
     handler: async (ctx) => {
       const db = ctx.db<typeof schema>();
+      const settings = await loadAccountSettings(ctx);
       const rows = await db
         .select()
         .from(schema.alerts)
         .orderBy(desc(schema.alerts.id))
         .limit(200);
       const visible = rows.filter((r) => r.dismissedAt == null);
+      const dismissed = rows.filter((r) => r.dismissedAt != null);
+      const toShape = (r: (typeof rows)[number]) => ({
+        id: r.id,
+        kind: r.kind,
+        title: r.title,
+        body: r.body,
+        item: r.item,
+        read: r.readAt != null,
+        createdAt: r.createdAt.toISOString(),
+      });
       return {
         unreadCount: visible.filter((r) => r.readAt == null).length,
-        alerts: visible.slice(0, 30).map((r) => ({
-          id: r.id,
-          kind: r.kind,
-          title: r.title,
-          body: r.body,
-          item: r.item,
-          read: r.readAt != null,
-          createdAt: r.createdAt.toISOString(),
+        alerts: visible.slice(0, 30).map(toShape),
+        dismissed: dismissed.slice(0, 10).map((r) => ({
+          ...toShape(r),
+          ...undoMeta(settings, "alertDismissals", r.dismissedBy, false),
         })),
       };
     },
@@ -7981,18 +9140,56 @@ export const Actions = {
 
   dismissAlert: defineAction({
     description:
-      "Dismisses one alert from the in-app feed: it leaves the list and no longer counts as unread. Display only — dismissing never touches inventory.",
+      "Dismisses one alert from the in-app feed: it leaves the list and no longer counts as unread. Display only — dismissing never touches inventory. The dismissal is reversible: restoreAlert brings the alert back.",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean() }),
     handler: async (ctx, args): Promise<{ ok: boolean }> => {
       const db = ctx.db<typeof schema>();
+      // Attribution (audit #5): the dismissal records the acting
+      // role — its Restore follows the alert-dismissals policy
+      // and the ownership rule against it.
+      const { role } = await loadAccountSettings(ctx);
       const res = await db
         .update(schema.alerts)
-        .set({ dismissedAt: new Date() })
+        .set({ dismissedAt: new Date(), dismissedBy: role })
         .where(eq(schema.alerts.id, args.id))
         .returning({ id: schema.alerts.id });
       ctx.invalidateQueries();
       return { ok: res.length > 0 };
+    },
+  }),
+
+  restoreAlert: defineAction({
+    description:
+      "Restores one dismissed alert to the in-app feed (Beta 0.01 batch, audit #5 — the dismissal's Undo): clears its dismissed stamp so it shows in the alerts list again with its read state as it was. Display only — restoring never touches inventory. Policy (audit #5, Primary vs Connected): refused when alert dismissals are set Permanent, and a Connected account can restore only its own dismissals — the Primary user can restore anyone's.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.alerts)
+        .where(eq(schema.alerts.id, args.id));
+      const row = rows[0];
+      if (!row) return { ok: false, error: "That alert no longer exists." };
+      if (row.dismissedAt != null) {
+        const settings = await loadAccountSettings(ctx);
+        const refusal = undoGate(settings, "alertDismissals", row.dismissedBy);
+        if (refusal) return { ok: false, error: refusal };
+      }
+      const res = await db
+        .update(schema.alerts)
+        .set({ dismissedAt: null, dismissedBy: null })
+        .where(eq(schema.alerts.id, args.id))
+        .returning({ id: schema.alerts.id });
+      ctx.invalidateQueries();
+      return { ok: res.length > 0, error: null };
     },
   }),
 
@@ -8093,7 +9290,7 @@ export const Actions = {
 
   getBitState: defineAction({
     description:
-      "Reads the whole BIT (Business Inventory Tracker) side in one call: the business profile from the setup wizard (null until setup is completed) with its categories (the only organizing concept — for a business set up under the earlier category-or-zone choice, its existing groups are presented as its categories and each item's category is its group) and its saved POS connection (null until one is connected from the Inventory tab), every inventory item with its on-hand (book) count, par, unit, pack size, supplier, SKU, category and tags, the recent finished rounds with their variance / below-par / freezer summaries, and the manifest photo scans awaiting or holding a reader proposal. The business also carries its business-type needs profile (Alpha 0.75 — expiry tracking / waste log / fractional counting, keyed off the stored type), each item its optional expiry date, and, for waste-log (Restaurant) businesses, the waste history. For a requisition business (usesRequisition — TFS station 226) it also returns the current outstanding requisition with its check-off lines, the closed requisition history, the not-received lines carried onto the next build as resubmissions, and the catalogue draft extras on the requisition being built. (The Quartermaster catalogue entries themselves are tracked inventory items since Alpha 0.72 and come back in the items list under their own category.)",
+      "Reads the whole BIT (Business Inventory Tracker) side in one call: the business profile from the setup wizard (null until setup is completed) with its categories (the only organizing concept — for a business set up under the earlier category-or-zone choice, its existing groups are presented as its categories and each item's category is its group) and its saved POS connection (null until one is connected from the Inventory tab), every inventory item with its on-hand (book) count, par, unit, pack size, supplier, SKU, category and tags, the recent finished rounds with their variance / below-par / freezer summaries, and the manifest photo scans awaiting or holding a reader proposal. The business also carries its business-type needs profile (Alpha 0.75 — expiry tracking / waste log / fractional counting, keyed off the stored type), each item its optional expiry date, and, for waste-log (Restaurant) businesses, the waste history. For a requisition business (usesRequisition — TFS station 226) it also returns the current outstanding requisition with its check-off lines, the closed requisition history, the not-received lines carried onto the next build as resubmissions, and the catalogue draft extras on the requisition being built. The business also carries the requisition approver (District Chief) name and the recorded-at stamps for the Duty Officer and approver names (audit #15), each requisition its snapshotted prepared-by / approved-by names and dates, and each item its own last-counted stamp from the finished-check snapshots (audit #16; null when never counted). (The Quartermaster catalogue entries themselves are tracked inventory items since Alpha 0.72 and come back in the items list under their own category.)",
     request: z.object({ businessId: bitBusinessIdRequest }),
     response: z.object({
       businesses: z.array(
@@ -8120,6 +9317,15 @@ export const Actions = {
           usesRequisition: z.boolean(),
           division: z.string().nullable(),
           dutyOfficerName: z.string().nullable(),
+          // Approver separation (audit #15): the District Chief
+          // recorded as this requisition's approver, and when each
+          // header name was recorded (ISO; null until set).
+          approverName: z.string().nullable(),
+          approverRecordedAt: z.string().nullable(),
+          dutyOfficerRecordedAt: z.string().nullable(),
+          // Team size saved by the setup wizard's team-size step
+          // (Alpha 0.90); null for businesses set up before it.
+          teamSize: z.string().nullable(),
           // Business-type needs profile (Alpha 0.75), keyed off
           // the stored business type: which type-specific
           // features are switched on for this business. All false
@@ -8201,6 +9407,13 @@ export const Actions = {
       // for businesses whose needs profile includes the waste log
       // (Restaurant); empty for every other business.
       wasteLog: z.array(bitWasteLogShape),
+      // Undo coverage (audit #5): recent Inventory-tab count
+      // changes (manual_count stock events, newest first) with
+      // their undone state, and recent manifest imports with the
+      // names each added / updated — the records those surfaces'
+      // Undos revert.
+      stockEvents: z.array(bitStockEventShape),
+      manifestImports: z.array(bitManifestImportShape),
       requisition: bitRequisitionShape.nullable(),
       requisitionHistory: z.array(bitRequisitionShape),
       resubmittedLines: z.array(bitRequisitionLineShape),
@@ -8208,6 +9421,10 @@ export const Actions = {
     }),
     handler: async (ctx, args) => {
       const db = ctx.db<typeof schema>();
+      // Attribution + policy (audit #5): every undoable record
+      // in this read carries its actor / permanent / canUndo
+      // trio, computed against the one settings row.
+      const settings = await loadAccountSettings(ctx);
       const allBizRows = await db
         .select()
         .from(schema.bitBusiness)
@@ -8324,6 +9541,49 @@ export const Actions = {
               .orderBy(desc(schema.bitWasteLog.id))
               .limit(50)
           : [];
+      // Undo coverage (audit #5): the Inventory tab's recent
+      // manual count changes and the business's recent manifest
+      // imports — the records those surfaces' Undos act on.
+      const [stockEventRows, manifestImportRows] = biz
+        ? await Promise.all([
+            db
+              .select()
+              .from(schema.bitStockEvents)
+              .where(
+                and(
+                  eq(schema.bitStockEvents.businessId, biz.id),
+                  eq(schema.bitStockEvents.source, "manual_count"),
+                ),
+              )
+              .orderBy(desc(schema.bitStockEvents.id))
+              .limit(20),
+            db
+              .select()
+              .from(schema.bitManifestImports)
+              .where(eq(schema.bitManifestImports.businessId, biz.id))
+              .orderBy(desc(schema.bitManifestImports.id))
+              .limit(10),
+          ])
+        : [[], []];
+      // Per-item last-counted stamps (audit #16): the newest
+      // finished-check snapshot per item, from bit_item_snapshots
+      // — an item never counted in a finished check has none.
+      const itemSnapRows = biz
+        ? await db
+            .select({
+              itemId: schema.bitItemSnapshots.itemId,
+              createdAt: schema.bitItemSnapshots.createdAt,
+            })
+            .from(schema.bitItemSnapshots)
+            .where(eq(schema.bitItemSnapshots.businessId, biz.id))
+        : [];
+      const lastCountedByItem = new Map<number, number>();
+      for (const s of itemSnapRows) {
+        if (s.itemId == null) continue;
+        const t = s.createdAt.getTime();
+        if (t > (lastCountedByItem.get(s.itemId) ?? 0))
+          lastCountedByItem.set(s.itemId, t);
+      }
       // Ensure a webhook/API-key custom POS has an intake token.
       let intakeToken = biz?.posIntakeToken ?? null;
       if (
@@ -8367,6 +9627,12 @@ export const Actions = {
               usesRequisition: biz.usesRequisition === 1,
               division: biz.division,
               dutyOfficerName: biz.dutyOfficerName,
+              approverName: biz.approverName,
+              approverRecordedAt:
+                biz.approverRecordedAt?.toISOString() ?? null,
+              dutyOfficerRecordedAt:
+                biz.dutyOfficerRecordedAt?.toISOString() ?? null,
+              teamSize: biz.teamSize,
               needs: needsProfile,
               hasAnalytics: analyticsRows.length > 0,
               pos:
@@ -8420,7 +9686,16 @@ export const Actions = {
           // up organized by its former zones, that is the item's
           // stored zone value; the legacy zone field mirrors it.
           const group = bitRowGroup(r, biz);
-          return { ...item, category: group, zone: group };
+          const lastCountedMs = lastCountedByItem.get(r.id);
+          return {
+            ...item,
+            category: group,
+            zone: group,
+            lastCountedAt:
+              lastCountedMs != null
+                ? new Date(lastCountedMs).toISOString()
+                : null,
+          };
         }),
         rounds: roundRows.map((r) => ({
           id: r.id,
@@ -8455,13 +9730,48 @@ export const Actions = {
           quantity: w.quantity,
           reason: w.reason,
           createdAt: w.createdAt.toISOString(),
+          undone: w.undone === 1,
+          ...undoMeta(settings, "wasteLog", w.actor, w.undone === 1),
         })),
+        stockEvents: stockEventRows.map((e) => ({
+          id: e.id,
+          itemId: e.itemId,
+          itemName: e.itemName,
+          delta: e.delta,
+          createdAt: e.createdAt.toISOString(),
+          undone: e.undone === 1,
+          ...undoMeta(
+            settings,
+            "bitCountChanges",
+            e.actor,
+            e.undone === 1,
+          ),
+        })),
+        manifestImports: manifestImportRows.map((r) => {
+          const changes = bitParseManifestImportChanges(r.changesJson);
+          return {
+            id: r.id,
+            scanId: r.scanId,
+            addedNames: changes.filter((c) => c.added).map((c) => c.name),
+            updatedNames: changes
+              .filter((c) => !c.added)
+              .map((c) => c.name),
+            createdAt: r.createdAt.toISOString(),
+            undone: r.undone === 1,
+            ...undoMeta(
+              settings,
+              "manifestImports",
+              r.actor,
+              r.undone === 1,
+            ),
+          };
+        }),
         requisition: outstandingReq
-          ? bitRequisitionToShape(outstandingReq, reqLineRows)
+          ? bitRequisitionToShape(outstandingReq, reqLineRows, settings)
           : null,
         requisitionHistory: reqRows
           .filter((r) => r.status === "closed")
-          .map((r) => bitRequisitionToShape(r, reqLineRows)),
+          .map((r) => bitRequisitionToShape(r, reqLineRows, settings)),
         resubmittedLines: resubmittedRows.map((l) => ({
           id: l.id,
           itemId: l.itemId,
@@ -8472,6 +9782,12 @@ export const Actions = {
           category: l.category,
           status: l.status,
           qtyReceived: l.qtyReceived,
+          ...undoMeta(
+            settings,
+            "requisitionCheckOffs",
+            l.checkedOffBy,
+            false,
+          ),
         })),
         draftExtras: draftExtraRows.map((d) => ({
           id: d.id,
@@ -9298,37 +10614,272 @@ export const Actions = {
     },
   }),
 
+  replaceBitTfsInventory: defineAction({
+    description:
+      "Bulk-replaces the TFS station 226 business's tracked inventory with catalogue lines supplied in the call (the station-supply categories of the TFS Quartermaster catalogue spreadsheet the user supplied). Targets the requisition business whose name starts with 'TFS station 226'; when no such business exists the call is refused and nothing changes. With clearFirst true it first deletes ALL of the business's current inventory items (plus its requisition draft extras, POS mappings to those items, and the item links on its requisition history lines — the history keeps its name snapshots) and sets the business's category list to the provided categories array, in the given order; the business's other profile fields (name, type, usesRequisition, Division / Duty Officer header fields, freezers, POS state) never change. Every line is then inserted as an inventory item: name verbatim, its category, SKU = the catalogue Material ID (stored as text), its unit, on-hand count 0, par 0, no supplier — the catalogue's warehouse stock figures are never loaded as station counts. Item names are unique case-insensitively per business: if the payload (combined with any items already present when clearFirst is false) would create a duplicate name, the whole call is rejected and nothing from it is inserted. Designed to be invoked repeatedly: the first call passes clearFirst true with the full ordered category list and the first batch of lines; later calls pass clearFirst false to append the remaining batches. No other business is touched.",
+    request: z.object({
+      clearFirst: z.boolean(),
+      categories: z.array(z.string().min(1).max(120)).max(200).optional(),
+      lines: z
+        .array(
+          z.object({
+            name: z.string().min(1).max(500),
+            category: z.string().min(1).max(120),
+            sku: z.string().max(120),
+            unit: z.string().min(1).max(60),
+          }),
+        )
+        .max(2000),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      removed: z.number(),
+      added: z.number(),
+      totalItems: z.number(),
+      categories: z.number(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      error: string | null;
+      removed: number;
+      added: number;
+      totalItems: number;
+      categories: number;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const all = await db
+        .select()
+        .from(schema.bitBusiness)
+        .orderBy(asc(schema.bitBusiness.id));
+      const tfs = all.find((b) =>
+        b.name.trim().toLowerCase().startsWith("tfs station 226"),
+      );
+      if (!tfs || tfs.usesRequisition !== 1) {
+        return {
+          ok: false,
+          error:
+            "No TFS station 226 requisition business was found — nothing was changed.",
+          removed: 0,
+          added: 0,
+          totalItems: 0,
+          categories: 0,
+        };
+      }
+      const existing = await db
+        .select()
+        .from(schema.bitItems)
+        .where(eq(schema.bitItems.businessId, tfs.id));
+      // Duplicate-name guard, checked before anything is written:
+      // names must stay unique case-insensitively per business.
+      // With clearFirst the current items are all going away, so
+      // only duplicates inside the payload itself can clash;
+      // otherwise the payload must also clear the names already
+      // present.
+      const seen = new Set<string>(
+        args.clearFirst
+          ? []
+          : existing.map((r) => r.name.trim().toLowerCase()),
+      );
+      for (const line of args.lines) {
+        const key = line.name.trim().toLowerCase();
+        if (seen.has(key)) {
+          return {
+            ok: false,
+            error: `Duplicate item name in this load: "${line.name}". Nothing from this call was inserted.`,
+            removed: 0,
+            added: 0,
+            totalItems: existing.length,
+            categories: bitBusinessCategories(tfs).length,
+          };
+        }
+        seen.add(key);
+      }
+      const statements: BatchItem<"sqlite">[] = [];
+      let removed = 0;
+      if (args.clearFirst) {
+        removed = existing.length;
+        const removedIds = new Set(existing.map((r) => r.id));
+        for (const r of existing) {
+          statements.push(
+            db.delete(schema.bitItems).where(eq(schema.bitItems.id, r.id)),
+          );
+        }
+        // Draft extras reference items being replaced; they go too.
+        statements.push(
+          db
+            .delete(schema.bitRequisitionDraftExtras)
+            .where(
+              eq(schema.bitRequisitionDraftExtras.businessId, tfs.id),
+            ),
+        );
+        if (removedIds.size > 0) {
+          // POS mappings pointing at a removed item go with it (the
+          // POS transaction log itself is history and stays).
+          const mappings = await db
+            .select()
+            .from(schema.bitPosMappings)
+            .where(eq(schema.bitPosMappings.businessId, tfs.id));
+          for (const m of mappings) {
+            if (removedIds.has(m.itemId)) {
+              statements.push(
+                db
+                  .delete(schema.bitPosMappings)
+                  .where(eq(schema.bitPosMappings.id, m.id)),
+              );
+            }
+          }
+          // Requisition history keeps its line names; only the link
+          // back to a now-removed inventory item is cleared.
+          const lines = await db
+            .select()
+            .from(schema.bitRequisitionLines)
+            .where(eq(schema.bitRequisitionLines.businessId, tfs.id));
+          for (const l of lines) {
+            if (l.itemId != null && removedIds.has(l.itemId)) {
+              statements.push(
+                db
+                  .update(schema.bitRequisitionLines)
+                  .set({ itemId: null })
+                  .where(eq(schema.bitRequisitionLines.id, l.id)),
+              );
+            }
+          }
+        }
+        // The business's category list becomes exactly the provided
+        // list, in the given order (both stored lists are kept in
+        // step). Every other profile field is left untouched.
+        if (args.categories) {
+          statements.push(
+            db
+              .update(schema.bitBusiness)
+              .set({
+                categoriesJson: JSON.stringify(args.categories),
+                zonesJson: JSON.stringify(args.categories),
+                updatedAt: new Date(),
+              })
+              .where(eq(schema.bitBusiness.id, tfs.id)),
+          );
+        }
+      }
+      const baseOrder = args.clearFirst
+        ? -1
+        : existing.reduce((m, r) => Math.max(m, r.sortOrder), -1);
+      args.lines.forEach((line, i) => {
+        statements.push(
+          db.insert(schema.bitItems).values({
+            businessId: tfs.id,
+            name: line.name,
+            category: line.category,
+            zone: line.category,
+            onHand: 0,
+            unit: line.unit,
+            par: 0,
+            packSize: 1,
+            supplier: null,
+            sku: line.sku.trim() ? line.sku : null,
+            tagsJson: "[]",
+            sortOrder: baseOrder + 1 + i,
+          }),
+        );
+      });
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      const finalItems = await db
+        .select()
+        .from(schema.bitItems)
+        .where(eq(schema.bitItems.businessId, tfs.id));
+      const finalBiz = await db
+        .select()
+        .from(schema.bitBusiness)
+        .where(eq(schema.bitBusiness.id, tfs.id));
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        error: null,
+        removed,
+        added: args.lines.length,
+        totalItems: finalItems.length,
+        categories: finalBiz[0]
+          ? bitBusinessCategories(finalBiz[0]).length
+          : 0,
+      };
+    },
+  }),
+
   updateBitRequisitionProfile: defineAction({
     description:
-      "Stores the requisition form's editable header fields on a requisition business (TFS): the Division and the Duty Officer's name. Both start blank and stay exactly what the user sets; blank clears the field.",
+      "Stores the requisition form's editable header fields on a requisition business (TFS): the Division, the Duty Officer's name (the preparer), and the Approver's name (the District Chief, audit #15). All start blank and stay exactly what the user sets; blank clears the field. When a name changes, its recorded-at stamp moves to now (and clears with the name). The approver must differ from the Duty Officer: recording the same name as both is rejected and nothing is saved.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       division: z.string().max(120).nullable(),
       dutyOfficerName: z.string().max(120).nullable(),
+      approverName: z.string().max(120).nullable(),
     }),
-    response: z.object({ ok: z.literal(true) }),
-    handler: async (ctx, args): Promise<{ ok: true }> => {
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
       const db = ctx.db<typeof schema>();
       const biz = await resolveBitBusiness(ctx, args.businessId);
       if (!biz) throw new Error("updateBitRequisitionProfile: no business");
+      const division = args.division?.trim() ? args.division.trim() : null;
+      const dutyOfficerName = args.dutyOfficerName?.trim()
+        ? args.dutyOfficerName.trim()
+        : null;
+      const approverName = args.approverName?.trim()
+        ? args.approverName.trim()
+        : null;
+      // Approver separation: the District Chief who approves can
+      // never be the Duty Officer who prepared it.
+      if (
+        approverName &&
+        dutyOfficerName &&
+        approverName.toLowerCase() === dutyOfficerName.toLowerCase()
+      ) {
+        return {
+          ok: false,
+          error:
+            "The approver must be different from the D.O. who prepared the requisition — the same name can't be recorded as both.",
+        };
+      }
+      const now = new Date();
       await db
         .update(schema.bitBusiness)
         .set({
-          division: args.division?.trim() ? args.division.trim() : null,
-          dutyOfficerName: args.dutyOfficerName?.trim()
-            ? args.dutyOfficerName.trim()
-            : null,
-          updatedAt: new Date(),
+          division,
+          dutyOfficerName,
+          approverName,
+          dutyOfficerRecordedAt:
+            dutyOfficerName === biz.dutyOfficerName
+              ? biz.dutyOfficerRecordedAt
+              : dutyOfficerName
+                ? now
+                : null,
+          approverRecordedAt:
+            approverName === biz.approverName
+              ? biz.approverRecordedAt
+              : approverName
+                ? now
+                : null,
+          updatedAt: now,
         })
         .where(eq(schema.bitBusiness.id, biz.id));
       ctx.invalidateQueries();
-      return { ok: true as const };
+      return { ok: true, error: null };
     },
   }),
 
   sendBitRequisition: defineAction({
     description:
-      "Marks a requisition as sent to the Quartermaster Section: records it (auto-generated Req. No. in the form's Fire Station-YY-MM-DD format, today's date, the exact lines sent) as the business's current outstanding requisition, awaiting the delivery check-off. Any not-received lines from earlier closed requisitions that this requisition resubmits are marked superseded, and catalogue draft extras folded into the lines are cleared. Refused while another requisition is still outstanding.",
+      "Marks a requisition as sent to the Quartermaster Section: records it (auto-generated Req. No. in the form's Fire Station-YY-MM-DD format, today's date, the exact lines sent) as the business's current outstanding requisition, awaiting the delivery check-off. Any not-received lines from earlier closed requisitions that this requisition resubmits are marked superseded, and catalogue draft extras folded into the lines are cleared. Refused while another requisition is still outstanding. Approver separation (audit #15): refused until an approver (District Chief) is recorded on the business, and refused if the approver is the same name as the Duty Officer who prepared it; the preparer / approver names and their recorded dates are snapshotted onto the requisition at send time.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       lines: z
@@ -9372,6 +10923,29 @@ export const Actions = {
           error: "This business does not use requisitions.",
         };
       }
+      // Approver separation (audit #15): no approver recorded —
+      // no send. This cannot be waived (the client's pre-send
+      // popup says the same and offers the approver field there).
+      if (!biz.approverName?.trim()) {
+        return {
+          ok: false,
+          reqNo: null,
+          error:
+            "An approver is required before sending — record the District Chief's name as the approver first.",
+        };
+      }
+      if (
+        biz.dutyOfficerName?.trim() &&
+        biz.approverName.trim().toLowerCase() ===
+          biz.dutyOfficerName.trim().toLowerCase()
+      ) {
+        return {
+          ok: false,
+          reqNo: null,
+          error:
+            "The approver must be different from the D.O. who prepared the requisition.",
+        };
+      }
       const existing = await db
         .select()
         .from(schema.bitRequisitions)
@@ -9397,6 +10971,12 @@ export const Actions = {
           businessId: biz.id,
           reqNo,
           status: "outstanding",
+          // Prepared by → Approved by → Sent, snapshotted from
+          // the header fields so the state stays on file.
+          preparedBy: biz.dutyOfficerName,
+          preparedAt: biz.dutyOfficerRecordedAt,
+          approvedBy: biz.approverName,
+          approvedAt: biz.approverRecordedAt,
           sentAt: now,
         })
         .returning({ id: schema.bitRequisitions.id });
@@ -9506,11 +11086,16 @@ export const Actions = {
         args.outcome === "received"
           ? (args.qtyReceived ?? line.qtyOrdered)
           : null;
+      // Attribution (audit #5): the check-off records the acting
+      // role on the line (its Undo follows it) and on the stock
+      // event a receipt logs.
+      const { role } = await loadAccountSettings(ctx);
       await db
         .update(schema.bitRequisitionLines)
         .set({
           status: args.outcome,
           qtyReceived: receivedQty,
+          checkedOffBy: role,
         })
         .where(eq(schema.bitRequisitionLines.id, line.id));
       // Received supplies go onto the station stock.
@@ -9525,6 +11110,20 @@ export const Actions = {
             .update(schema.bitItems)
             .set({ onHand: item.onHand + (receivedQty ?? 0) })
             .where(eq(schema.bitItems.id, item.id));
+          // Trend collection (Alpha 0.79): the receipt is logged
+          // as a dated stock-in event so usage between checks can
+          // be computed (previous count + receipts − current
+          // count).
+          if ((receivedQty ?? 0) !== 0) {
+            await db.insert(schema.bitStockEvents).values({
+              businessId: item.businessId,
+              itemId: item.id,
+              itemName: item.name,
+              delta: receivedQty ?? 0,
+              source: "requisition_received",
+              actor: role,
+            });
+          }
         }
       }
       // Completing the check-off closes the requisition; it stays
@@ -9551,6 +11150,147 @@ export const Actions = {
     },
   }),
 
+  undoBitRequisitionCheckOff: defineAction({
+    description:
+      "Undoes one requisition line's delivery check-off (Beta 0.01 batch, audit #5): the line returns to 'pending' with no received quantity, and a 'received' mark's stock is taken back off the tracked item (its requisition_received stock event is marked undone too, so Trends' usage math stays exact). If the check-off had closed the requisition, the requisition reopens as outstanding. A line already resubmitted onto a newer requisition can't be undone (the newer requisition carries it now), and a closed requisition can't reopen while another requisition is outstanding.",
+    request: z.object({ lineId: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      reopened: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; reopened: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const lineRows = await db
+        .select()
+        .from(schema.bitRequisitionLines)
+        .where(eq(schema.bitRequisitionLines.id, args.lineId));
+      const line = lineRows[0];
+      if (!line) {
+        return { ok: false, reopened: false, error: "That line is gone." };
+      }
+      if (line.status === "pending") {
+        return {
+          ok: false,
+          reopened: false,
+          error: "That line hasn't been checked off.",
+        };
+      }
+      if (line.supersededBy != null) {
+        return {
+          ok: false,
+          reopened: false,
+          error:
+            "That line was already resubmitted on a newer requisition, so its check-off can't be undone.",
+        };
+      }
+      const lineGate = undoGate(
+        await loadAccountSettings(ctx),
+        "requisitionCheckOffs",
+        line.checkedOffBy,
+      );
+      if (lineGate) {
+        return { ok: false, reopened: false, error: lineGate };
+      }
+      const reqRows = await db
+        .select()
+        .from(schema.bitRequisitions)
+        .where(eq(schema.bitRequisitions.id, line.requisitionId));
+      const req = reqRows[0];
+      if (!req) {
+        return {
+          ok: false,
+          reopened: false,
+          error: "That requisition is gone.",
+        };
+      }
+      let reopened = false;
+      if (req.status === "closed") {
+        const others = await db
+          .select()
+          .from(schema.bitRequisitions)
+          .where(
+            and(
+              eq(schema.bitRequisitions.businessId, req.businessId),
+              eq(schema.bitRequisitions.status, "outstanding"),
+            ),
+          );
+        if (others.length > 0) {
+          return {
+            ok: false,
+            reopened: false,
+            error:
+              "Another requisition is outstanding, so this one can't reopen for the undo.",
+          };
+        }
+        reopened = true;
+      }
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.bitRequisitionLines)
+          .set({ status: "pending", qtyReceived: null, checkedOffBy: null })
+          .where(eq(schema.bitRequisitionLines.id, line.id)),
+      ];
+      if (reopened) {
+        statements.push(
+          db
+            .update(schema.bitRequisitions)
+            .set({ status: "outstanding", closedAt: null })
+            .where(eq(schema.bitRequisitions.id, req.id)),
+        );
+      }
+      // Take back the stock a "received" mark applied, and retire
+      // the stock event it logged.
+      if (
+        line.status === "received" &&
+        line.itemId != null &&
+        (line.qtyReceived ?? 0) !== 0
+      ) {
+        const qty = line.qtyReceived ?? 0;
+        const itemRows = await db
+          .select()
+          .from(schema.bitItems)
+          .where(eq(schema.bitItems.id, line.itemId));
+        const item = itemRows[0];
+        if (item) {
+          statements.push(
+            db
+              .update(schema.bitItems)
+              .set({ onHand: Math.max(0, item.onHand - qty) })
+              .where(eq(schema.bitItems.id, item.id)),
+          );
+          const eventRows = await db
+            .select()
+            .from(schema.bitStockEvents)
+            .where(
+              and(
+                eq(schema.bitStockEvents.itemId, item.id),
+                eq(schema.bitStockEvents.source, "requisition_received"),
+                eq(schema.bitStockEvents.undone, 0),
+              ),
+            )
+            .orderBy(desc(schema.bitStockEvents.id));
+          const event = eventRows.find((e) => e.delta === qty);
+          if (event) {
+            statements.push(
+              db
+                .update(schema.bitStockEvents)
+                .set({ undone: 1 })
+                .where(eq(schema.bitStockEvents.id, event.id)),
+            );
+          }
+        }
+      }
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, reopened, error: null };
+    },
+  }),
+
   removeBitRequisitionDraftExtra: defineAction({
     description:
       "Removes one catalogue draft extra from the requisition currently being built.",
@@ -9568,12 +11308,15 @@ export const Actions = {
 
   completeBitSetup: defineAction({
     description:
-      "Finishes (or re-runs) the BIT Business setup wizard: stores the business profile (type, custom type for 'Other', name, the chosen categories — the only organizing concept — freezers, category colours) and seeds the inventory with the supplied starter-pack items already merged with any manifest lines confirmed in the wizard. Only the categories the user actually picked are stored, and only items in those categories are seeded — a completed setup stores exactly the picked set, nothing more. Re-running setup replaces the BIT inventory wholesale; it never touches any household (HIT) data.",
+      "Finishes the BIT Business setup wizard by creating a BRAND-NEW business: stores the new business's profile (type, custom type for 'Other', name, the chosen categories — the only organizing concept — freezers, category colours) and seeds its inventory with the supplied starter-pack items already merged with any manifest lines confirmed in the wizard. Only the categories the user actually picked are stored, and only items in those categories are seeded — a completed setup stores exactly the picked set, nothing more. Setup is add-only (Alpha 0.88): it ALWAYS inserts a new business and returns its id; it never updates, replaces, or deletes an existing business's profile or inventory, and it never touches any household (HIT) data.",
     request: z.object({
-      businessId: bitBusinessIdRequest,
       businessType: z.string().min(1).max(80),
       customType: z.string().max(120).nullable(),
       name: z.string().min(1).max(120),
+      // Team size from the wizard's team-size step (Alpha 0.90):
+      // one of the eight bands or a custom Other entry; null when
+      // the step was skipped.
+      teamSize: z.string().max(60).nullable().default(null),
       categories: z.array(z.string().min(1).max(120)).max(24),
       freezers: z.array(z.string().min(1).max(80)).max(12),
       colors: z.record(z.string(), z.string()),
@@ -9594,11 +11337,15 @@ export const Actions = {
         )
         .max(400),
     }),
-    response: z.object({ ok: z.literal(true), itemCount: z.number() }),
+    response: z.object({
+      ok: z.literal(true),
+      businessId: z.number(),
+      itemCount: z.number(),
+    }),
     handler: async (
       ctx,
       args,
-    ): Promise<{ ok: true; itemCount: number }> => {
+    ): Promise<{ ok: true; businessId: number; itemCount: number }> => {
       const db = ctx.db<typeof schema>();
       // Dedupe by name (case-insensitive); the LAST occurrence wins,
       // so manifest-confirmed lines the wizard merged after the pack
@@ -9620,17 +11367,16 @@ export const Actions = {
       const items = deduped.filter((it) =>
         groupSet.has(it.category.trim()),
       );
-      // With several businesses, setup targets ONE business: the
-      // one named by businessId, else the first business, else a
-      // brand-new one (fresh setup). Only that business's profile
-      // and inventory are replaced — its past checks are kept, and
-      // every other business is untouched. A target business keeps
-      // its id and its POS connection exactly as saved.
-      const target = await resolveBitBusiness(ctx, args.businessId);
+      // Setup is add-only (Alpha 0.88): finishing the wizard
+      // ALWAYS creates a brand-new business alongside any existing
+      // ones. There is deliberately no update/replace path here —
+      // an existing business's profile and inventory can never be
+      // overwritten or wiped by setup.
       const profile = {
         businessType: args.businessType,
         customType: args.customType,
         name: args.name,
+        teamSize: args.teamSize?.trim() ? args.teamSize.trim() : null,
         // Categories are the only organizing concept; the
         // legacy zone list and organizing-axis columns are kept
         // in step with the categories so stored data stays
@@ -9645,25 +11391,13 @@ export const Actions = {
         colorsJson: JSON.stringify(args.colors),
         updatedAt: new Date(),
       };
-      let businessId: number;
-      if (target) {
-        businessId = target.id;
-        await db
-          .update(schema.bitBusiness)
-          .set(profile)
-          .where(eq(schema.bitBusiness.id, target.id));
-        await db
-          .delete(schema.bitItems)
-          .where(eq(schema.bitItems.businessId, target.id));
-      } else {
-        const insertedBiz = await db
-          .insert(schema.bitBusiness)
-          .values(profile)
-          .returning({ id: schema.bitBusiness.id });
-        const row = insertedBiz[0];
-        if (!row) throw new Error("completeBitSetup: no business row");
-        businessId = row.id;
-      }
+      const insertedBiz = await db
+        .insert(schema.bitBusiness)
+        .values(profile)
+        .returning({ id: schema.bitBusiness.id });
+      const row = insertedBiz[0];
+      if (!row) throw new Error("completeBitSetup: no business row");
+      const businessId = row.id;
       const statements: BatchItem<"sqlite">[] = [];
       items.forEach((it, i) => {
         statements.push(
@@ -9688,7 +11422,7 @@ export const Actions = {
         if (first) await db.batch([first, ...rest]);
       }
       ctx.invalidateQueries();
-      return { ok: true as const, itemCount: items.length };
+      return { ok: true as const, businessId, itemCount: items.length };
     },
   }),
 
@@ -9786,9 +11520,109 @@ export const Actions = {
       const profile = biz
         ? bitNeedsProfileFor(biz.businessType)
         : BIT_NO_NEEDS;
+      const newOnHand = bitRoundCount(profile, args.onHand);
       await db
         .update(schema.bitItems)
-        .set({ onHand: bitRoundCount(profile, args.onHand) })
+        .set({ onHand: newOnHand })
+        .where(eq(schema.bitItems.id, args.itemId));
+      // Trend collection (Alpha 0.79): a count changed outside a
+      // check is logged as a dated stock event so usage between
+      // checks can be computed (previous count + receipts −
+      // current count).
+      if (item && newOnHand !== item.onHand) {
+        const { role } = await loadAccountSettings(ctx);
+        await db.insert(schema.bitStockEvents).values({
+          businessId: item.businessId,
+          itemId: item.id,
+          itemName: item.name,
+          delta: newOnHand - item.onHand,
+          source: "manual_count",
+          actor: role,
+        });
+      }
+      ctx.invalidateQueries();
+      return { ok: true as const };
+    },
+  }),
+
+  undoBitStockEvent: defineAction({
+    description:
+      "Undoes one Inventory-tab count change (a manual_count stock event, Beta 0.01 batch, audit #5): reverses the event's delta on the item's on-hand count, restoring the count from before that change, and marks the event undone so Trends' usage math excludes it. Requisition receipts are not undone here — their Undo is the requisition line's check-off Undo. Already-undone events, and events whose item is no longer tracked, report an error and change nothing.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.bitStockEvents)
+        .where(eq(schema.bitStockEvents.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return { ok: false, error: "That count change no longer exists." };
+      }
+      if (row.source !== "manual_count") {
+        return {
+          ok: false,
+          error:
+            "That change came from a requisition receipt — undo it from the requisition line instead.",
+        };
+      }
+      if (row.undone === 1) {
+        return { ok: false, error: "That count change is already undone." };
+      }
+      const eventGate = undoGate(
+        await loadAccountSettings(ctx),
+        "bitCountChanges",
+        row.actor,
+      );
+      if (eventGate) return { ok: false, error: eventGate };
+      if (row.itemId == null) {
+        return { ok: false, error: "That item is no longer tracked." };
+      }
+      const itemRows = await db
+        .select()
+        .from(schema.bitItems)
+        .where(eq(schema.bitItems.id, row.itemId));
+      const item = itemRows[0];
+      if (!item) {
+        return { ok: false, error: "That item is no longer tracked." };
+      }
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.bitStockEvents)
+          .set({ undone: 1 })
+          .where(eq(schema.bitStockEvents.id, row.id)),
+        db
+          .update(schema.bitItems)
+          .set({ onHand: Math.max(0, item.onHand - row.delta) })
+          .where(eq(schema.bitItems.id, item.id)),
+      ];
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
+  setBitItemPar: defineAction({
+    description:
+      "Sets the par level (the inventory threshold) of one existing BIT inventory item (Alpha 0.79). Par was previously write-once at item creation; this is the editor behind the Inventory Checks Finish summary's per-item Par fields and the Inventory tab's tappable 'Par N'. Par must be a whole number ≥ 0; 0 means no threshold set (the item never auto-appears on a requisition / order build).",
+    request: z.object({
+      itemId: z.number().int().positive(),
+      par: z.number().int().min(0).max(100000),
+    }),
+    response: z.object({ ok: z.literal(true) }),
+    handler: async (ctx, args): Promise<{ ok: true }> => {
+      const db = ctx.db<typeof schema>();
+      await db
+        .update(schema.bitItems)
+        .set({ par: args.par })
         .where(eq(schema.bitItems.id, args.itemId));
       ctx.invalidateQueries();
       return { ok: true as const };
@@ -9909,6 +11743,7 @@ export const Actions = {
         .update(schema.bitItems)
         .set({ onHand })
         .where(eq(schema.bitItems.id, item.id));
+      const { role } = await loadAccountSettings(ctx);
       await db.insert(schema.bitWasteLog).values({
         businessId: biz.id,
         itemId: item.id,
@@ -9916,7 +11751,87 @@ export const Actions = {
         unit: item.unit,
         quantity: args.quantity,
         reason: args.reason,
+        actor: role,
+        // The amount actually deducted (the clamp at zero can
+        // make it less than the quantity logged) — the entry's
+        // Undo restores exactly this.
+        stockDeducted: item.onHand - onHand,
       });
+      ctx.invalidateQueries();
+      return { ok: true, error: null, onHand };
+    },
+  }),
+
+  undoBitWaste: defineAction({
+    description:
+      "Undoes one BIT waste log entry (Beta 0.01 batch, audit #5): restores exactly the stock the entry deducted to the item's on-hand count and marks the entry undone — it stays in the waste history, marked Undone. Entries logged before the actual deducted amount was recorded restore their logged quantity. An already-undone entry reports an error and changes nothing; if the item itself is gone, the entry is still marked undone and no stock is restored.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      onHand: z.number().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      error: string | null;
+      onHand: number | null;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.bitWasteLog)
+        .where(eq(schema.bitWasteLog.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return {
+          ok: false,
+          error: "That waste entry no longer exists.",
+          onHand: null,
+        };
+      }
+      if (row.undone === 1) {
+        return {
+          ok: false,
+          error: "That waste entry is already undone.",
+          onHand: null,
+        };
+      }
+      const wasteGate = undoGate(
+        await loadAccountSettings(ctx),
+        "wasteLog",
+        row.actor,
+      );
+      if (wasteGate) {
+        return { ok: false, error: wasteGate, onHand: null };
+      }
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.bitWasteLog)
+          .set({ undone: 1 })
+          .where(eq(schema.bitWasteLog.id, row.id)),
+      ];
+      let onHand: number | null = null;
+      if (row.itemId != null) {
+        const itemRows = await db
+          .select()
+          .from(schema.bitItems)
+          .where(eq(schema.bitItems.id, row.itemId));
+        const item = itemRows[0];
+        if (item) {
+          onHand = item.onHand + (row.stockDeducted ?? row.quantity);
+          statements.push(
+            db
+              .update(schema.bitItems)
+              .set({ onHand })
+              .where(eq(schema.bitItems.id, item.id)),
+          );
+        }
+      }
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
       ctx.invalidateQueries();
       return { ok: true, error: null, onHand };
     },
@@ -10039,11 +11954,20 @@ export const Actions = {
 
   finishBitRound: defineAction({
     description:
-      "Finishes a BIT inventory check (a round): writes each counted item's count back as its new on-hand (book) count, and records the check — who counted, the category filter, counted-of-total, every variance (counted vs the previous book count), the items left at or below par, and the freezer temperature readings (anything warmer than −18°C flagged as an alert; recorded only for food & beverage businesses). Counts are rounded to tenths for a fractional-counting (Bar / Pub profile) business and to whole numbers for every other business. Returns that same summary for the Inventory Checks tab to display.",
+      "Finishes a BIT inventory check (a round): writes each counted item's count back as its new on-hand (book) count, and records the check — who counted (for the TFS requisition business, the shift letter A–D instead of a name, stored in the same counter field and displayed as 'Shift A'), the category filter, counted-of-total, every variance (counted vs the previous book count), the items left at or below par, and the freezer temperature readings (anything warmer than −18°C flagged as an alert; recorded only for food & beverage businesses). Counts are rounded to tenths for a fractional-counting (Bar / Pub profile) business and to whole numbers for every other business. Returns that same summary for the Inventory Checks tab to display. Since Alpha 0.79 it also writes one bit_item_snapshots row for EVERY counted item (name, category, book count before the check, counted value, par at the time, round id) — the per-item count history behind the Trends view — and returns those counted items so the Finish summary can offer a par editor per item. Alpha 0.82: each counted item also carries its snapshot id so the summary can record a variance reason (setBitVarianceReason) or submit the one blind recount (recountBitItem) for that item's round record. Alpha 0.85: when the request carries itemIds (a weekly cycle-count check started from getBitWeeklyCount's proposal), the check is scoped to exactly that item set — its counted-of total is the set's size and counts for items outside the set are ignored; snapshots are written as usual, which is what advances each item's cycle schedule.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       counterName: z.string().min(1).max(80),
       zoneFilter: z.string().max(80).nullable(),
+      // Alpha 0.85: a weekly cycle-count check sends the exact
+      // proposed item set; the check's scope (and its counted-of
+      // total) is that set. Null/absent = the normal category
+      // scope, unchanged.
+      itemIds: z
+        .array(z.number().int().positive())
+        .max(5000)
+        .nullable()
+        .optional(),
       counts: z
         .array(
           z.object({
@@ -10076,6 +12000,24 @@ export const Actions = {
         z.object({ name: z.string(), onHand: z.number(), par: z.number() }),
       ),
       freezerReadings: z.array(bitFreezerReadingShape),
+      // Every counted item (Alpha 0.79), so the Finish summary
+      // can list book → counted with an editable par per item.
+      // Alpha 0.82 adds the snapshot id plus the variance-reason /
+      // recount state, so the summary's reason picker and blind
+      // recount write straight onto the item's snapshot.
+      countedItems: z.array(
+        z.object({
+          itemId: z.number(),
+          snapshotId: z.number(),
+          name: z.string(),
+          category: z.string(),
+          book: z.number(),
+          counted: z.number(),
+          par: z.number(),
+          varianceReason: z.string().nullable(),
+          recounted: z.boolean(),
+        }),
+      ),
     }),
     handler: async (
       ctx,
@@ -10088,6 +12030,17 @@ export const Actions = {
       variances: z.infer<typeof bitVarianceShape>[];
       belowPar: { name: string; onHand: number; par: number }[];
       freezerReadings: z.infer<typeof bitFreezerReadingShape>[];
+      countedItems: {
+        itemId: number;
+        snapshotId: number;
+        name: string;
+        category: string;
+        book: number;
+        counted: number;
+        par: number;
+        varianceReason: string | null;
+        recounted: boolean;
+      }[];
     }> => {
       const db = ctx.db<typeof schema>();
       const scopeBiz = await resolveBitBusiness(ctx, args.businessId);
@@ -10103,11 +12056,19 @@ export const Actions = {
       // field — its stored name predates categories-only); an
       // item's group is its category (for a business set up under
       // the old zone choice, its stored zone value).
-      const scope = args.zoneFilter
-        ? allItems.filter(
-            (r) => bitRowGroup(r, scopeBiz) === args.zoneFilter,
-          )
-        : allItems;
+      // Alpha 0.85: a weekly cycle-count check is scoped to
+      // exactly its proposed item set when one is sent.
+      const weeklySet =
+        args.itemIds && args.itemIds.length > 0
+          ? new Set(args.itemIds)
+          : null;
+      const scope = weeklySet
+        ? allItems.filter((r) => weeklySet.has(r.id))
+        : args.zoneFilter
+          ? allItems.filter(
+              (r) => bitRowGroup(r, scopeBiz) === args.zoneFilter,
+            )
+          : allItems;
       const variances: z.infer<typeof bitVarianceShape>[] = [];
       const statements: BatchItem<"sqlite">[] = [];
       // Counts are stored the way this business counts: tenths
@@ -10117,11 +12078,42 @@ export const Actions = {
         ? bitNeedsProfileFor(scopeBiz.businessType)
         : BIT_NO_NEEDS;
       let counted = 0;
+      // One entry per counted item (Alpha 0.79): the snapshot
+      // rows written for the Trends history and the counted-items
+      // list the Finish summary renders with par editors. The
+      // book count and par are captured BEFORE the count is
+      // written back.
+      const countedItems: {
+        itemId: number;
+        snapshotId: number;
+        name: string;
+        category: string;
+        book: number;
+        counted: number;
+        par: number;
+        varianceReason: string | null;
+        recounted: boolean;
+      }[] = [];
       for (const c of args.counts) {
         const item = byId.get(c.itemId);
         if (!item) continue;
+        // A weekly cycle-count check counts only its proposed
+        // set, even if extra counts were sent.
+        if (weeklySet && !weeklySet.has(c.itemId)) continue;
         counted += 1;
         const countedValue = bitRoundCount(countProfile, c.counted);
+        countedItems.push({
+          itemId: item.id,
+          // Filled in once the snapshot row is inserted below.
+          snapshotId: 0,
+          name: item.name,
+          category: bitRowGroup(item, scopeBiz),
+          book: item.onHand,
+          counted: countedValue,
+          par: item.par,
+          varianceReason: null,
+          recounted: false,
+        });
         if (countedValue !== item.onHand) {
           variances.push({
             item: item.name,
@@ -10173,9 +12165,42 @@ export const Actions = {
         .returning({ id: schema.bitRounds.id });
       const round = inserted[0];
       if (!round) throw new Error("finishBitRound: insert returned no rows");
+      // Trend collection (Alpha 0.79): one snapshot row for
+      // EVERY counted item — not just the variances — batched
+      // with the on-hand write-backs. The snapshot ids are read
+      // back afterwards so the Finish summary's variance-reason
+      // picker and blind recount (Alpha 0.82) can write onto
+      // each item's snapshot.
+      for (const ci of countedItems) {
+        statements.push(
+          db.insert(schema.bitItemSnapshots).values({
+            businessId: scopeBiz?.id ?? 1,
+            itemId: ci.itemId,
+            itemName: ci.name,
+            category: ci.category,
+            bookCount: ci.book,
+            counted: ci.counted,
+            par: ci.par,
+            roundId: round.id,
+          }),
+        );
+      }
       if (statements.length > 0) {
         const [first, ...rest] = statements;
         if (first) await db.batch([first, ...rest]);
+      }
+      const snapshotRows = await db
+        .select({
+          id: schema.bitItemSnapshots.id,
+          itemId: schema.bitItemSnapshots.itemId,
+        })
+        .from(schema.bitItemSnapshots)
+        .where(eq(schema.bitItemSnapshots.roundId, round.id));
+      const snapshotIdByItem = new Map(
+        snapshotRows.map((s) => [s.itemId, s.id]),
+      );
+      for (const ci of countedItems) {
+        ci.snapshotId = snapshotIdByItem.get(ci.itemId) ?? 0;
       }
       ctx.invalidateQueries();
       return {
@@ -10186,23 +12211,642 @@ export const Actions = {
         variances,
         belowPar,
         freezerReadings,
+        countedItems,
       };
+    },
+  }),
+
+  setBitVarianceReason: defineAction({
+    description:
+      "Records (or clears, with null) the reason for one BIT check variance (Alpha 0.82): one of Used / Damaged / Expired / Missing / Counting error, written onto the counted item's bit_item_snapshots row for that round from the Inventory Checks Finish summary. Write-through and never blocking — a variance may simply be left without a reason. Only a snapshot whose counted value differs from its book count accepts a reason.",
+    request: z.object({
+      snapshotId: z.number().int().positive(),
+      reason: z
+        .enum(["Used", "Damaged", "Expired", "Missing", "Counting error"])
+        .nullable(),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.bitItemSnapshots)
+        .where(eq(schema.bitItemSnapshots.id, args.snapshotId));
+      const snap = rows[0];
+      if (!snap) {
+        return { ok: false, error: "That count record is gone." };
+      }
+      if (args.reason != null && snap.counted === snap.bookCount) {
+        return {
+          ok: false,
+          error: "That count matched the book count — no variance to explain.",
+        };
+      }
+      await db
+        .update(schema.bitItemSnapshots)
+        .set({ varianceReason: args.reason })
+        .where(eq(schema.bitItemSnapshots.id, snap.id));
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
+    },
+  }),
+
+  recountBitItem: defineAction({
+    description:
+      "Submits the one blind recount allowed per item per BIT check round (Alpha 0.82), prompted on the Finish summary when a variance is large (|counted − book| ≥ 5 units or ≥ 25% of book). The recount value replaces the item's counted value for the round: the item's on-hand, its bit_item_snapshots row for the round, and the round's stored variance / below-par summary are all recomputed; any reason recorded for the old variance is cleared (the reason picker then applies to the new variance, if one remains). The book count is never changed, and a second recount for the same item and round is refused. The value is rounded the way the business counts (tenths for a fractional-counting business, whole numbers otherwise).",
+    request: z.object({
+      snapshotId: z.number().int().positive(),
+      counted: z.number().min(0).max(100000),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+      counted: z.number().nullable(),
+      variances: z.array(bitVarianceShape),
+      belowPar: z.array(
+        z.object({ name: z.string(), onHand: z.number(), par: z.number() }),
+      ),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      error: string | null;
+      counted: number | null;
+      variances: z.infer<typeof bitVarianceShape>[];
+      belowPar: { name: string; onHand: number; par: number }[];
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const fail = (error: string) => ({
+        ok: false,
+        error,
+        counted: null,
+        variances: [],
+        belowPar: [],
+      });
+      const snapRows = await db
+        .select()
+        .from(schema.bitItemSnapshots)
+        .where(eq(schema.bitItemSnapshots.id, args.snapshotId));
+      const snap = snapRows[0];
+      if (!snap) return fail("That count record is gone.");
+      if (snap.recounted === 1) {
+        return fail("This item was already recounted for this check.");
+      }
+      const biz = await resolveBitBusiness(ctx, snap.businessId);
+      const countProfile = biz
+        ? bitNeedsProfileFor(biz.businessType)
+        : BIT_NO_NEEDS;
+      const newCounted = bitRoundCount(countProfile, args.counted);
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.bitItemSnapshots)
+          .set({
+            counted: newCounted,
+            recounted: 1,
+            // The reason described the old variance; the picker
+            // now applies to whatever variance remains.
+            varianceReason: null,
+          })
+          .where(eq(schema.bitItemSnapshots.id, snap.id)),
+      ];
+      if (snap.itemId != null) {
+        statements.push(
+          db
+            .update(schema.bitItems)
+            .set({ onHand: newCounted })
+            .where(eq(schema.bitItems.id, snap.itemId)),
+        );
+      }
+      // Recompute the round's stored summary from its snapshots
+      // (variances) and the business's items (below par, with
+      // this item's new on-hand applied).
+      const roundSnaps = await db
+        .select()
+        .from(schema.bitItemSnapshots)
+        .where(eq(schema.bitItemSnapshots.roundId, snap.roundId));
+      const variances: z.infer<typeof bitVarianceShape>[] = [];
+      for (const s of roundSnaps) {
+        const c = s.id === snap.id ? newCounted : s.counted;
+        if (c !== s.bookCount) {
+          variances.push({ item: s.itemName, book: s.bookCount, counted: c });
+        }
+      }
+      const bizItems = biz
+        ? await db
+            .select()
+            .from(schema.bitItems)
+            .where(eq(schema.bitItems.businessId, biz.id))
+        : [];
+      const belowPar = bizItems
+        .map((r) => ({
+          name: r.name,
+          onHand: r.id === snap.itemId ? newCounted : r.onHand,
+          par: r.par,
+        }))
+        .filter((r) => r.onHand <= r.par);
+      statements.push(
+        db
+          .update(schema.bitRounds)
+          .set({
+            variancesJson: JSON.stringify(variances),
+            belowParJson: JSON.stringify(belowPar.map((b) => b.name)),
+          })
+          .where(eq(schema.bitRounds.id, snap.roundId)),
+      );
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return {
+        ok: true,
+        error: null,
+        counted: newCounted,
+        variances,
+        belowPar,
+      };
+    },
+  }),
+
+  getBitTrends: defineAction({
+    description:
+      "Reads the BIT Trends view data for one business (Alpha 0.79): the per-item count history collected by finishBitRound (bit_item_snapshots — one row per counted item per finished check, starting with the first check finished after Alpha 0.79; nothing is backfilled) plus the dated stock events logged outside checks (bit_stock_events). Per item it returns its checks over time (book, counted, par at the time), total usage between checks (previous count + stock-in events − current count, summed over consecutive check pairs), how many checks varied from book, how many checks landed at or below par, and a par suggestion (the largest single between-checks usage, rounded up — a suggestion only, never applied). hasHistory is false until the first check is finished, and the client shows an honest empty state. Alpha 0.82: each check entry also carries its recorded variance reason and recount flag, and the repeated-variances list carries each item's recorded reasons with counts. Alpha 0.84: each item also carries a days-of-cover forecast when it honestly can have one — at least two counts on different days (UTC calendar days between the first and last count) and positive total usage over that span: avgDailyUsage = usageTotal ÷ span days, daysOfCover = the item's current on-hand ÷ avgDailyUsage, runOutDate = today (UTC) + days of cover rounded to whole days, as a YYYY-MM-DD key. Items with zero or negative recorded usage, or whose current on-hand is unknown (item since removed), get forecast null — never an infinite cover. notEnoughHistory counts the items whose counts span fewer than two different days, so the client can say so in one quiet line.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+    }),
+    response: z.object({
+      hasHistory: z.boolean(),
+      items: z.array(
+        z.object({
+          itemId: z.number().nullable(),
+          name: z.string(),
+          category: z.string(),
+          currentPar: z.number(),
+          checks: z.array(
+            z.object({
+              at: z.string(),
+              book: z.number(),
+              counted: z.number(),
+              par: z.number(),
+              varianceReason: z.string().nullable(),
+              recounted: z.boolean(),
+            }),
+          ),
+          usageTotal: z.number(),
+          intervals: z.number(),
+          varianceCount: z.number(),
+          belowParCount: z.number(),
+          varianceReasons: z.array(
+            z.object({ reason: z.string(), count: z.number() }),
+          ),
+          suggestedPar: z.number().nullable(),
+          // Days-of-cover forecast (Alpha 0.84); null when the
+          // item cannot honestly be forecast (see description).
+          forecast: z
+            .object({
+              onHand: z.number(),
+              avgDailyUsage: z.number(),
+              daysOfCover: z.number(),
+              runOutDate: z.string(),
+            })
+            .nullable(),
+        }),
+      ),
+      // Items whose counts span fewer than two different days
+      // (Alpha 0.84) — counted so the client can note them in one
+      // quiet line instead of per-item noise.
+      notEnoughHistory: z.number(),
+      repeatVariances: z.array(
+        z.object({
+          name: z.string(),
+          varianceCount: z.number(),
+          // The recorded variance reasons for this item (Alpha
+          // 0.82), most frequent first — e.g. repeated "Missing"
+          // reads as the shrinkage signal it is.
+          reasons: z.array(
+            z.object({ reason: z.string(), count: z.number() }),
+          ),
+        }),
+      ),
+      mostBelowPar: z.array(
+        z.object({ name: z.string(), belowParCount: z.number() }),
+      ),
+    }),
+    handler: async (ctx, args) => {
+      const db = ctx.db<typeof schema>();
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz) {
+        return {
+          hasHistory: false,
+          items: [],
+          repeatVariances: [],
+          mostBelowPar: [],
+          notEnoughHistory: 0,
+        };
+      }
+      const [snapshotRows, eventRows, itemRows] = await Promise.all([
+        db
+          .select()
+          .from(schema.bitItemSnapshots)
+          .where(eq(schema.bitItemSnapshots.businessId, biz.id))
+          .orderBy(
+            asc(schema.bitItemSnapshots.createdAt),
+            asc(schema.bitItemSnapshots.id),
+          ),
+        db
+          .select()
+          .from(schema.bitStockEvents)
+          .where(eq(schema.bitStockEvents.businessId, biz.id))
+          .orderBy(
+            asc(schema.bitStockEvents.createdAt),
+            asc(schema.bitStockEvents.id),
+          ),
+        db
+          .select()
+          .from(schema.bitItems)
+          .where(eq(schema.bitItems.businessId, biz.id)),
+      ]);
+      const currentParById = new Map(itemRows.map((r) => [r.id, r.par]));
+      const onHandById = new Map(itemRows.map((r) => [r.id, r.onHand]));
+      // One "today" for every forecast in this read (Alpha 0.84):
+      // UTC calendar day, matching the ISO dates snapshots carry.
+      const nowDate = new Date();
+      const todayStartMs = Date.UTC(
+        nowDate.getUTCFullYear(),
+        nowDate.getUTCMonth(),
+        nowDate.getUTCDate(),
+      );
+      // Group snapshots per item (by id when present, else by
+      // the snapshotted name) and stock events per item id.
+      type Snap = (typeof snapshotRows)[number];
+      const snapsByKey = new Map<string, Snap[]>();
+      for (const s of snapshotRows) {
+        const key = s.itemId != null ? `id:${s.itemId}` : `name:${s.itemName}`;
+        const list = snapsByKey.get(key);
+        if (list) list.push(s);
+        else snapsByKey.set(key, [s]);
+      }
+      const eventsByItemId = new Map<number, typeof eventRows>();
+      // Undone events (audit #5) had their stock change reversed,
+      // so they play no part in usage between checks.
+      for (const e of eventRows.filter((r) => r.undone === 0)) {
+        if (e.itemId == null) continue;
+        const list = eventsByItemId.get(e.itemId);
+        if (list) list.push(e);
+        else eventsByItemId.set(e.itemId, [e]);
+      }
+      const items = [...snapsByKey.values()].map((snaps) => {
+        const first = snaps[0];
+        const itemId = first?.itemId ?? null;
+        const checks = snaps.map((s) => ({
+          at: s.createdAt.toISOString(),
+          book: s.bookCount,
+          counted: s.counted,
+          par: s.par,
+          varianceReason: s.varianceReason ?? null,
+          recounted: s.recounted === 1,
+        }));
+        // Recorded reasons across this item's variance checks
+        // (Alpha 0.82), most frequent first.
+        const reasonCounts = new Map<string, number>();
+        for (const s of snaps) {
+          if (s.counted !== s.bookCount && s.varianceReason) {
+            reasonCounts.set(
+              s.varianceReason,
+              (reasonCounts.get(s.varianceReason) ?? 0) + 1,
+            );
+          }
+        }
+        const varianceReasons = [...reasonCounts.entries()]
+          .map(([reason, count]) => ({ reason, count }))
+          .sort((a, b) => b.count - a.count);
+        const varianceCount = snaps.filter(
+          (s) => s.counted !== s.bookCount,
+        ).length;
+        const belowParCount = snaps.filter(
+          (s) => s.par > 0 && s.counted <= s.par,
+        ).length;
+        // Usage between consecutive checks: previous count +
+        // stock that arrived between the two checks − this
+        // count. Stock events are matched by timestamp window.
+        const itemEvents =
+          itemId != null ? (eventsByItemId.get(itemId) ?? []) : [];
+        let usageTotal = 0;
+        let maxUsage: number | null = null;
+        let intervals = 0;
+        for (let i = 1; i < snaps.length; i++) {
+          const prev = snaps[i - 1];
+          const next = snaps[i];
+          if (!prev || !next) continue;
+          const from = prev.createdAt.getTime();
+          const to = next.createdAt.getTime();
+          const stockIn = itemEvents
+            .filter((e) => {
+              const t = e.createdAt.getTime();
+              return t > from && t <= to;
+            })
+            .reduce((sum, e) => sum + e.delta, 0);
+          const usage = prev.counted + stockIn - next.counted;
+          usageTotal += usage;
+          maxUsage = maxUsage == null ? usage : Math.max(maxUsage, usage);
+          intervals += 1;
+        }
+        // Days-of-cover forecast (Alpha 0.84). Honest gates: the
+        // counts must span at least two different days (UTC
+        // calendar days between the first and last count) and the
+        // recorded usage over the span must be positive — zero or
+        // negative usage means no forecast, never infinite cover.
+        // All math stays in decimals so fractional (tenths)
+        // counts forecast correctly.
+        const firstSnap = snaps[0];
+        const lastSnap = snaps[snaps.length - 1];
+        let enoughHistory = false;
+        let forecast: {
+          onHand: number;
+          avgDailyUsage: number;
+          daysOfCover: number;
+          runOutDate: string;
+        } | null = null;
+        if (firstSnap && lastSnap) {
+          const dayStartMs = (d: Date) =>
+            Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+          const spanDays = Math.round(
+            (dayStartMs(lastSnap.createdAt) - dayStartMs(firstSnap.createdAt)) /
+              86_400_000,
+          );
+          if (spanDays >= 1) {
+            enoughHistory = true;
+            const onHand =
+              itemId != null ? onHandById.get(itemId) : undefined;
+            if (usageTotal > 0 && onHand != null) {
+              const avgDailyUsage = usageTotal / spanDays;
+              const daysOfCover = onHand / avgDailyUsage;
+              forecast = {
+                onHand,
+                avgDailyUsage,
+                daysOfCover,
+                runOutDate: new Date(
+                  todayStartMs + Math.round(daysOfCover) * 86_400_000,
+                )
+                  .toISOString()
+                  .slice(0, 10),
+              };
+            }
+          }
+        }
+        return {
+          itemId,
+          name: first?.itemName ?? "",
+          category: first?.category ?? "",
+          currentPar:
+            itemId != null
+              ? (currentParById.get(itemId) ?? first?.par ?? 0)
+              : (first?.par ?? 0),
+          checks,
+          varianceReasons,
+          usageTotal,
+          intervals,
+          varianceCount,
+          belowParCount,
+          // A suggestion only: par covering the heaviest usage
+          // seen between two checks. Null until an item has two
+          // checks with positive usage between them.
+          suggestedPar:
+            maxUsage != null && maxUsage > 0 ? Math.ceil(maxUsage) : null,
+          forecast,
+          enoughHistory,
+        };
+      });
+      items.sort((a, b) => a.name.localeCompare(b.name));
+      const repeatVariances = items
+        .filter((i) => i.varianceCount >= 2)
+        .map((i) => ({
+          name: i.name,
+          varianceCount: i.varianceCount,
+          reasons: i.varianceReasons,
+        }))
+        .sort((a, b) => b.varianceCount - a.varianceCount);
+      const mostBelowPar = items
+        .filter((i) => i.belowParCount >= 1)
+        .map((i) => ({ name: i.name, belowParCount: i.belowParCount }))
+        .sort((a, b) => b.belowParCount - a.belowParCount)
+        .slice(0, 10);
+      const notEnoughHistory = items.filter(
+        (i) => !i.enoughHistory,
+      ).length;
+      return {
+        hasHistory: snapshotRows.length > 0,
+        items: items.map(({ enoughHistory: _enoughHistory, ...rest }) => rest),
+        repeatVariances,
+        mostBelowPar,
+        notEnoughHistory,
+      };
+    },
+  }),
+
+  getBitWeeklyCount: defineAction({
+    description:
+      "Computes this week's proposed cycle-count set for one BIT business (Alpha 0.85), from the same history Trends reads (bit_item_snapshots + bit_stock_events, collected since Alpha 0.79; nothing is backfilled). Each current inventory item is classified from its recorded activity: A — high usage (total usage between counts of 20 or more units) or repeated variances (2 or more counts that differed from book) — due every week; B — some recorded activity (any usage, one variance, or any stock event) — due every 4 weeks; C — low or no recorded activity — due every 12 weeks. An item is due when it has never been counted, or when its class interval (7 / 28 / 84 whole days) has elapsed since its last count. Never-counted class C items are staggered across their 12-week rotation: each item's position in the business's stable item order (sortOrder, then id — the order getBitState returns) is its fixed rotation slot, and only items whose position modulo 12 matches the current week number (whole weeks since the epoch) are due, so roughly a twelfth are proposed each week instead of the whole catalogue at once, and counting other items never moves an item's slot. Never-counted A or B items (activity recorded but never counted) are due immediately. Returns the due items in inventory order, each with its class, its interval in plain words, whether it was never counted, and whole days since its last count (null when never counted), plus the business's total item count. Starting the proposed check goes through finishBitRound with itemIds set to exactly this set.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+    }),
+    response: z.object({
+      due: z.array(
+        z.object({
+          itemId: z.number(),
+          name: z.string(),
+          category: z.string(),
+          cls: z.enum(["A", "B", "C"]),
+          intervalLabel: z.string(),
+          neverCounted: z.boolean(),
+          daysSinceLastCount: z.number().nullable(),
+        }),
+      ),
+      totalItems: z.number(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      due: {
+        itemId: number;
+        name: string;
+        category: string;
+        cls: "A" | "B" | "C";
+        intervalLabel: string;
+        neverCounted: boolean;
+        daysSinceLastCount: number | null;
+      }[];
+      totalItems: number;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz) return { due: [], totalItems: 0 };
+      const [itemRows, snapshotRows, eventRows] = await Promise.all([
+        db
+          .select()
+          .from(schema.bitItems)
+          .where(eq(schema.bitItems.businessId, biz.id))
+          .orderBy(
+            asc(schema.bitItems.sortOrder),
+            asc(schema.bitItems.id),
+          ),
+        db
+          .select()
+          .from(schema.bitItemSnapshots)
+          .where(eq(schema.bitItemSnapshots.businessId, biz.id))
+          .orderBy(
+            asc(schema.bitItemSnapshots.createdAt),
+            asc(schema.bitItemSnapshots.id),
+          ),
+        db
+          .select()
+          .from(schema.bitStockEvents)
+          .where(eq(schema.bitStockEvents.businessId, biz.id))
+          .orderBy(
+            asc(schema.bitStockEvents.createdAt),
+            asc(schema.bitStockEvents.id),
+          ),
+      ]);
+      type Snap = (typeof snapshotRows)[number];
+      const snapsByItemId = new Map<number, Snap[]>();
+      for (const s of snapshotRows) {
+        if (s.itemId == null) continue;
+        const list = snapsByItemId.get(s.itemId);
+        if (list) list.push(s);
+        else snapsByItemId.set(s.itemId, [s]);
+      }
+      const eventsByItemId = new Map<number, typeof eventRows>();
+      // Undone events (audit #5) had their stock change reversed,
+      // so they play no part in usage between checks.
+      for (const e of eventRows.filter((r) => r.undone === 0)) {
+        if (e.itemId == null) continue;
+        const list = eventsByItemId.get(e.itemId);
+        if (list) list.push(e);
+        else eventsByItemId.set(e.itemId, [e]);
+      }
+      const DAY_MS = 86_400_000;
+      const nowMs = Date.now();
+      // Whole weeks since the epoch: the rotation bucket the
+      // never-counted class C stagger keys off.
+      const weekIndex = Math.floor(nowMs / (7 * DAY_MS));
+      const INTERVAL_DAYS = { A: 7, B: 28, C: 84 } as const;
+      const INTERVAL_LABEL = {
+        A: "weekly",
+        B: "every 4 weeks",
+        C: "every 12 weeks",
+      } as const;
+      // First pass: classify every item and find its last count.
+      type Classified = {
+        item: (typeof itemRows)[number];
+        cls: "A" | "B" | "C";
+        lastCountedMs: number | null;
+      };
+      const classified: Classified[] = itemRows.map((item) => {
+        const snaps = snapsByItemId.get(item.id) ?? [];
+        const itemEvents = eventsByItemId.get(item.id) ?? [];
+        const varianceCount = snaps.filter(
+          (s) => s.counted !== s.bookCount,
+        ).length;
+        // Total usage between counts — the same math Trends
+        // shows: previous count + stock-in events in the
+        // interval − this count, summed over consecutive pairs.
+        let usageTotal = 0;
+        for (let i = 1; i < snaps.length; i++) {
+          const prev = snaps[i - 1];
+          const next = snaps[i];
+          if (!prev || !next) continue;
+          const from = prev.createdAt.getTime();
+          const to = next.createdAt.getTime();
+          const stockIn = itemEvents
+            .filter((e) => {
+              const t = e.createdAt.getTime();
+              return t > from && t <= to;
+            })
+            .reduce((sum, e) => sum + e.delta, 0);
+          usageTotal += prev.counted + stockIn - next.counted;
+        }
+        const cls: "A" | "B" | "C" =
+          varianceCount >= 2 || usageTotal >= 20
+            ? "A"
+            : usageTotal > 0 || varianceCount >= 1 || itemEvents.length > 0
+              ? "B"
+              : "C";
+        const last = snaps[snaps.length - 1];
+        return {
+          item,
+          cls,
+          lastCountedMs: last ? last.createdAt.getTime() : null,
+        };
+      });
+      // Second pass: due-ness, staggering the never-counted
+      // class C items across their 12-week rotation by the
+      // item's own position in the stable item order — a fixed
+      // slot per item, so counting other items never moves an
+      // item's rotation week.
+      const due: {
+        itemId: number;
+        name: string;
+        category: string;
+        cls: "A" | "B" | "C";
+        intervalLabel: string;
+        neverCounted: boolean;
+        daysSinceLastCount: number | null;
+      }[] = [];
+      classified.forEach((c, position) => {
+        let isDue = false;
+        let daysSinceLastCount: number | null = null;
+        if (c.lastCountedMs == null) {
+          if (c.cls === "C") {
+            isDue = position % 12 === weekIndex % 12;
+          } else {
+            isDue = true;
+          }
+        } else {
+          daysSinceLastCount = Math.floor(
+            (nowMs - c.lastCountedMs) / DAY_MS,
+          );
+          isDue = daysSinceLastCount >= INTERVAL_DAYS[c.cls];
+        }
+        if (isDue) {
+          due.push({
+            itemId: c.item.id,
+            name: c.item.name,
+            category: bitRowGroup(c.item, biz),
+            cls: c.cls,
+            intervalLabel: INTERVAL_LABEL[c.cls],
+            neverCounted: c.lastCountedMs == null,
+            daysSinceLastCount,
+          });
+        }
+      });
+      return { due, totalItems: itemRows.length };
     },
   }),
 
   importBitManifest: defineAction({
     description:
-      "Confirms a reviewed BIT manifest import (the shared review used by the setup wizard's manifest step and the Inventory tab's Import manifest): lines whose name matches an existing inventory item (case-insensitive) SET that item's on-hand count; new lines are added as items (par defaults to the imported count when the line has none; a new item is placed in its category — the line's category when it names one of the business's categories, otherwise the business's first category). When scanId names a manifest photo scan, that scan is marked 'confirmed'. Returns how many items were added vs updated.",
+      "Confirms a reviewed BIT manifest import (the shared review used by the setup wizard's manifest step and the Inventory tab's Import manifest): lines whose name matches an existing inventory item (case-insensitive) SET that item's on-hand count; new lines are added as items (par defaults to the imported count when the line has none; a new item is placed in its category — the line's category when it names one of the business's categories, otherwise the business's first category). When scanId names a manifest photo scan, that scan is marked 'confirmed'. Returns how many items were added vs updated. Undo coverage (audit #5): every import that changes anything also writes a bit_manifest_imports record — per line, the item it created or the on-hand it replaced — which undoBitManifestImport reverts from, and whose id is returned as importId (null when nothing changed).",
     request: z.object({
       businessId: bitBusinessIdRequest,
       lines: z.array(bitManifestLineRequest).max(500),
       scanId: z.number().int().positive().nullable(),
     }),
-    response: z.object({ added: z.number(), updated: z.number() }),
+    response: z.object({
+      added: z.number(),
+      updated: z.number(),
+      importId: z.number().nullable(),
+    }),
     handler: async (
       ctx,
       args,
-    ): Promise<{ added: number; updated: number }> => {
+    ): Promise<{ added: number; updated: number; importId: number | null }> => {
       const db = ctx.db<typeof schema>();
       const biz = await resolveBitBusiness(ctx, args.businessId);
       const existing = biz
@@ -10223,6 +12867,8 @@ export const Actions = {
       let added = 0;
       let updated = 0;
       const statements: BatchItem<"sqlite">[] = [];
+      // The import's undo record: one change per line touched.
+      const changes: BitManifestImportChange[] = [];
       const seen = new Set<string>();
       for (const line of args.lines) {
         const key = line.name.trim().toLowerCase();
@@ -10231,6 +12877,12 @@ export const Actions = {
         const match = byName.get(key);
         if (match) {
           updated += 1;
+          changes.push({
+            name: match.name,
+            itemId: match.id,
+            added: false,
+            priorOnHand: match.onHand,
+          });
           statements.push(
             db
               .update(schema.bitItems)
@@ -10243,8 +12895,12 @@ export const Actions = {
           const category = bizCategories.includes(lineCat)
             ? lineCat
             : (bizCategories[0] ?? (lineCat || "General"));
-          statements.push(
-            db.insert(schema.bitItems).values({
+          // New items are inserted one by one (not batched) so
+          // the undo record can name the exact item each line
+          // created.
+          const [inserted] = await db
+            .insert(schema.bitItems)
+            .values({
               businessId: biz?.id ?? 1,
               name: line.name.trim(),
               category,
@@ -10257,8 +12913,14 @@ export const Actions = {
               sku: null,
               tagsJson: "[]",
               sortOrder: nextOrder++,
-            }),
-          );
+            })
+            .returning({ id: schema.bitItems.id });
+          changes.push({
+            name: line.name.trim(),
+            itemId: inserted?.id ?? null,
+            added: true,
+            priorOnHand: null,
+          });
         }
       }
       if (args.scanId != null) {
@@ -10273,8 +12935,107 @@ export const Actions = {
         const [first, ...rest] = statements;
         if (first) await db.batch([first, ...rest]);
       }
+      let importId: number | null = null;
+      if (changes.length > 0) {
+        const { role } = await loadAccountSettings(ctx);
+        const [record] = await db
+          .insert(schema.bitManifestImports)
+          .values({
+            businessId: biz?.id ?? 1,
+            scanId: args.scanId,
+            changesJson: JSON.stringify(changes),
+            actor: role,
+          })
+          .returning({ id: schema.bitManifestImports.id });
+        importId = record?.id ?? null;
+      }
       ctx.invalidateQueries();
-      return { added, updated };
+      return { added, updated, importId };
+    },
+  }),
+
+  undoBitManifestImport: defineAction({
+    description:
+      "Undoes one recorded BIT manifest import (Beta 0.01 batch, audit #5): reverts exactly what that import did — items the import created are removed from the inventory, and items whose counts the import set get their pre-import on-hand back. The import record is marked undone, and a photo scan the import confirmed returns to 'proposed' so its lines can be reviewed again. An already-undone import reports an error and changes nothing. Items created by the import that have since been removed are simply skipped.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.bitManifestImports)
+        .where(eq(schema.bitManifestImports.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return { ok: false, error: "That import no longer exists." };
+      }
+      if (row.undone === 1) {
+        return { ok: false, error: "That import is already undone." };
+      }
+      const importGate = undoGate(
+        await loadAccountSettings(ctx),
+        "manifestImports",
+        row.actor,
+      );
+      if (importGate) return { ok: false, error: importGate };
+      const changes = bitParseManifestImportChanges(row.changesJson);
+      const itemRows = await db
+        .select()
+        .from(schema.bitItems)
+        .where(eq(schema.bitItems.businessId, row.businessId));
+      const byId = new Map(itemRows.map((r) => [r.id, r]));
+      const byName = new Map(
+        itemRows.map((r) => [r.name.trim().toLowerCase(), r]),
+      );
+      const statements: BatchItem<"sqlite">[] = [
+        db
+          .update(schema.bitManifestImports)
+          .set({ undone: 1 })
+          .where(eq(schema.bitManifestImports.id, row.id)),
+      ];
+      for (const change of changes) {
+        const item =
+          (change.itemId != null ? byId.get(change.itemId) : undefined) ??
+          byName.get(change.name.trim().toLowerCase());
+        if (!item) continue;
+        if (change.added) {
+          statements.push(
+            db
+              .delete(schema.bitItems)
+              .where(eq(schema.bitItems.id, item.id)),
+          );
+        } else if (change.priorOnHand != null) {
+          statements.push(
+            db
+              .update(schema.bitItems)
+              .set({ onHand: change.priorOnHand })
+              .where(eq(schema.bitItems.id, item.id)),
+          );
+        }
+      }
+      if (row.scanId != null) {
+        statements.push(
+          db
+            .update(schema.bitManifestScans)
+            .set({ status: "proposed", updatedAt: new Date() })
+            .where(
+              and(
+                eq(schema.bitManifestScans.id, row.scanId),
+                eq(schema.bitManifestScans.status, "confirmed"),
+              ),
+            ),
+        );
+      }
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      ctx.invalidateQueries();
+      return { ok: true, error: null };
     },
   }),
 
@@ -10701,6 +13462,7 @@ export const Actions = {
     }),
     handler: async (ctx, args) => {
       const db = ctx.db<typeof schema>();
+      const settings = await loadAccountSettings(ctx);
       const biz = await resolveBitBusiness(ctx, args.businessId);
       const rows = biz
         ? await db
@@ -10724,6 +13486,7 @@ export const Actions = {
           belowPar: r.belowPar === 1,
           undone: r.undone === 1,
           createdAt: r.createdAt.toISOString(),
+          ...undoMeta(settings, "posSyncs", r.actor, r.undone === 1),
         }));
       const unmatched = rows
         .filter((r) => r.matched === 0 && r.resolved === 0)
@@ -10759,6 +13522,12 @@ export const Actions = {
       if (row.matched !== 1 || row.undone === 1 || row.itemId == null) {
         return { ok: false, error: "That entry can't be undone." };
       }
+      const posGate = undoGate(
+        await loadAccountSettings(ctx),
+        "posSyncs",
+        row.actor,
+      );
+      if (posGate) return { ok: false, error: posGate };
       const itemRows = await db
         .select()
         .from(schema.bitItems)

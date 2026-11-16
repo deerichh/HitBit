@@ -2,6 +2,8 @@ import { useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fileToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
+import { ActorTag } from "./AccountPolicy";
+import { INFO_BUTTON_STYLE, useHoldInfo } from "./popupHooks";
 
 type AlertsData = ApiResponse<typeof api, "getAlerts">;
 type AlertItem = AlertsData["alerts"][number];
@@ -37,6 +39,87 @@ function Chevron({ collapsed }: { collapsed: boolean }) {
   );
 }
 
+/**
+ * The ⓘ button of the one header spec (Beta 0.05, audit #9): it
+ * sits beside a banner's title count and its popup lists — names
+ * only, one per line — what the count counts, so the number
+ * always matches the list. HOLD-TO-SHOW, like every ⓘ in the app
+ * (see popupHooks): shown while held, gone within 2 seconds of
+ * release.
+ */
+function InfoListButton({
+  names,
+  emptyText,
+  ariaLabel,
+}: {
+  names: string[];
+  emptyText: string;
+  ariaLabel: string;
+}) {
+  const hold = useHoldInfo();
+
+  return (
+    <span
+      data-hold-info-root=""
+      className="relative inline-flex shrink-0 items-center"
+    >
+      {hold.visible && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute top-full right-0 z-50 mt-1 rounded-lg border px-2.5 py-1.5 text-left shadow-lg"
+          style={{
+            backgroundColor: "var(--surface)",
+            color: "var(--text)",
+            borderColor: "var(--border)",
+            fontSize: 13,
+            boxShadow: "0 6px 20px rgba(0,0,0,0.22)",
+            opacity: hold.fading ? 0 : 1,
+            transition: "opacity 0.7s ease",
+          }}
+        >
+          {names.length > 0 ? (
+            names.map((name, idx) => (
+              <span
+                key={`${name}-${idx}`}
+                className="block font-semibold whitespace-nowrap"
+              >
+                {name}
+              </span>
+            ))
+          ) : (
+            <span className="block font-semibold whitespace-nowrap">
+              {emptyText}
+            </span>
+          )}
+        </span>
+      )}
+      <button
+        type="button"
+        aria-label={ariaLabel}
+        {...hold.buttonProps}
+        className="hit24 inline-flex shrink-0 items-center justify-center rounded-full leading-none"
+        style={{
+          width: 18,
+          height: 18,
+          // Overrides the global 2rem button minimum in theme.css
+          // so the button stays small and quiet beside the count.
+          // The visible box stays 18×18; the .hit24 overlay
+          // (theme.css, audit #10) grows the tappable area to
+          // 24×24 without changing the layout.
+          minHeight: 18,
+          padding: 0,
+          fontSize: 13,
+          color: "var(--dim)",
+          backgroundColor: "transparent",
+          ...INFO_BUTTON_STYLE,
+        }}
+      >
+        ⓘ
+      </button>
+    </span>
+  );
+}
+
 function alertTime(iso: string): string {
   const d = new Date(iso);
   return d.toLocaleString("en-CA", {
@@ -55,11 +138,18 @@ const ALERT_KIND_LABEL: Record<AlertItem["kind"], string> = {
 
 /**
  * The alerts strip at the very top of the Shopping List tab (above
- * the locked "Sales by Store" header). Quiet by design: one slim
- * row with the unread count; tapping it expands the feed (newest
- * first, each alert dismissible) and marks the alerts read. Alerts
- * are written by Muse's external scan jobs and are display only.
- * With no alerts at all, the strip renders nothing.
+ * the locked "Sales by Store" header). It uses the one header spec
+ * (Beta 0.05, audit #9): the standard accent box with its chevron
+ * on the left, ONE count in the title — "Alerts - X", X the total
+ * number of alerts — and an ⓘ beside it listing the alert titles.
+ * Which alerts are new shows on the rows themselves (unread rows
+ * are bold), never as a second count. Tapping the title expands
+ * the feed (newest first, each alert dismissible) and marks the
+ * alerts read. Dismissed alerts collect in a Dismissed list below
+ * the feed, each with a Restore — a dismissal is reversible
+ * (audit #5). Alerts are written by Muse's external scan jobs
+ * and are display only. With no alerts at all, the strip renders
+ * nothing.
  */
 export function AlertsStrip() {
   const queryClient = useQueryClient();
@@ -81,9 +171,28 @@ export function AlertsStrip() {
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["alerts"] }),
   });
+  // Undo coverage (audit #5): a dismissed alert can be restored
+  // from the Dismissed list below — dismissal is reversible.
+  // Policy (audit #5, second half): the Restore shows only when
+  // the current role may undo this dismissal (alert dismissals
+  // Reversible + ownership); a refusal from the server is shown.
+  const [restoreNote, setRestoreNote] = useState<string | null>(null);
+  const restore = useMutation({
+    mutationFn: async (id: number) => await api.restoreAlert({ id }),
+    onSuccess: (res) => {
+      setRestoreNote(res.ok ? null : (res.error ?? "That alert couldn't be restored."));
+      queryClient.invalidateQueries({ queryKey: ["alerts"] });
+    },
+    onError: () => setRestoreNote("That alert couldn't be restored. Try again."),
+  });
 
   const data = alerts.data;
-  if (!data || (data.alerts.length === 0 && data.unreadCount === 0)) {
+  if (
+    !data ||
+    (data.alerts.length === 0 &&
+      data.unreadCount === 0 &&
+      data.dismissed.length === 0)
+  ) {
     return null;
   }
   const unread = data.unreadCount;
@@ -98,10 +207,10 @@ export function AlertsStrip() {
   return (
     <section className="pt-2">
       <div
-        className="overflow-hidden rounded-2xl"
+        className="flex w-full items-center rounded-xl px-3 py-2"
         style={{
-          backgroundColor: "var(--surface)",
-          border: "1px solid var(--border)",
+          backgroundColor: "var(--accent-soft)",
+          border: "2px solid var(--accent)",
         }}
       >
         <button
@@ -113,30 +222,34 @@ export function AlertsStrip() {
               : "Alerts"
           }
           onClick={toggle}
-          className="flex w-full items-center gap-2 px-3 py-2 text-left"
+          // -my-2 py-2 (audit #10): the toggle's tappable area
+          // fills the banner's full height, like the other banner
+          // toggles — the negative margins cancel the extra
+          // padding in layout, so the banner doesn't grow.
+          className="-my-2 flex min-w-0 flex-1 items-center gap-1.5 py-2 text-left"
         >
           <Chevron collapsed={!open} />
-          <span className="text-sm font-bold text-[var(--text)]">
-            Alerts
-          </span>
-          {unread > 0 && (
-            <span
-              className="rounded-full px-2 py-0.5 text-[13px] font-bold"
-              style={{
-                backgroundColor: "var(--accent)",
-                color: "var(--accent-text)",
-              }}
-            >
-              {unread} new
-            </span>
-          )}
-          <span className="ml-auto text-xs text-[var(--dim)]">
-            {data.alerts.length}{" "}
-            {data.alerts.length === 1 ? "alert" : "alerts"}
+          <span
+            className="font-bold text-[var(--text)]"
+            style={{ fontSize: "20px", lineHeight: 1.2 }}
+          >
+            Alerts - {data.alerts.length}
           </span>
         </button>
-        {open && (
-          <ul className="divide-y border-t border-[var(--border)]">
+        <InfoListButton
+          names={data.alerts.map((a) => a.title)}
+          emptyText="No alerts"
+          ariaLabel="Show the alerts in this section"
+        />
+      </div>
+      {open && (
+        <ul
+          className="mt-1.5 divide-y rounded-2xl"
+          style={{
+            backgroundColor: "var(--surface)",
+            border: "1px solid var(--border)",
+          }}
+        >
             {data.alerts.map((a) => (
               <li key={a.id} className="flex gap-2 px-3 py-2">
                 <div className="min-w-0 flex-1">
@@ -183,9 +296,62 @@ export function AlertsStrip() {
                 </button>
               </li>
             ))}
+        </ul>
+      )}
+      {open && data.dismissed.length > 0 && (
+        <div className="mt-1.5">
+          <p className="px-1 text-xs font-bold text-[var(--dim)]">
+            Dismissed
+          </p>
+          <ul
+            className="mt-1 divide-y rounded-2xl opacity-75"
+            style={{
+              backgroundColor: "var(--surface)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            {data.dismissed.map((a) => (
+              <li key={a.id} className="flex gap-2 px-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-medium leading-snug text-[var(--text)]">
+                    {a.title}
+                  </p>
+                  <p className="mt-0.5 text-[13px] text-[var(--dim)]">
+                    {a.item ? `${a.item} · ` : ""}
+                    {alertTime(a.createdAt)}
+                    <ActorTag actor={a.actor} permanent={a.permanent} />
+                  </p>
+                </div>
+                {a.permanent ? (
+                  <span className="shrink-0 self-start rounded-full px-3 py-1 text-xs font-bold text-[var(--dim)]">
+                    Permanent
+                  </span>
+                ) : a.canUndo ? (
+                <button
+                  type="button"
+                  aria-label={`Restore alert: ${a.title}`}
+                  disabled={restore.isPending && restore.variables === a.id}
+                  onClick={() => restore.mutate(a.id)}
+                  className="shrink-0 self-start rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+                  style={{
+                    backgroundColor: "var(--surface-alt)",
+                    color: "var(--accent)",
+                    border: "1px solid var(--border)",
+                  }}
+                >
+                  Restore
+                </button>
+                ) : null}
+              </li>
+            ))}
           </ul>
-        )}
-      </div>
+          {restoreNote && (
+            <p className="mt-1 px-1 text-xs font-semibold text-[var(--red)]" role="alert">
+              {restoreNote}
+            </p>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -306,7 +472,7 @@ function ReceiptProposal({
     onSuccess: (res) => {
       if (res.ok) {
         onDone(
-          `Added ${res.recorded} ${res.recorded === 1 ? "item" : "items"} from the receipt — counts are updated here now and will be written to the sheet on the next auto-scan.`,
+          `Added ${res.recorded} ${res.recorded === 1 ? "item" : "items"} from the receipt — counts are updated here now.`,
         );
       } else {
         onDone(res.error ?? "Those items couldn't be saved. Try again.");
@@ -511,6 +677,24 @@ export function ReceiptScansSection() {
     onError: () => setNote("That receipt photo couldn't be sent. Try again."),
   });
 
+  // Undo coverage (audit #5): a confirmed scan's own Undo,
+  // reversing the stock additions its confirmation recorded.
+  const undoScan = useMutation({
+    mutationFn: async (id: number) => await api.undoReceiptScan({ id }),
+    onSuccess: (res) => {
+      setNote(
+        res.ok
+          ? "Receipt scan undone — the stock it added was taken back off."
+          : (res.error ?? "That scan couldn't be undone."),
+      );
+      queryClient.invalidateQueries({ queryKey: ["receipt-scans"] });
+      queryClient.invalidateQueries({ queryKey: ["hit"] });
+      queryClient.invalidateQueries({ queryKey: ["activity"] });
+      queryClient.invalidateQueries({ queryKey: ["list"] });
+    },
+    onError: () => setNote("That scan couldn't be undone. Try again."),
+  });
+
   const rows = scans.data?.scans ?? [];
   const proposed = rows.filter((s) => s.status === "proposed");
   const pending = rows.filter((s) => s.status === "pending");
@@ -518,42 +702,73 @@ export function ReceiptScansSection() {
     (s) => s.status === "confirmed" || s.status === "dismissed",
   );
   const open = openOverride ?? proposed.length > 0;
+  // The one header spec (Beta 0.05, audit #9): the pending count
+  // lives in the banner title ("Receipt scans - X") — every scan
+  // still waiting, whether it's ready to review or still being
+  // read — and the ⓘ beside it lists exactly those scans, so the
+  // number always matches the list.
+  const pendingCount = proposed.length + pending.length;
+  const pendingNames = [
+    ...proposed.map(
+      (s) => `Ready to review · ${alertTime(s.createdAt)}`,
+    ),
+    ...pending.map(
+      (s) => `Waiting to be read · ${alertTime(s.createdAt)}`,
+    ),
+  ];
 
   return (
     <section className="mt-2">
-      <div className="flex items-center justify-between gap-3 px-1">
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-label={`${open ? "Collapse" : "Expand"} Receipt scans section`}
-          onClick={() => setOpenOverride(!open)}
-          className="flex min-w-0 items-center gap-1.5 text-left"
+      <div className="flex items-center gap-2">
+        <div
+          className="flex min-w-0 flex-1 items-center rounded-xl px-3 py-2"
+          style={{
+            backgroundColor: "var(--accent-soft)",
+            border: "2px solid var(--accent)",
+          }}
         >
-          <Chevron collapsed={!open} />
-          <span
-            className="font-bold whitespace-nowrap text-[var(--text)]"
-            style={{ fontSize: "20px", lineHeight: 1.2 }}
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-label={`${open ? "Collapse" : "Expand"} Receipt scans section`}
+            onClick={() => setOpenOverride(!open)}
+            // -my-2 py-2 (audit #10): the toggle's tappable area
+            // fills the banner's full height, like the other
+            // banner toggles — the negative margins cancel the
+            // extra padding in layout, so the banner doesn't grow.
+            className="-my-2 flex min-w-0 flex-1 items-center gap-1.5 py-2 text-left"
           >
-            Receipt scans
-          </span>
-          {proposed.length > 0 && (
+            <Chevron collapsed={!open} />
             <span
-              className="rounded-full px-2 py-0.5 text-[13px] font-bold"
+              className="font-bold whitespace-nowrap text-[var(--text)]"
               style={{
-                backgroundColor: "var(--accent)",
-                color: "var(--accent-text)",
+                // The banner shares its row with the "Receipt
+                // scan" button, so its title steps down a touch
+                // from the 20px banner size to always fit beside
+                // it (the Membership Alternatives shrink-to-fit
+                // idea) — the ⓘ never overlaps the count.
+                fontSize:
+                  `Receipt scans - ${pendingCount}`.length > 17
+                    ? 16
+                    : 18,
+                lineHeight: 1.2,
               }}
             >
-              {proposed.length} to review
+              Receipt scans - {pendingCount}
             </span>
-          )}
-        </button>
+          </button>
+          <InfoListButton
+            names={pendingNames}
+            emptyText="No scans waiting"
+            ariaLabel="Show the scans waiting in this section"
+          />
+        </div>
         <button
           type="button"
           aria-label="Scan a photo of a receipt"
           disabled={send.isPending}
           onClick={() => fileRef.current?.click()}
-          className="shrink-0 rounded-full px-4 py-1 text-sm font-bold disabled:opacity-50"
+          className="shrink-0 rounded-full px-3 py-1 text-sm font-bold disabled:opacity-50"
           style={{
             backgroundColor: "var(--surface)",
             color: "var(--accent)",
@@ -615,12 +830,50 @@ export function ReceiptScansSection() {
           {past.length > 0 && (
             <ul className="flex flex-col gap-1 px-1">
               {past.map((scan) => (
-                <li key={scan.id} className="text-xs text-[var(--dim)]">
-                  {scan.status === "confirmed"
-                    ? `Confirmed · ${alertTime(scan.createdAt)} — ${scan.confirmedUnits ?? 0} ${
-                        scan.confirmedUnits === 1 ? "item" : "items"
-                      } added from the receipt`
-                    : `Dismissed · ${alertTime(scan.createdAt)}`}
+                <li
+                  key={scan.id}
+                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--dim)]"
+                >
+                  <span>
+                    {scan.status === "confirmed"
+                      ? `Confirmed · ${alertTime(scan.createdAt)} — ${scan.confirmedUnits ?? 0} ${
+                          scan.confirmedUnits === 1 ? "item" : "items"
+                        } added from the receipt${scan.undone ? " · Undone" : ""}`
+                      : `Dismissed · ${alertTime(scan.createdAt)}`}
+                    {scan.status === "confirmed" && (
+                      <ActorTag
+                        actor={scan.actor}
+                        permanent={scan.permanent}
+                      />
+                    )}
+                  </span>
+                  {scan.status === "confirmed" &&
+                    !scan.undone &&
+                    scan.permanent && (
+                      <span className="font-bold text-[var(--dim)]">
+                        Permanent
+                      </span>
+                    )}
+                  {scan.status === "confirmed" &&
+                    !scan.undone &&
+                    scan.canUndo && (
+                    <button
+                      type="button"
+                      aria-label="Undo this confirmed receipt scan"
+                      disabled={
+                        undoScan.isPending && undoScan.variables === scan.id
+                      }
+                      onClick={() => undoScan.mutate(scan.id)}
+                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                      style={{
+                        backgroundColor: "var(--surface)",
+                        color: "var(--accent)",
+                        border: "1px solid var(--border)",
+                      }}
+                    >
+                      Undo
+                    </button>
+                  )}
                 </li>
               ))}
             </ul>

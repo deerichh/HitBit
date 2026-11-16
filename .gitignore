@@ -12,3 +12,5 @@ client/dist/
 client/dist-cvm/
 server/dist/
 *.tsbuildinfo
+.xmds-icon
+*.tsbuildinfo.*

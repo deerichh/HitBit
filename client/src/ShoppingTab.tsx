@@ -1,9 +1,20 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import {
+Fragment,
+useEffect,
+useMemo,
+useRef,
+useState,
+} from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, type ApiResponse } from "./api";
 import { AlertsStrip, ReceiptScansSection } from "./ShoppingExtras";
 import { RefreshProgress } from "./RefreshProgress";
 import { SourceDropdown } from "./SourceDropdown";
+import {
+INFO_BUTTON_STYLE,
+useHoldInfo,
+useMenuDismiss,
+} from "./popupHooks";
 
 type ListData = ApiResponse<typeof api, "getList">;
 type Item = ListData["items"][number];
@@ -85,30 +96,37 @@ function ffsNameFontSize(totalLength: number): number {
 // characters), still displays in full on a phone-width screen.
 // Titles are NEVER truncated with an ellipsis: the full title
 // always shows, wrapping to a second line if it still needs the
-// room. That includes the Out of Stock section's longer display
-// title, "Out of Stock - Shopping List" (app display only — the
-// sheet section the scans write stays "Out of Stock"): it renders
-// at the same 20px as every other header and wraps beside its
-// "N to get" count rather than stepping down in size.
-// ONE exception (Nov 13, 2026): the Membership Alternatives header
-// appends the household's membership store names to its title
-// ("Membership Alternatives · Costco, Amazon"), so ITS font steps
-// down as the name list grows — see membershipTitleFontSize.
+// room. That includes the Out of Stock section's display title,
+// "Shopping List - N" (app display only — the sheet section the
+// scans write stays "Out of Stock"), N the number of unpurchased
+// items in the section (Alpha 0.99): it renders at the same 20px
+// as every other header, beside the banner's info (ⓘ) button. (It
+// also carried an "N to get" label until Beta 0.01 removed it as
+// redundant with the count in the title.)
+// ONE exception: the Membership Alternatives header appends the
+// NUMBER of the household's memberships to its title ("Membership
+// Alternatives - 2"), so ITS font steps down as the title grows —
+// see membershipTitleFontSize. What each count counts lives
+// behind the small info (ⓘ) button beside the count in the
+// banner: the membership names for Membership Alternatives
+// (Alpha 0.97), the section's item names for Shopping List
+// (Alpha 0.99).
 const GROUP_TITLE_FONT_SIZE = 20;
 
 // The stores the household holds a membership with — alternatives
 // are priced against these (Costco and Amazon; Amazon is treated
-// exactly like Costco). The Membership Alternatives header lists
+// exactly like Costco). The Membership Alternatives banner counts
 // every one of these that appears among the HIT List inventory's
-// usual stores.
+// usual stores, and its ⓘ popup lists them by name.
 const MEMBERSHIP_STORES = ["Costco", "Amazon"];
 
-// The Membership Alternatives header names the household's
-// membership stores, so the title can grow well past the uniform
-// 20px width. Its font steps DOWN as the full title gets longer —
+// The Membership Alternatives title carries the membership count
+// ("Membership Alternatives - 2"), which can push it past the
+// uniform 20px width once the ⓘ button beside the count is
+// counted in. Its font steps DOWN as the full title gets longer —
 // the same shrink-to-fit idea as the locked "Sales by Store"
 // header — so the whole title always fits on one line. The plain
-// title (23 chars, no stores) keeps the uniform 20px.
+// title (23 chars, no count) keeps the uniform 20px.
 function membershipTitleFontSize(totalLength: number): number {
   if (totalLength <= 26) return GROUP_TITLE_FONT_SIZE;
   if (totalLength <= 32) return 17;
@@ -160,6 +178,92 @@ function SectionChevron({ collapsed }: { collapsed: boolean }) {
           strokeLinejoin="round"
         />
       </svg>
+    </span>
+  );
+}
+
+/**
+ * The small, visually quiet info (ⓘ) button that sits beside the
+ * count in a section banner, with its popup listing — names only,
+ * one per line, no heading — what the count counts. Shared by the
+ * Membership Alternatives banner (the household's membership
+ * stores; empty state "No stores") and the Shopping List
+ * banner (the section's unpurchased item names; empty state
+ * "No items"). The popup is anchored to the banner's right edge
+ * and is HOLD-TO-SHOW (Beta 0.04, audit #6): it appears while the
+ * ⓘ is held and fades away within 2 seconds of release; holding
+ * the ⓘ never expands or collapses the section — the banner
+ * title itself does that.
+ */
+function BannerInfoButton({
+  names,
+  emptyText,
+  ariaLabel,
+}: {
+  names: string[];
+  emptyText: string;
+  ariaLabel: string;
+}) {
+  const hold = useHoldInfo();
+
+  return (
+    <span
+      data-hold-info-root=""
+      className="relative inline-flex shrink-0 items-center"
+    >
+      {hold.visible && (
+        <span
+          role="tooltip"
+          className="pointer-events-none absolute top-full right-0 z-50 mt-1 rounded-lg border px-2.5 py-1.5 text-left shadow-lg"
+          style={{
+            backgroundColor: "var(--surface)",
+            color: "var(--text)",
+            borderColor: "var(--border)",
+            fontSize: 13,
+            boxShadow: "0 6px 20px rgba(0,0,0,0.22)",
+            opacity: hold.fading ? 0 : 1,
+            transition: "opacity 0.7s ease",
+          }}
+        >
+          {names.length > 0 ? (
+            names.map((name) => (
+              <span
+                key={name}
+                className="block font-semibold whitespace-nowrap"
+              >
+                {name}
+              </span>
+            ))
+          ) : (
+            <span className="block font-semibold whitespace-nowrap">
+              {emptyText}
+            </span>
+          )}
+        </span>
+      )}
+      <button
+        type="button"
+        aria-label={ariaLabel}
+        {...hold.buttonProps}
+        className="hit24 inline-flex shrink-0 items-center justify-center rounded-full leading-none"
+        style={{
+          width: 18,
+          height: 18,
+          // Overrides the global 2rem button minimum in theme.css
+          // so the button stays small and quiet beside the count.
+          // The visible box stays 18×18; the .hit24 overlay
+          // (theme.css, audit #10) grows the tappable area to
+          // 24×24 without changing the layout.
+          minHeight: 18,
+          padding: 0,
+          fontSize: 13,
+          color: "var(--dim)",
+          backgroundColor: "transparent",
+          ...INFO_BUTTON_STYLE,
+        }}
+      >
+        ⓘ
+      </button>
     </span>
   );
 }
@@ -274,10 +378,21 @@ function ItemRow({
     setSourceCopied(true);
     window.setTimeout(() => setSourceCopied(false), 2000);
   };
+  // One dismissal spec for the row's dropdown menus (Beta 0.04,
+  // audit #6): while the Savings or Source menu is open, a tap
+  // outside this row's content, a scroll, or Escape closes it —
+  // they no longer close only by re-tapping their toggle.
+  const rowMenuRef = useRef<HTMLDivElement | null>(null);
+  useMenuDismiss(savingsOpen || sourceOpen, rowMenuRef, () => {
+    setSavingsOpen(false);
+    setSourceOpen(false);
+    setSourceMenuOpen(false);
+  });
   // Two-step purchase: striking the item off alone changes nothing.
   // While it's struck and unconfirmed, the row grows a −/+ counter
-  // beside the name and a Purchased button beside the price; only
-  // pressing Purchased records the quantity into the inventory.
+  // beside the name and a Purchased button beside the price; tapping
+  // Purchased opens the quantity popup, and only confirming THAT
+  // records the quantity into the inventory.
   const showConfirmControls =
     item.checked && !item.restocked && matchedHit === true;
   return (
@@ -305,7 +420,7 @@ function ItemRow({
       >
         ✓
       </button>
-      <div className="min-w-0 flex-1">
+      <div ref={rowMenuRef} className="min-w-0 flex-1">
         <div className="flex items-start justify-between gap-2">
           <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
             <p
@@ -370,7 +485,7 @@ function ItemRow({
                 </p>
               ) : (
                 <p className="shrink-0 whitespace-nowrap text-xs italic text-[var(--dim)]">
-                  no price yet
+                  No verified price found yet
                 </p>
               )}
               {item.checked && item.restocked && (
@@ -404,26 +519,32 @@ function ItemRow({
               )}
             </div>
             {bracketNote && (membershipNote || savingsDetail) && (
-              <button
-                type="button"
-                aria-expanded={savingsOpen}
-                aria-label={`${savingsOpen ? "Hide" : "Show"} savings details for ${item.item}`}
-                onClick={() => setSavingsOpen((v) => !v)}
-                className="inline-flex items-center gap-[3.45px] rounded-full px-[6.9px] py-[1.725px] text-[10.4px] font-bold"
-                style={{
-                  backgroundColor: "var(--surface-alt)",
-                  color: "var(--accent)",
-                  border: "1px solid var(--border)",
-                  // 15% larger than the 16.5px size this toggle
-                  // previously had — also overrides the global 2rem
-                  // button minimum in theme.css, which would
-                  // otherwise make this small button taller.
-                  minHeight: "19px",
-                }}
-              >
-                Savings
-                <span aria-hidden="true">{savingsOpen ? "▴" : "▾"}</span>
-              </button>
+              <span className="relative inline-flex items-center gap-1">
+                <button
+                  type="button"
+                  aria-expanded={savingsOpen}
+                  aria-label={`${savingsOpen ? "Hide" : "Show"} savings details for ${item.item}`}
+                  onClick={() => setSavingsOpen((v) => !v)}
+                  className="hit24y inline-flex items-center gap-[3.45px] rounded-full px-[6.9px] py-[1.725px] text-[12px] leading-none font-bold"
+                  style={{
+                    backgroundColor: "var(--surface-alt)",
+                    color: "var(--accent)",
+                    border: "1px solid var(--border)",
+                    // 15% larger than the 16.5px size this toggle
+                    // previously had — also overrides the global 2rem
+                    // button minimum in theme.css, which would
+                    // otherwise make this small button taller. The
+                    // text sits at the 12px floor (audit #10) on a
+                    // line-height of 1, so the pill's visual height
+                    // is unchanged; the .hit24y overlay (theme.css)
+                    // grows the tappable height to 24px.
+                    minHeight: "19px",
+                  }}
+                >
+                  Savings
+                  <span aria-hidden="true">{savingsOpen ? "▴" : "▾"}</span>
+                </button>
+              </span>
             )}
             {hasPrice && (
               <button
@@ -434,14 +555,15 @@ function ItemRow({
                   setSourceOpen((v) => !v);
                   setSourceMenuOpen(false);
                 }}
-                className="inline-flex items-center gap-[3.45px] rounded-full px-[6.9px] py-[1.725px] text-[10.4px] font-bold"
+                className="hit24y inline-flex items-center gap-[3.45px] rounded-full px-[6.9px] py-[1.725px] text-[12px] leading-none font-bold"
                 style={{
                   backgroundColor: "var(--surface-alt)",
                   color: "var(--accent)",
                   border: "1px solid var(--border)",
                   // Same size as the Savings toggle (see its
                   // comment): overrides the global 2rem button
-                  // minimum so the toggle stays compact.
+                  // minimum so the toggle stays compact, with the
+                  // same 12px text and 24px tappable height.
                   minHeight: "19px",
                 }}
               >
@@ -690,7 +812,7 @@ function RecipeNeedRow({
               </p>
             ) : (
               <p className="shrink-0 text-xs whitespace-nowrap text-[var(--dim)] italic">
-                no price yet
+                No verified price found yet
               </p>
             )}
             {price?.sourceUrl && (
@@ -776,6 +898,9 @@ function RecipeNeedsSubsection({
   onToggleNeed: (meal: NeedsMeal, entry: NeedsEntry) => void;
 }) {
   const needs = meal.entries.filter((e) => e.status !== "covered");
+  // "To get" (Beta 0.02, audit #2): the needs not yet picked up.
+  // When every need is checked this is 0 and the label below reads
+  // "0 to get" — it never falls back to the full needs count.
   const remaining = needs.filter((e) => !e.checked).length;
   const anyPending = needs.some((e) => e.price?.status === "pending");
   return (
@@ -788,9 +913,7 @@ function RecipeNeedsSubsection({
           <span className="text-xs font-medium text-[var(--dim)]">
             {needs.length === 0
               ? "all ingredients on hand"
-              : remaining > 0
-                ? `${remaining} to get`
-                : `${needs.length} to get`}
+              : `${remaining} to get`}
           </span>
         </p>
         {needs.length > 0 && (
@@ -839,7 +962,6 @@ function RecipeNeedsSubsection({
  * empty, search-only state.
  */
 function RecipeNeedsSection({
-  meals,
   allMeals,
   collapsed,
   search,
@@ -849,7 +971,6 @@ function RecipeNeedsSection({
   onRecheck,
   onToggleNeed,
 }: {
-  meals: NeedsMeal[];
   allMeals: NeedsMeal[];
   collapsed: boolean;
   search: string;
@@ -892,11 +1013,6 @@ function RecipeNeedsSection({
           >
             Recipe Needs
           </span>
-        </span>
-        <span className="shrink-0 text-xs font-medium text-[var(--dim)]">
-          {meals.length > 0
-            ? `${meals.length} ${meals.length === 1 ? "recipe" : "recipes"}`
-            : ""}
         </span>
       </button>
       {!collapsed && (
@@ -1097,7 +1213,6 @@ export function ShoppingTab() {
   const needsSection =
     view === "section" && allNeedsMeals.length > 0 ? (
       <RecipeNeedsSection
-        meals={needsMeals}
         allMeals={allNeedsMeals}
         collapsed={!expandedSections.has("recipe-needs")}
         search={needsSearch}
@@ -1125,15 +1240,22 @@ export function ShoppingTab() {
   // Two-step purchase, like a two-factor check: striking an item off
   // the list changes nothing in the inventory. A struck-off item
   // grows a −/+ quantity counter beside its name and a "Purchased"
-  // button beside its price, right on its row; only pressing
-  // Purchased records a pending +quantity stock adjustment for the
-  // HIT List item it matches. The button then flips to a disabled
-  // "Purchased ✓", and the confirmation survives un-striking and
-  // re-striking the item, so it can't be recorded twice. The sheet
-  // itself is read-only — the auto-scan writes the adjustments to
-  // it later; the app's stock counts include them right away.
+  // button beside its price, right on its row. Tapping Purchased
+  // opens a popup window asking how many were bought (Alpha 0.91):
+  // the quantity starts at the row's counter value — the quantity
+  // the row calls for, or 1 when it was never adjusted — and only
+  // CONFIRMING the popup records a pending +quantity stock
+  // adjustment for the HIT List item it matches. Cancelling the
+  // popup changes nothing. Once confirmed, the button flips to a
+  // disabled "Purchased ✓", and the confirmation survives
+  // un-striking and re-striking the item, so it can't be recorded
+  // twice. The sheet itself is read-only — the auto-scan writes
+  // the adjustments to it later; the app's stock counts include
+  // them right away.
   // (This inventory read also feeds the Membership Alternatives
-  // header's membership-store names — see membershipStores.)
+  // banner's membership count and ⓘ list — see membershipStores.
+  // The Shopping List banner's count and ⓘ list come from the
+  // section's own rows.)
   const hit = useQuery({
     queryKey: ["hit"],
     queryFn: () => api.getHitList({}),
@@ -1142,6 +1264,15 @@ export function ShoppingTab() {
     {},
   );
   const [confirmNote, setConfirmNote] = useState<string | null>(null);
+  // The Purchased quantity popup: the item awaiting confirmation
+  // and the quantity typed/stepped inside the popup.
+  const [purchasePrompt, setPurchasePrompt] = useState<Item | null>(
+    null,
+  );
+  const [promptQty, setPromptQty] = useState(1);
+  // The section banners' ⓘ popups (the Membership Alternatives
+  // membership stores, Alpha 0.97; the Shopping List item names,
+  // Alpha 0.99) are self-contained — see BannerInfoButton.
 
   const hitNameByKey = useMemo(() => {
     const map = new Map<string, string>();
@@ -1152,17 +1283,18 @@ export function ShoppingTab() {
   }, [hit.data]);
 
   const confirmPurchase = useMutation({
-    mutationFn: async (item: Item) =>
+    mutationFn: async (args: { item: Item; quantity: number }) =>
       await api.confirmPurchased({
-        key: item.key,
-        item: item.item,
-        quantity: quantities[item.key] ?? 1,
+        key: args.item.key,
+        item: args.item.item,
+        quantity: args.quantity,
       }),
-    onSuccess: (res, item) => {
+    onSuccess: (res, args) => {
+      const { item } = args;
+      setPurchasePrompt(null);
       if (res.recorded) {
-        const qty = quantities[item.key] ?? 1;
         setConfirmNote(
-          `${item.item} × ${qty} added to the inventory — counts are updated here now and will be written to the sheet on the next auto-scan.`,
+          `${item.item} × ${args.quantity} added to the inventory — counts are updated here now.`,
         );
         setQuantities((prev) => {
           const next = { ...prev };
@@ -1184,6 +1316,18 @@ export function ShoppingTab() {
     onError: () =>
       setConfirmNote("That purchase couldn't be saved. Try again."),
   });
+
+  // Escape closes the quantity popup under the same guard as its
+  // backdrop (Beta 0.04, audit #6): only while nothing is pending.
+  useEffect(() => {
+    if (!purchasePrompt) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !confirmPurchase.isPending)
+        setPurchasePrompt(null);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [purchasePrompt, confirmPurchase.isPending]);
 
   const items = list.data?.items ?? [];
   // "Hide purchased" hides only CONFIRMED purchases (Purchased ✓):
@@ -1236,18 +1380,20 @@ export function ShoppingTab() {
   const storeNameFontSize = Math.max(8, 16 * storeHeaderScale);
   const storeCountFontSize = Math.max(7, 14 * storeHeaderScale);
 
-  // The household's membership stores, named in the Membership
-  // Alternatives header: EVERY membership store represented in
-  // the HIT List inventory — the distinct membership stores
-  // (MEMBERSHIP_STORES) among the inventory items' usual stores,
-  // in canonical order — whether or not an alternative for that
-  // store happens to be on the Shopping List right now. (For this
-  // household: Costco and Amazon, since Amazon items are tracked
-  // in the inventory too.) While the inventory hasn't loaded, or
-  // holds no membership-store items, fall back to the usual
-  // stores of the items sitting in the Membership Alternatives
-  // section, as before. Empty only when neither source names a
-  // store, in which case the header keeps its plain title.
+  // The household's membership stores, counted in the Membership
+  // Alternatives banner ("Membership Alternatives - 2") and
+  // listed by name in the banner's ⓘ popup: EVERY membership
+  // store represented in the HIT List inventory — the distinct
+  // membership stores (MEMBERSHIP_STORES) among the inventory
+  // items' usual stores, in canonical order — whether or not an
+  // alternative for that store happens to be on the Shopping List
+  // right now. (For this household: Costco and Amazon, since
+  // Amazon items are tracked in the inventory too.) While the
+  // inventory hasn't loaded, or holds no membership-store items,
+  // fall back to the usual stores of the items sitting in the
+  // Membership Alternatives section, as before. Empty only when
+  // neither source names a store, in which case the banner shows
+  // a count of 0 and the popup says "No stores".
   const membershipStores = useMemo(() => {
     const inventoryStores = new Set(
       (hit.data?.items ?? []).map((i) => i.store.trim().toLowerCase()),
@@ -1268,24 +1414,34 @@ export function ShoppingTab() {
   const groups = useMemo(() => {
     if (view === "store") {
       const byStore = new Map<string, Item[]>();
+      // Items with no buy-at store yet get their own group at the
+      // end (Beta 0.05, audit #7) instead of vanishing from this
+      // view, so every row appears somewhere and the per-store
+      // counts plus this group sum to the list total.
+      const noStoreItems: Item[] = [];
       for (const item of visible) {
-        // Items with no buy-at store yet aren't shown in the By store
-        // view; they still appear under By section.
-        if (!item.buyAt) continue;
+        if (!item.buyAt) {
+          noStoreItems.push(item);
+          continue;
+        }
         const store = item.buyAt;
         const arr = byStore.get(store) ?? [];
         arr.push(item);
         byStore.set(store, arr);
       }
-      return Array.from(byStore.entries()).map(([title, groupItems]) => {
-        const remaining = groupItems.filter((i) => !i.checked);
+      const storeGroup = (title: string, groupItems: Item[], key: string) => {
+        // "To get" has ONE meaning app-wide (Beta 0.02, audit #2):
+        // unpurchased — not settled via the Purchased confirmation
+        // (restocked), matching the Shopping List banner's count.
+        // A struck-but-not-Purchased row still counts as to get.
+        const remaining = groupItems.filter((i) => !i.restocked);
         return {
-          key: `store:${title}`,
+          key,
           title,
           titleFontSize: null,
           // Plain count only — no descriptive text beside the
           // store name: how many items are still to get at this
-          // store, or the plain item count when all are struck off.
+          // store, or the plain item count when all are purchased.
           countLabel:
             remaining.length > 0
               ? `${remaining.length} to get`
@@ -1293,9 +1449,22 @@ export function ShoppingTab() {
           items: groupItems,
           showStore: false,
           membership: false,
+          infoNames: null as string[] | null,
+          infoEmptyText: "",
+          infoAriaLabel: "",
           collapsible: true,
         };
-      });
+      };
+      const storeGroups = Array.from(byStore.entries()).map(
+        ([title, groupItems]) =>
+          storeGroup(title, groupItems, `store:${title}`),
+      );
+      if (noStoreItems.length > 0) {
+        storeGroups.push(
+          storeGroup("No store yet", noStoreItems, "store:__none__"),
+        );
+      }
+      return storeGroups;
     }
     // By section: group by canonical section (matched by meaning —
     // see canonicalSection), displayed under the current titles.
@@ -1303,33 +1472,68 @@ export function ShoppingTab() {
       const groupItems = visible.filter(
         (i) => canonicalSection(i.section) === def.id,
       );
-      const remaining = groupItems.filter((i) => !i.checked);
-      // The Membership Alternatives title names the household's
-      // membership stores from the HIT List inventory ("Membership
-      // Alternatives · Costco, Amazon") and steps its font down to
-      // fit (membershipTitleFontSize); every other title keeps the
-      // uniform group size (titleFontSize null).
+      // Three banners carry a COUNT in their title, with the
+      // counted names listed in the banner's ⓘ popup
+      // (BannerInfoButton) — the one header spec app-wide
+      // (Beta 0.05, audit #9): the Membership Alternatives title
+      // carries the NUMBER of the household's memberships from
+      // the HIT List inventory ("Membership Alternatives - 2");
+      // the Out of Stock section's title is "Shopping List - N"
+      // (Alpha 0.99) and Low Stock on Sale Now follows the same
+      // shape ("Low Stock on Sale Now - N"), N in both cases the
+      // number of UNPURCHASED items in the section — items not
+      // settled via the Purchased confirmation (restocked). A
+      // merely struck-off row still counts as unpurchased:
+      // striking changes nothing until Purchased is confirmed
+      // (update 92). Each popup lists exactly the items its
+      // number counts, so the number always matches the list.
+      // The Membership Alternatives and Low Stock titles step
+      // their font down to fit (membershipTitleFontSize); the
+      // Shopping List title keeps the uniform group size.
+      const unpurchased =
+        def.id === "out" || def.id === "low"
+          ? groupItems.filter((i) => !i.restocked)
+          : groupItems;
       const title =
         def.id === "out"
-          ? "Out of Stock - Shopping List"
-          : def.id === "membership" && membershipStores.length > 0
-            ? `Membership Alternatives · ${membershipStores.join(", ")}`
-            : def.title;
+          ? `Shopping List - ${unpurchased.length}`
+          : def.id === "low"
+            ? `Low Stock on Sale Now - ${unpurchased.length}`
+            : def.id === "membership"
+              ? `Membership Alternatives - ${membershipStores.length}`
+              : def.title;
       return {
         key: `section:${def.id}`,
         title,
         titleFontSize:
-          def.id === "membership"
+          def.id === "membership" || def.id === "low"
             ? membershipTitleFontSize(title.length)
             : null,
-        // Plain count only, where a count was already part of the
-        // header (Out of Stock); the other sections carried
-        // descriptive text only, so they show no label now.
-        countLabel:
-          def.id === "out" ? `${remaining.length} to get` : null,
+        // No count label on any section header: the Shopping List
+        // section's count lives in its title ("Shopping List - N"),
+        // so the old "N to get" label beside it was redundant and
+        // was removed (Beta 0.01); the other sections carried
+        // descriptive text only, so they show no label either.
+        countLabel: null,
         items: groupItems,
         showStore: true,
         membership: def.id === "membership",
+        infoNames:
+          def.id === "out" || def.id === "low"
+            ? unpurchased.map((i) => i.item)
+            : def.id === "membership"
+              ? membershipStores
+              : null,
+        // The two ⓘ wordings are parallel (Beta 0.05, audit #1):
+        // "Show the items in this section" / "No items" for the
+        // item banners, "Show the stores in this section" /
+        // "No stores" for Membership Alternatives.
+        infoEmptyText:
+          def.id === "membership" ? "No stores" : "No items",
+        infoAriaLabel:
+          def.id === "membership"
+            ? "Show the stores in this section"
+            : "Show the items in this section",
         collapsible: true,
       };
     }).filter((g) => g.items.length > 0);
@@ -1356,6 +1560,9 @@ export function ShoppingTab() {
         items: visible.filter((i) => i.section === title),
         showStore: true,
         membership: false,
+        infoNames: null as string[] | null,
+        infoEmptyText: "",
+        infoAriaLabel: "",
         collapsible: true,
       });
     }
@@ -1506,6 +1713,22 @@ export function ShoppingTab() {
         <p className="mt-2 text-sm text-[var(--dim)]">{confirmNote}</p>
       )}
 
+      {/* "Hide purchased" on with everything purchased (Beta 0.05,
+          audit #7): say so explicitly instead of leaving a blank
+          area where the list was. */}
+      {hidePurchased && items.length > 0 && visible.length === 0 && (
+        <p
+          className="mt-3 rounded-2xl px-4 py-6 text-center text-sm text-[var(--dim)]"
+          style={{
+            backgroundColor: "var(--surface)",
+            border: "1px solid var(--border)",
+          }}
+        >
+          Everything on the list is purchased — nothing left to get.
+          Turn off “Hide purchased” to see the items again.
+        </p>
+      )}
+
       {/* List */}
       {list.isPending ? (
         <p className="py-12 text-center text-sm text-[var(--dim)]">
@@ -1537,27 +1760,39 @@ export function ShoppingTab() {
           return (
           <Fragment key={group.key}>
           <section className="mt-2">
-            {group.membership ? (
-              // Membership Alternatives header: the section title
-              // spans the full width across the top of the box on
-              // one line, naming the household's membership stores
-              // after the title; its font steps down as the name
-              // list grows so the full title always fits (see
-              // membershipTitleFontSize). The whole header is the
-              // collapse toggle.
-              <button
-                type="button"
-                aria-expanded={!isCollapsed}
-                aria-controls={panelId}
-                aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${group.title} section`}
-                onClick={() => toggleSection(group.key)}
-                className="block w-full rounded-xl px-3 py-2 text-left"
+            {group.infoNames !== null ? (
+              // Count banner (Membership Alternatives, the
+              // Shopping List section, and Low Stock on Sale Now):
+              // the section title spans the
+              // top of the box on one line, carrying a COUNT after
+              // the title ("Membership Alternatives - 2",
+              // "Shopping List - 4"); the Membership Alternatives
+              // font steps down as the title grows so it always
+              // fits (see membershipTitleFontSize). The title is
+              // the collapse toggle; beside the count sits a small
+              // info (ⓘ) button whose popup lists what the count
+              // counts, names only — tapping it never toggles the
+              // section.
+              <div
+                className="flex w-full items-center rounded-xl px-3 py-2"
                 style={{
                   backgroundColor: "var(--accent-soft)",
                   border: "2px solid var(--accent)",
                 }}
               >
-                <span className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  aria-expanded={!isCollapsed}
+                  aria-controls={panelId}
+                  aria-label={`${isCollapsed ? "Expand" : "Collapse"} ${group.title} section`}
+                  onClick={() => toggleSection(group.key)}
+                  // -my-2 py-2 (audit #10): the toggle's tappable
+                  // area fills the banner's full height, like the
+                  // whole-banner toggles — the negative margins
+                  // cancel the extra padding in layout, so the
+                  // banner itself doesn't grow.
+                  className="-my-2 flex min-w-0 flex-1 items-center gap-1.5 py-2 text-left"
+                >
                   <SectionChevron collapsed={isCollapsed} />
                   <span
                     className="whitespace-nowrap font-bold text-[var(--text)]"
@@ -1568,8 +1803,18 @@ export function ShoppingTab() {
                   >
                     {group.title}
                   </span>
-                </span>
-              </button>
+                </button>
+                {group.countLabel && (
+                  <span className="mr-2 shrink-0 text-xs font-medium text-[var(--dim)]">
+                    {group.countLabel}
+                  </span>
+                )}
+                <BannerInfoButton
+                  names={group.infoNames}
+                  emptyText={group.infoEmptyText}
+                  ariaLabel={group.infoAriaLabel}
+                />
+              </div>
             ) : group.collapsible ? (
               <button
                 type="button"
@@ -1622,7 +1867,7 @@ export function ShoppingTab() {
             {!isCollapsed && (
             <ul
               id={group.collapsible ? panelId : undefined}
-              className="mt-1.5 divide-y overflow-hidden rounded-2xl"
+              className="mt-1.5 divide-y rounded-2xl"
               style={{
                 backgroundColor: "var(--surface)",
                 border: "1px solid var(--border)",
@@ -1643,15 +1888,18 @@ export function ShoppingTab() {
                   }
                   confirming={
                     confirmPurchase.isPending &&
-                    confirmPurchase.variables?.key === item.key
+                    confirmPurchase.variables?.item.key === item.key
                   }
                   onToggle={(i) => toggle.mutate(i)}
                   onQtyChange={(q) =>
                     setQuantities((prev) => ({ ...prev, [item.key]: q }))
                   }
                   onConfirm={(i) => {
+                    // Tapping Purchased opens the quantity popup;
+                    // nothing is recorded until it is confirmed.
                     setConfirmNote(null);
-                    confirmPurchase.mutate(i);
+                    setPromptQty(quantities[i.key] ?? 1);
+                    setPurchasePrompt(i);
                   }}
                 />
               ))}
@@ -1676,11 +1924,112 @@ export function ShoppingTab() {
         <p className="mt-4 text-center text-xs text-[var(--dim)]">
           Striking an item off here is just for this run — the
           inventory doesn&rsquo;t change until you press Purchased on
-          the item itself. Set how many you got with the −/+ counter
-          beside its name, then tap Purchased beside its price to add
-          them back into the inventory — counts update here right away
-          and reach the sheet on the next auto-scan.
+          the item itself. Tapping Purchased opens a window asking how
+          many you bought; confirming adds them to the inventory right
+          away.
         </p>
+      )}
+
+      {/* Purchased quantity popup (Alpha 0.91): opened by a row's
+          Purchased button. Confirming records the entered quantity
+          into the inventory and completes the row as purchased;
+          cancelling — or tapping the backdrop — changes nothing. */}
+      {purchasePrompt && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
+          onClick={() => {
+            if (!confirmPurchase.isPending) setPurchasePrompt(null);
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`How many ${purchasePrompt.item} did you buy?`}
+            className="w-full max-w-xs rounded-2xl p-4"
+            style={{
+              backgroundColor: "var(--surface)",
+              border: "1px solid var(--border)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <h2 className="text-base font-bold text-[var(--text)]">
+              {purchasePrompt.item}
+            </h2>
+            <p className="mt-1 text-sm text-[var(--dim)]">
+              How many did you buy? Confirming adds them to the
+              inventory and marks this item purchased.
+            </p>
+            <div className="mt-3 flex items-center justify-center gap-2">
+              <button
+                type="button"
+                aria-label="One fewer"
+                disabled={promptQty <= 1 || confirmPurchase.isPending}
+                onClick={() => setPromptQty(Math.max(1, promptQty - 1))}
+                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 font-medium disabled:opacity-40"
+              >
+                −
+              </button>
+              <input
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={999}
+                aria-label={`Quantity of ${purchasePrompt.item} purchased`}
+                value={promptQty}
+                onChange={(e) => {
+                  const n = Math.floor(Number(e.target.value));
+                  setPromptQty(
+                    Number.isFinite(n) ? Math.min(999, Math.max(1, n)) : 1,
+                  );
+                }}
+                className="w-20 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-2 py-1.5 text-center text-base font-semibold tabular-nums text-[var(--text)]"
+              />
+              <button
+                type="button"
+                aria-label="One more"
+                disabled={confirmPurchase.isPending}
+                onClick={() => setPromptQty(Math.min(999, promptQty + 1))}
+                className="rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 font-medium disabled:opacity-40"
+              >
+                +
+              </button>
+            </div>
+            <div className="mt-4 flex gap-2">
+              <button
+                type="button"
+                disabled={confirmPurchase.isPending}
+                onClick={() => setPurchasePrompt(null)}
+                className="flex-1 rounded-full px-3 py-2 text-sm font-bold disabled:opacity-50"
+                style={{
+                  backgroundColor: "var(--surface-alt)",
+                  color: "var(--text)",
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={confirmPurchase.isPending}
+                onClick={() =>
+                  confirmPurchase.mutate({
+                    item: purchasePrompt,
+                    quantity: promptQty,
+                  })
+                }
+                className="flex-1 rounded-full px-3 py-2 text-sm font-bold disabled:opacity-50"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                }}
+              >
+                {confirmPurchase.isPending
+                  ? "Adding…"
+                  : "Confirm purchase"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
