@@ -11,12 +11,14 @@ XAxis,
 YAxis,
 } from "recharts";
 import { fileToBase64 } from "@hatch/space-sdk/client";
+import { PdfViewer } from "@hatch/space-sdk/pdf";
 import { api, type ApiResponse } from "./api";
 import { AccountPolicy, ActorTag } from "./AccountPolicy";
 import {
 GearButton,
 SettingsDrawer,
 SettingsDrawerItem,
+UndoLastActionItem,
 } from "./SettingsDrawer";
 import { INFO_BUTTON_STYLE, useHoldInfo } from "./popupHooks";
 import {
@@ -44,9 +46,9 @@ type BitScan = BitState["scans"][number];
 type BitRequisition = NonNullable<BitState["requisition"]>;
 type RoundSummary = ApiResponse<typeof api, "finishBitRound">;
 
-/** The SOG F-SUPP order sequence for a requisition: Medical
-    supplies first, then Stationery (Office Supplies), then
-    Cleaning supplies (general), then everything else. */
+/** The requisition order sequence: Medical supplies first,
+    then Stationery (Office Supplies), then Cleaning supplies
+    (general), then everything else. */
 function reqCategoryRank(category: string): number {
   const c = category.trim().toLowerCase();
   if (c === "medical") return 0;
@@ -56,11 +58,10 @@ function reqCategoryRank(category: string): number {
   return 3;
 }
 
-/** The tag carried by every TFS inventory item that came from
-    the user's filled requisition form (the third file supplied
-    Nov 14, 2026), set server-side by
-    importBitTfsFilledRequisitionItems. The Requisition tab lists
-    exactly the items carrying it — nothing else. */
+/** The tag carried by every inventory item that came from a
+    filled-in requisition form supplied by the user, set
+    server-side when such a form is imported. The Requisition tab
+    lists exactly the items carrying it — nothing else. */
 const FILLED_REQ_TAG = "Filled requisition form";
 
 /** Word-based search matching for inventory items: every word of
@@ -91,11 +92,192 @@ function bitItemMatchesSearch(
   );
 }
 
-/** The station number from the business name ("TFS station 226
-    Inventory" → "226"), used in the requisition number. */
-function stationNoOf(business: BitBusiness): string {
+/** The short code from the business name (its first 2–4 digit
+    run, or "B" + the business id), used in the requisition
+    number. */
+function reqCodeOf(business: BitBusiness): string {
   const m = business.name.match(/(\d{2,4})/);
-  return m?.[1] ?? "226";
+  return m?.[1] ?? `B${business.id}`;
+}
+
+/**
+ * Render typed initials as a "signature": the lettering is drawn
+ * in the generic cursive (Great Vibes, the .req-signature font)
+ * on a transparent canvas and returned as base64 PNG, which the
+ * server draws into the filled requisition form's signature box. Returns
+ * null when the initials are blank or the drawing fails — the
+ * signature box then stays blank, as before.
+ */
+async function renderSignaturePng(
+  initials: string,
+): Promise<string | null> {
+  const text = initials.trim();
+  if (!text) return null;
+  try {
+    // Wait for the cursive web font so the drawing uses it; if it
+    // can't load, the canvas falls back to the platform cursive.
+    try {
+      await document.fonts.load('80px "Great Vibes"', text);
+    } catch {
+      // Font loading is best-effort — draw with the fallback.
+    }
+    const fontPx = 96;
+    const font = `${fontPx}px "Great Vibes", "Snell Roundhand", cursive`;
+    const measure = document.createElement("canvas").getContext("2d");
+    if (!measure) return null;
+    measure.font = font;
+    const textW = Math.max(1, Math.ceil(measure.measureText(text).width));
+    // Draw on an oversized canvas first: Great Vibes capitals
+    // carry swashes that reach far above and below the em box —
+    // well past a lowercase letter's height — so a canvas sized
+    // to the font size clips them, and a canvas with fixed
+    // padding leaves the capitals' ink filling nearly the whole
+    // image while lowercase ink fills a fraction of it, which is
+    // why capitals loomed too big for the form's signature box
+    // once the server fitted the image into it. Drawing large
+    // and cropping to the actual ink (below) makes the returned
+    // PNG hug the lettering whatever case it is in, so the
+    // server's fit-to-box scaling treats capitals and lowercase
+    // alike.
+    const canvas = document.createElement("canvas");
+    canvas.width = textW + 64;
+    canvas.height = fontPx * 3;
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return null;
+    ctx2d.font = font;
+    ctx2d.textBaseline = "alphabetic";
+    ctx2d.fillStyle = "#191d26";
+    ctx2d.fillText(text, 32, fontPx * 1.9);
+    // Find the ink's bounding box from the drawn pixels.
+    const img = ctx2d.getImageData(0, 0, canvas.width, canvas.height);
+    let minX = canvas.width;
+    let minY = canvas.height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < canvas.height; y++) {
+      for (let x = 0; x < canvas.width; x++) {
+        if ((img.data[(y * canvas.width + x) * 4 + 3] ?? 0) > 8) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < 0) return null;
+    const pad = 6;
+    const sx = Math.max(0, minX - pad);
+    const sy = Math.max(0, minY - pad);
+    const sw = Math.min(canvas.width, maxX + pad + 1) - sx;
+    const sh = Math.min(canvas.height, maxY + pad + 1) - sy;
+    const cropped = document.createElement("canvas");
+    cropped.width = sw;
+    cropped.height = sh;
+    const cctx = cropped.getContext("2d");
+    if (!cctx) return null;
+    cctx.drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+    const dataUrl = cropped.toDataURL("image/png");
+    const comma = dataUrl.indexOf(",");
+    return comma >= 0 ? dataUrl.slice(comma + 1) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The cursive signature preview inside a signature box. Great
+ * Vibes capitals are drawn far taller than its lowercase — at a
+ * fixed font size an all-capitals signature towers out of the
+ * box while a lowercase one sits small. So the preview measures
+ * the lettering's actual ink height (canvas measureText at a
+ * reference size, once the cursive has loaded) and picks the
+ * font size that gives the ink a constant height, whatever case
+ * the initials are typed in — the same normalizing the filled
+ * form's signature gets from renderSignaturePng's ink crop.
+ */
+function SignaturePreview({ text }: { text: string }) {
+  const [fontSize, setFontSize] = useState(20);
+  useEffect(() => {
+    let cancelled = false;
+    const target = 20; // px of actual ink height inside the box
+    const refPx = 100;
+    void (async () => {
+      try {
+        await document.fonts.load(`${refPx}px "Great Vibes"`, text);
+      } catch {
+        // Best-effort — measure with the fallback cursive.
+      }
+      if (cancelled) return;
+      const c = document.createElement("canvas").getContext("2d");
+      if (!c) return;
+      c.font = `${refPx}px "Great Vibes", "Snell Roundhand", cursive`;
+      const m = c.measureText(text);
+      const ink =
+        (m.actualBoundingBoxAscent ?? refPx * 0.7) +
+        (m.actualBoundingBoxDescent ?? refPx * 0.25);
+      if (ink > 0) {
+        const size = Math.round((refPx * target) / ink);
+        if (!cancelled) setFontSize(Math.min(24, Math.max(11, size)));
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [text]);
+  return (
+    <span
+      className="req-signature truncate leading-none"
+      style={{ fontSize }}
+    >
+      {text}
+    </span>
+  );
+}
+
+/** Division is free text the user sets (a division recorded
+    another way — e.g. read off a scanned pre-populated form — is
+    kept exactly as read, never silently lost). */
+function DivisionSelect({
+  value,
+  onChange,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <input
+      value={value}
+      aria-label="Division"
+      onChange={(e) => onChange(e.target.value)}
+      placeholder="Not set yet"
+      className="rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]"
+      style={{
+        borderColor: "var(--border)",
+        backgroundColor: "var(--surface)",
+      }}
+      autoComplete="off"
+    />
+  );
+}
+
+/** Save a base64 PDF to the device or PC as a file download.
+    Returns false when the download couldn't be started. */
+function downloadPdfBase64(base64: string, filename: string): boolean {
+  try {
+    const bytes = Uint8Array.from(atob(base64), (c) => c.charCodeAt(0));
+    const blob = new Blob([bytes], { type: "application/pdf" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Today's requisition number: Fire Station-YY-MM-DD. */
@@ -104,7 +286,7 @@ function reqNoToday(business: BitBusiness): string {
   const yy = String(now.getFullYear()).slice(-2);
   const mm = String(now.getMonth() + 1).padStart(2, "0");
   const dd = String(now.getDate()).padStart(2, "0");
-  return `${stationNoOf(business)}-${yy}-${mm}-${dd}`;
+  return `${reqCodeOf(business)}-${yy}-${mm}-${dd}`;
 }
 
 type BitTab = "rounds" | "inventory" | "order" | "analytics";
@@ -1101,6 +1283,10 @@ function BitSetupWizard({
   // Team-size step (Alpha 0.90): one of the eight bands, or a
   // custom entry typed through Other (stored exactly like a band).
   const [teamSize, setTeamSize] = useState("");
+  // Whether this business orders by requisition (asked on the
+  // Review step): true gives it the Requisition tab with the
+  // preparer / approver flow instead of the Order Email tab.
+  const [usesRequisition, setUsesRequisition] = useState(false);
   const [teamOtherOpen, setTeamOtherOpen] = useState(false);
   const [teamOtherDraft, setTeamOtherDraft] = useState("");
   // Business-type Other entry (Alpha 0.90): a type typed through
@@ -1245,6 +1431,7 @@ function BitSetupWizard({
           bizType === "Other" ? customType.trim() || null : null,
         name: name.trim() || pack.defaultName,
         teamSize: teamSize.trim() ? teamSize.trim() : null,
+        usesRequisition,
         // The business's categories are exactly the ones picked.
         categories: groups,
         // Freezer checks are only for food & beverage businesses.
@@ -1685,6 +1872,12 @@ function BitSetupWizard({
                   ] as [string, string],
                 ]
               : []),
+            [
+              "Orders by requisition",
+              usesRequisition
+                ? "Yes — the Requisition tab with preparer / approver sign-off"
+                : "No — the Order Email tab",
+            ],
           ].map(([label, value]) => (
             <div
               key={label}
@@ -1700,6 +1893,26 @@ function BitSetupWizard({
               <p className="text-base font-semibold">{value}</p>
             </div>
           ))}
+          <label
+            className="flex items-start gap-2 rounded-xl border px-3 py-2 text-sm font-semibold"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={usesRequisition}
+              onChange={(e) => setUsesRequisition(e.target.checked)}
+              className="mt-0.5"
+              aria-label="Order by requisition"
+            />
+            <span>
+              Order by requisition — this business orders stock on a
+              requisition form, signed by a preparer and approved by
+              a different approver, instead of the Order Email tab.
+            </span>
+          </label>
           {/* The chosen type's needs profile (Alpha 0.75): the
               unique inventory needs researched for this kind of
               business, and the features they switch on. */}
@@ -2471,28 +2684,421 @@ function RoundsTab({
   business,
   items,
   rounds,
+  resubmittedLines,
+  draftExtras,
 }: {
   business: BitBusiness;
   items: BitItem[];
   rounds: BitState["rounds"];
+  resubmittedLines: BitState["resubmittedLines"];
+  draftExtras: BitState["draftExtras"];
 }) {
   const queryClient = useQueryClient();
   const [counterName, setCounterName] = useState("");
-  // TFS (the requisition business) counts by shift, not by name
-  // (Alpha 0.80): the round's counter identity is the platoon
+  // A requisition business counts by shift, not by name
+  // (Alpha 0.80): the round's counter identity is the shift
   // letter, defaulting to A. Other businesses keep the name field.
-  const isTfs = business.usesRequisition;
+  const usesRequisition = business.usesRequisition;
   const [shift, setShift] = useState("A");
   const [summaryShift, setSummaryShift] = useState<string | null>(null);
-  const counterMissing = !isTfs && counterName.trim() === "";
+  const counterMissing = !usesRequisition && counterName.trim() === "";
   const [groupFilter, setGroupFilter] = useState("");
   const [counts, setCounts] = useState<Record<number, number>>({});
   const [editing, setEditing] = useState<{ id: number; text: string } | null>(
     null,
   );
   const [remainingOnly, setRemainingOnly] = useState(false);
+  // Item search for the open check: a full-width bar under the
+  // Shift / Category row, above the "Counted …" row. It narrows
+  // the visible items (same word-based matching as the Items tab
+  // search) without touching the check's scope or counts.
+  const [search, setSearch] = useState("");
+  // Voice search for the bar above: the microphone button at the
+  // right end of the search row dictates into the search text via
+  // the browser's speech recognition, where the device offers it.
+  // Listening state + a short note line for "not available here"
+  // and recognition errors; the recognition object itself lives in
+  // a ref so re-renders never restart it.
+  const [listening, setListening] = useState(false);
+  const [voiceNote, setVoiceNote] = useState<string | null>(null);
+  // Microphone pop-up (the activation sequence): tapping the
+  // mic button first checks whether the microphone is allowed
+  // for this site/app, reading the kept-current permission
+  // state (micPermRef below). Allowed → voice search starts,
+  // synchronously in the tap. Not allowed → this pop-up opens:
+  // it says the microphone hasn't been activated yet and shows
+  // how to switch it on in the browser (the website) and in
+  // the phone's app settings (the app). When the user confirms
+  // they've activated it, checkMicAllowed runs again; if the
+  // mic is allowed now, the pop-up closes and voice search
+  // starts.
+  const [micBlockedOpen, setMicBlockedOpen] = useState(false);
+  const [unblockChecking, setUnblockChecking] = useState(false);
+  // Feedback for a confirmation check that still finds the mic
+  // off: without it a failed check changed nothing on screen
+  // (the pop-up was already showing the steps) and read as a
+  // dead button. Set on every failed check while the pop-up is
+  // open; cleared when the pop-up (re)opens or a check passes.
+  const [unblockNote, setUnblockNote] = useState<string | null>(null);
+  const unblockBusyRef = useRef(false);
+  const recognitionRef = useRef<{
+    stop: () => void;
+  } | null>(null);
+  useEffect(
+    () => () => {
+      recognitionRef.current?.stop();
+      recognitionRef.current = null;
+    },
+    [],
+  );
+  // The last known microphone permission state, kept current for
+  // the life of this tab: queried on mount, updated whenever the
+  // browser reports a change, and set outright by a passed
+  // activation check below. The mic button reads it to decide —
+  // synchronously, inside the tap — whether voice search can
+  // start right away or the activation pop-up has to open.
+  // Starting the recognizer has to happen inside the tap handler
+  // itself: browsers that gate speech recognition on a fresh
+  // user gesture (Safari especially) drop the gesture across an
+  // awaited permission query, and the recognizer then never
+  // starts even though the microphone is allowed — the sequence
+  // completes, but the button reads as dead. "unknown" means no
+  // check has answered yet, or this browser has no Permissions
+  // API for the microphone.
+  const micPermRef = useRef<"granted" | "denied" | "prompt" | "unknown">(
+    "unknown",
+  );
+  useEffect(() => {
+    let status: PermissionStatus | null = null;
+    let cancelled = false;
+    const update = () => {
+      if (!status) return;
+      micPermRef.current =
+        status.state === "granted"
+          ? "granted"
+          : status.state === "denied"
+            ? "denied"
+            : "prompt";
+    };
+    navigator.permissions
+      ?.query({ name: "microphone" as PermissionName })
+      .then((s) => {
+        if (cancelled) return;
+        status = s;
+        update();
+        s.addEventListener("change", update);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      status?.removeEventListener("change", update);
+    };
+  }, []);
+  // Stop voice search and clear the listening state right away,
+  // without waiting for the recognizer's end event: some
+  // browsers fire an error (or a stop) without an end, and a
+  // stuck "listening" flag turns the next tap into a no-op stop
+  // instead of a fresh start.
+  function stopRecognition() {
+    const rec = recognitionRef.current;
+    recognitionRef.current = null;
+    if (rec) {
+      try {
+        rec.stop();
+      } catch {
+        // Already stopped — nothing to do.
+      }
+    }
+    setListening(false);
+  }
+  function startRecognition() {
+    const w = window as unknown as {
+      SpeechRecognition?: new () => {
+        lang: string;
+        interimResults: boolean;
+        onresult: ((e: unknown) => void) | null;
+        onerror: ((e: unknown) => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+      webkitSpeechRecognition?: new () => {
+        lang: string;
+        interimResults: boolean;
+        onresult: ((e: unknown) => void) | null;
+        onerror: ((e: unknown) => void) | null;
+        onend: (() => void) | null;
+        start: () => void;
+        stop: () => void;
+      };
+    };
+    const Ctor = w.SpeechRecognition ?? w.webkitSpeechRecognition;
+    if (!Ctor) {
+      setVoiceNote(
+        "Voice search isn't available in this browser — type to search instead.",
+      );
+      return;
+    }
+    setVoiceNote(null);
+    // Clear out any earlier session that never reported its end
+    // (some webviews drop the end event): a stale recognizer left
+    // in the ref makes the fresh start below throw or no-op, and
+    // the button reads as dead.
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.stop();
+      } catch {
+        // Already stopped — nothing to do.
+      }
+      recognitionRef.current = null;
+    }
+    const rec = new Ctor();
+    rec.lang = "en-CA";
+    rec.interimResults = false;
+    rec.onresult = (e: unknown) => {
+      const ev = e as {
+        results: ArrayLike<ArrayLike<{ transcript: string }>>;
+      };
+      const first = ev.results[0]?.[0];
+      if (first?.transcript) setSearch(first.transcript.trim());
+    };
+    rec.onerror = (e: unknown) => {
+      const code = (e as { error?: string }).error;
+      // Clear the listening state here, not only in onend: some
+      // browsers fire the error without an end event, and a stuck
+      // "listening" flag turns the next tap into a no-op stop
+      // instead of a fresh start.
+      setListening(false);
+      if (code === "not-allowed") {
+        // The microphone itself isn't allowed: the activation
+        // pop-up takes over from the old one-line note.
+        setVoiceNote(null);
+        setUnblockNote(null);
+        setMicBlockedOpen(true);
+      } else if (code === "service-not-allowed") {
+        // The browser refused the speech-recognition service
+        // itself, which is a different problem from the
+        // microphone permission. If the mic is in fact allowed,
+        // this view can't run voice recognition at all (common
+        // inside an embedded app panel) — say so plainly instead
+        // of looping back into the activation pop-up, whose
+        // steps can't fix it. If the mic isn't allowed, the
+        // pop-up is the right next step after all.
+        void checkMicAllowed().then((allowed) => {
+          if (allowed === true) {
+            micPermRef.current = "granted";
+            setVoiceNote(
+              "Voice recognition isn't available in this view, even though the microphone is allowed. Open the app in a full browser tab to use voice search — typing works here.",
+            );
+          } else {
+            setVoiceNote(null);
+            setUnblockNote(null);
+            setMicBlockedOpen(true);
+          }
+        });
+      } else if (code === "audio-capture") {
+        setVoiceNote(
+          "No microphone could be reached — check the device microphone and try again.",
+        );
+      } else if (code === "aborted") {
+        // The session was ended on purpose (a stop tap): not an
+        // error, so no note.
+        setVoiceNote(null);
+      } else {
+        setVoiceNote(
+          "Voice search didn't catch that — try again or type instead.",
+        );
+      }
+    };
+    rec.onend = () => {
+      recognitionRef.current = null;
+      setListening(false);
+    };
+    recognitionRef.current = rec;
+    try {
+      rec.start();
+      setListening(true);
+    } catch {
+      recognitionRef.current = null;
+      setVoiceNote("Voice search couldn't start — type to search instead.");
+    }
+  }
+  // The one microphone check, run by the pop-up's confirm
+  // button (and by the recognizer's service-refusal branch):
+  // read the saved microphone permission for this site/app.
+  // "granted" means activated; "denied" and "prompt" both mean
+  // it hasn't been activated yet. Returns null where the
+  // browser offers no Permissions API — there the recognition
+  // attempt itself is the check (it prompts, or reports the
+  // block through its error handler). The mic button itself
+  // doesn't await this: it reads the kept-current state in
+  // micPermRef, which this same query feeds on mount and on
+  // every permission change.
+  async function checkMicAllowed(): Promise<boolean | null> {
+    try {
+      const status = await navigator.permissions?.query({
+        name: "microphone" as PermissionName,
+      });
+      if (!status) return null;
+      return status.state === "granted";
+    } catch {
+      return null;
+    }
+  }
+  function toggleVoiceSearch() {
+    if (listening) {
+      stopRecognition();
+      return;
+    }
+    // Step 1 of the sequence: is the microphone allowed? The
+    // answer comes from the permission state this tab keeps
+    // current (micPermRef — checked on mount, on every browser
+    // permission change, and by the pop-up's confirm check), so
+    // the decision, and the recognition start when allowed,
+    // happen synchronously inside this tap. The previous flow
+    // awaited a fresh permission query between the tap and the
+    // start; on gesture-gated browsers (Safari especially) the
+    // tap's activation doesn't survive that await, so the
+    // recognizer never started even with the microphone
+    // allowed — the sequence completed and the button did
+    // nothing.
+    const perm = micPermRef.current;
+    if (perm === "granted" || perm === "unknown") {
+      // Allowed — we're good: start voice search. "unknown"
+      // covers browsers with no Permissions API for the
+      // microphone (and the first instant before the mount
+      // check answers): there the recognition attempt itself
+      // is the check — it prompts, or reports the block
+      // through its error handler, which opens the pop-up.
+      startRecognition();
+      return;
+    }
+    // "denied" or "prompt": the microphone hasn't been
+    // activated yet — cue the pop-up with the activation steps
+    // instead of starting a recognition attempt that can only
+    // fail the same way.
+    setUnblockNote(null);
+    setMicBlockedOpen(true);
+  }
+  // The pop-up's confirm button ("I've activated it — check
+  // again"): the user says they've switched the microphone on,
+  // so run the same check as the initial one again. If the mic
+  // is allowed now, close the pop-up and start voice search.
+  // The saved permission can lag behind a change made in the
+  // phone's Settings app, so a "not yet" answer to an explicit
+  // confirm gets one live probe — asking the browser for the
+  // microphone itself (which also surfaces the browser's own
+  // Allow prompt where one is pending) — before the pop-up
+  // reports back. The probe is raced against a timeout: in
+  // some embedded browsers it neither resolves nor rejects,
+  // which would leave the button stuck on "Checking…" forever.
+  // The quiet variant (the pop-up's automatic re-check when
+  // the user returns to the page) runs only the permission
+  // check — no probe, so returning never springs a prompt —
+  // and stays silent when the mic is still off.
+  async function confirmMicActivated(opts?: { quiet?: boolean }) {
+    if (unblockBusyRef.current) return;
+    unblockBusyRef.current = true;
+    setUnblockChecking(true);
+    let granted = (await checkMicAllowed()) === true;
+    let noAnswer = false;
+    if (!granted && !opts?.quiet) {
+      try {
+        const md = navigator.mediaDevices;
+        if (md?.getUserMedia) {
+          let timedOut = false;
+          const request = md.getUserMedia({ audio: true });
+          // If the request only answers after the timeout below,
+          // stop its tracks so the microphone isn't left running.
+          request.then(
+            (s) => {
+              if (timedOut) s.getTracks().forEach((t) => t.stop());
+            },
+            () => {},
+          );
+          const stream = await Promise.race([
+            request.catch(() => null),
+            new Promise<null>((resolve) =>
+              setTimeout(() => {
+                timedOut = true;
+                resolve(null);
+              }, 10000),
+            ),
+          ]);
+          if (stream) {
+            stream.getTracks().forEach((t) => t.stop());
+            granted = true;
+          } else if (timedOut) {
+            noAnswer = true;
+          }
+        }
+      } catch {
+        granted = false;
+      }
+    }
+    unblockBusyRef.current = false;
+    setUnblockChecking(false);
+    if (granted) {
+      // Record the pass in the kept-current state, so the mic
+      // button's next tap starts recognition synchronously
+      // instead of re-checking.
+      micPermRef.current = "granted";
+      setUnblockNote(null);
+      setMicBlockedOpen(false);
+      startRecognition();
+    } else if (!opts?.quiet) {
+      setUnblockNote(
+        noAnswer
+          ? "The browser didn't answer the microphone request. If this app is open inside another app's panel, open it in a full browser tab instead, then tap the button again."
+          : "Still not activated — checked just now. Work through the steps above once more, then tap the button again. If you set Microphone to Allow and it still says this, tap Reload the app below: browsers often apply a changed setting only to a freshly loaded page.",
+      );
+    }
+  }
+  const confirmMicRef = useRef(confirmMicActivated);
+  useEffect(() => {
+    confirmMicRef.current = confirmMicActivated;
+  });
+  // While the pop-up is open, re-run the same check quietly on
+  // its own when the user returns to the page (e.g. back from
+  // the browser's or phone's settings) or when the browser
+  // reports the microphone permission changed — if the mic is
+  // allowed now, the pop-up closes and voice search starts
+  // without another tap.
+  useEffect(() => {
+    if (!micBlockedOpen) return;
+    const recheck = () => {
+      if (document.visibilityState === "visible") {
+        void confirmMicRef.current({ quiet: true });
+      }
+    };
+    document.addEventListener("visibilitychange", recheck);
+    let permStatus: PermissionStatus | null = null;
+    let cancelled = false;
+    navigator.permissions
+      ?.query({ name: "microphone" as PermissionName })
+      .then((s) => {
+        if (cancelled) return;
+        permStatus = s;
+        s.addEventListener("change", recheck);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", recheck);
+      permStatus?.removeEventListener("change", recheck);
+    };
+  }, [micBlockedOpen]);
   const [temps, setTemps] = useState<Record<string, string>>({});
   const [summary, setSummary] = useState<RoundSummary | null>(null);
+  // Requisition review pop-up (the submission flow): for a requisition
+  // requisition business, the moment a check finishes, the draft
+  // it produced (everything now at or below par) opens as the
+  // filled requisition form for review; approving saves the form and
+  // records the requisition as sent.
+  const [reviewLines, setReviewLines] = useState<ReqBuildLine[] | null>(
+    null,
+  );
+  const [reviewMsg, setReviewMsg] = useState<string | null>(null);
   // Alpha 0.83: which summary item (if any) has its blind recount
   // open. While set, that item's book and first counted values are
   // masked everywhere on the summary so the recount stays blind.
@@ -2501,6 +3107,37 @@ function RoundsTab({
   >(null);
   const [finishError, setFinishError] = useState<string | null>(null);
   const [showTrends, setShowTrends] = useState(false);
+  // Inventory Checks collapsibles: every category group in the
+  // check (Medical Supplies, First Aid, Office Supplies, etc.),
+  // the weekly cycle-count panel, the freezer check, the recent
+  // checks list and the Finish summary's par groups all start
+  // COLLAPSED when the app is launched — empty sets / false by
+  // default, view-only state that never affects counting.
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(
+    new Set(),
+  );
+  const [summaryExpanded, setSummaryExpanded] = useState<Set<string>>(
+    new Set(),
+  );
+  const [weeklyOpen, setWeeklyOpen] = useState(false);
+  const [freezerOpen, setFreezerOpen] = useState(false);
+  const [recentOpen, setRecentOpen] = useState(false);
+  function toggleCheckGroup(category: string) {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+  }
+  function toggleSummaryGroup(category: string) {
+    setSummaryExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(category)) next.delete(category);
+      else next.add(category);
+      return next;
+    });
+  }
   // Cycle-count scheduling (Alpha 0.85): the server's "This
   // week's count" proposal (getBitWeeklyCount), and — once the
   // counter starts it — the exact proposed item set the open
@@ -2538,18 +3175,22 @@ function RoundsTab({
       ? groupItems.filter((it) => groupOf(it) === groupFilter)
       : groupItems;
   const countedCount = scope.filter((it) => counts[it.id] != null).length;
-  const visible = remainingOnly
-    ? scope.filter((it) => counts[it.id] == null)
-    : scope;
+  const searching = search.trim().length > 0;
+  const visible = scope.filter(
+    (it) =>
+      (!remainingOnly || counts[it.id] == null) &&
+      (!searching || bitItemMatchesSearch(search, it.name, it.sku)),
+  );
   const groups = groupByCategory(visible);
 
   const finish = useMutation({
     mutationFn: async () =>
       await api.finishBitRound({
         businessId: business.id,
-        // TFS rounds store the shift letter as the counter
-        // identity; every other business stores the counter's name.
-        counterName: isTfs ? shift : counterName.trim(),
+        // Requisition-business rounds store the shift letter as the
+        // counter identity; every other business stores the
+        // counter's name.
+        counterName: usesRequisition ? shift : counterName.trim(),
         // The filter names one of the business's categories; the
         // server scopes the check to that category. A weekly
         // cycle-count check (Alpha 0.85) instead sends its exact
@@ -2576,7 +3217,7 @@ function RoundsTab({
       }),
     onSuccess: (res) => {
       setSummary(res);
-      setSummaryShift(isTfs ? shift : null);
+      setSummaryShift(usesRequisition ? shift : null);
       setRecountOpenItemId(null);
       setCounts({});
       setTemps({});
@@ -2584,6 +3225,26 @@ function RoundsTab({
       // A finished weekly check clears the weekly scope; the
       // snapshots it just wrote move the proposal forward.
       setWeeklyIds(null);
+      // The requisition review pop-up opens the moment the check
+      // finishes: the counts just written back decide the draft
+      // (counted items at their new on-hand, everything else as
+      // it stands), built exactly the way the Requisition tab
+      // builds it. No draft — nothing at or below par — no pop-up.
+      if (usesRequisition) {
+        const countedById = new Map(
+          res.countedItems.map((ci) => [ci.itemId, ci.counted]),
+        );
+        const effective = items.map((it) => {
+          const counted = countedById.get(it.id);
+          return counted != null ? { ...it, onHand: counted } : it;
+        });
+        const lines = buildReqAutoLines(
+          effective,
+          resubmittedLines,
+          draftExtras,
+        ).filter((l) => l.qty >= 1);
+        if (lines.length > 0) setReviewLines(lines);
+      }
       void queryClient.invalidateQueries({ queryKey: ["bit"] });
       void queryClient.invalidateQueries({ queryKey: ["bit-weekly"] });
     },
@@ -2723,15 +3384,27 @@ function RoundsTab({
             backgroundColor: "var(--surface)",
           }}
         >
-          <div className="flex flex-wrap items-baseline justify-between gap-2">
-            <h3 className="text-base font-bold">This week's count</h3>
-            {weekly.data && weekly.data.due.length > 0 && (
-              <span className="text-sm font-bold">
-                {weekly.data.due.length} due
-              </span>
-            )}
-          </div>
-          <p className="mt-0.5 text-xs text-[var(--dim)]">
+          <button
+            type="button"
+            aria-expanded={weeklyOpen}
+            aria-label="This week's count"
+            onClick={() => setWeeklyOpen((v) => !v)}
+            className="flex w-full items-center gap-2 text-left"
+          >
+            <Chevron collapsed={!weeklyOpen} />
+            <span className="min-w-0 flex-1 text-base font-bold">
+              This week's count
+              {weekly.data && weekly.data.due.length > 0
+                ? ` - ${weekly.data.due.length} due`
+                : ""}
+            </span>
+            <span className="shrink-0 text-xs font-bold text-[var(--dim)]">
+              {weeklyOpen ? "Hide" : "Show"}
+            </span>
+          </button>
+          {weeklyOpen && (
+            <>
+          <p className="mt-1 text-xs text-[var(--dim)]">
             Cycle counting: busy or problem items (A) are due
             weekly, items with some activity (B) every 4 weeks,
             and quiet items (C) every 12 weeks — so a big
@@ -2800,10 +3473,13 @@ function RoundsTab({
                   setSummaryShift(null);
                   setRemainingOnly(false);
                   setFinishError(null);
+                  setWeeklyOpen(false);
                 }}
               >
                 Start this week's count
               </button>
+            </>
+          )}
             </>
           )}
         </div>
@@ -2939,14 +3615,27 @@ function RoundsTab({
                 build when a count lands at or below it. Set them here,
                 with the real counts in front of you.
               </p>
-              {countedGroups.map((g) => (
+              {countedGroups.map((g) => {
+                const isOpen = summaryExpanded.has(g.category);
+                return (
                 <div key={g.category} className="mt-2">
-                  <p
-                    className="text-xs font-bold tracking-wide"
-                    style={{ color: "var(--accent)" }}
+                  <button
+                    type="button"
+                    aria-expanded={isOpen}
+                    aria-label={g.category}
+                    onClick={() => toggleSummaryGroup(g.category)}
+                    className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left"
+                    style={{ backgroundColor: "var(--accent-soft)" }}
                   >
-                    {g.category}
-                  </p>
+                    <Chevron collapsed={!isOpen} />
+                    <span
+                      className="min-w-0 flex-1 truncate text-xs font-bold tracking-wide"
+                      style={{ color: "var(--accent)" }}
+                    >
+                      {g.category} - {g.items.length}
+                    </span>
+                  </button>
+                  {isOpen && (
                   <div className="flex flex-col">
                     {g.items.map((ci) => {
                       // Alpha 0.83: while this item's blind recount
@@ -2983,8 +3672,10 @@ function RoundsTab({
                       );
                     })}
                   </div>
+                  )}
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
           {summary.belowPar.length > 0 && (
@@ -3023,6 +3714,28 @@ function RoundsTab({
           </button>
         </div>
       )}
+      {reviewMsg && (
+        <p className="text-sm font-semibold" role="status">
+          {reviewMsg}
+        </p>
+      )}
+      {reviewLines && (
+        <ReqFormReviewPopup
+          business={business}
+          lines={reviewLines}
+          onClose={() => setReviewLines(null)}
+          onApproved={(reqNo) => {
+            setReviewLines(null);
+            setReviewMsg(
+              `Requisition ${reqNo} approved — the filled form is saved. Download it any time with the Requisition tab's “Download PDF” button.`,
+            );
+            void queryClient.invalidateQueries({ queryKey: ["bit"] });
+            void queryClient.invalidateQueries({
+              queryKey: ["bit-req-saved-form", business.id],
+            });
+          }}
+        />
+      )}
 
       <div
         className="rounded-xl border p-3"
@@ -3057,7 +3770,7 @@ function RoundsTab({
           </div>
         )}
         <div className="grid gap-2 sm:grid-cols-2">
-          {isTfs ? (
+          {usesRequisition ? (
             <div className="flex flex-col gap-0.5">
               <span className="text-xs font-semibold text-[var(--dim)]">
                 Shift
@@ -3127,6 +3840,228 @@ function RoundsTab({
             </select>
           </label>
         </div>
+        {/* Search row: the bar and the microphone button together
+            fill the whole row, under the Shift / Category row and
+            above the "Counted …" row. Typing narrows the items
+            below to matches (name or Material #); the category
+            groups auto-open while searching so matches are visible
+            without tapping each one. The microphone button at the
+            right end dictates into the same search text. */}
+        <div className="mt-2 flex w-full items-stretch gap-2">
+          <input
+            type="search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Search items in this check…"
+            aria-label="Search items in this check"
+            className="min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+          />
+          <button
+            type="button"
+            onClick={toggleVoiceSearch}
+            aria-label={
+              listening ? "Stop voice search" : "Search by voice"
+            }
+            aria-pressed={listening}
+            title={listening ? "Stop voice search" : "Search by voice"}
+            className="flex shrink-0 items-center justify-center rounded-lg border px-3"
+            style={{
+              borderColor: listening
+                ? "var(--red)"
+                : "var(--border)",
+              backgroundColor: listening
+                ? "var(--red-soft)"
+                : "var(--surface)",
+              color: listening ? "var(--red)" : "var(--dim)",
+            }}
+          >
+            <svg
+              viewBox="0 0 24 24"
+              width="20"
+              height="20"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="9" y="2" width="6" height="12" rx="3" />
+              <path d="M5 10a7 7 0 0 0 14 0" />
+              <line x1="12" y1="19" x2="12" y2="22" />
+            </svg>
+          </button>
+        </div>
+        {listening && (
+          <p className="mt-1 text-xs font-semibold text-[var(--red)]">
+            Listening… speak the item name, or tap the microphone
+            again to stop.
+          </p>
+        )}
+        {voiceNote && (
+          <p className="mt-1 text-xs font-semibold text-[var(--dim)]">
+            {voiceNote}
+          </p>
+        )}
+        {/* Microphone activation pop-up: cued by the mic button
+            whenever the pre-check finds the microphone isn't
+            allowed yet. It says the microphone hasn't been
+            activated yet and shows how to switch it on in the
+            browser (the website) and in the phone's app settings
+            (the app). The confirm button re-runs the same check
+            as the mic button's initial one; if the mic is
+            allowed now the pop-up closes and voice search
+            starts, and if it still isn't, the pop-up says so
+            (never a silent no-op). While it's open the check
+            also re-runs quietly when the user returns to the
+            page, and Reload the app covers browsers that only
+            apply a changed site setting to a freshly loaded
+            page. */}
+        {micBlockedOpen && (
+          <div
+            className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
+            style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
+            onClick={() => setMicBlockedOpen(false)}
+          >
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-label="Microphone hasn't been activated yet"
+              className="max-h-[85vh] w-full max-w-md overflow-y-auto rounded-2xl border p-4"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface)",
+              }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <h3 className="flex items-center gap-2 text-base font-bold">
+                <svg
+                  viewBox="0 0 24 24"
+                  width="20"
+                  height="20"
+                  fill="none"
+                  stroke="var(--red)"
+                  strokeWidth="2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  aria-hidden="true"
+                >
+                  <rect x="9" y="2" width="6" height="12" rx="3" />
+                  <path d="M5 10a7 7 0 0 0 14 0" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                  <line x1="3" y1="3" x2="21" y2="21" />
+                </svg>
+                Microphone hasn&apos;t been activated yet
+              </h3>
+              <p className="mt-1 text-sm text-[var(--dim)]">
+                Voice search needs the microphone, and it
+                isn&apos;t switched on for this app yet. Here&apos;s
+                how to activate it — on the website and in the
+                app. Once you&apos;ve switched it on, tap the
+                confirm button below and the app will check again.
+              </p>
+              <p className="mt-3 text-sm font-bold">
+                On the website (in your browser)
+              </p>
+              <ol className="mt-1 list-decimal space-y-1.5 pl-5 text-sm">
+                <li>
+                  Tap the tune (sliders) or padlock icon at the
+                  left of the address bar.
+                </li>
+                <li>
+                  Open <strong>Site settings</strong>.
+                </li>
+                <li>
+                  Set <strong>Microphone</strong> to{" "}
+                  <strong>Allow</strong>.
+                </li>
+              </ol>
+              <p className="mt-3 text-sm font-bold">
+                In the app (your phone&apos;s settings)
+              </p>
+              <ol className="mt-1 list-decimal space-y-1.5 pl-5 text-sm">
+                <li>
+                  Open your phone&apos;s <strong>Settings</strong>{" "}
+                  app.
+                </li>
+                <li>
+                  Tap <strong>Apps</strong>, then the app you
+                  opened HitBit in — your browser, or the app whose
+                  window you&apos;re reading this in. On iPhone,
+                  scroll to that app in Settings instead.
+                </li>
+                <li>
+                  Tap <strong>Permissions</strong> →{" "}
+                  <strong>Microphone</strong> →{" "}
+                  <strong>Allow</strong>. On iPhone, turn the{" "}
+                  <strong>Microphone</strong> switch on.
+                </li>
+                <li>
+                  Come back here and tap the confirm button below.
+                </li>
+              </ol>
+              <p className="mt-2 text-sm text-[var(--dim)]">
+                If this app is open inside another app&apos;s panel
+                rather than a full browser tab, open it in the
+                browser first — an embedded panel can block the mic
+                on its own. Typing in the search bar works either
+                way.
+              </p>
+              {unblockNote && (
+                <p
+                  role="status"
+                  className="mt-2 text-sm font-semibold"
+                  style={{ color: "var(--red)" }}
+                >
+                  {unblockNote}
+                </p>
+              )}
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="mt-3 w-full rounded-lg border px-3 py-2 text-sm font-bold"
+                style={{
+                  borderColor: "var(--border)",
+                  color: "var(--dim)",
+                }}
+              >
+                Reload the app
+              </button>
+              <div className="mt-3 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMicBlockedOpen(false)}
+                  className="flex-1 rounded-lg border px-3 py-2 text-sm font-bold"
+                  style={{
+                    borderColor: "var(--border)",
+                    color: "var(--dim)",
+                  }}
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void confirmMicActivated()}
+                  disabled={unblockChecking}
+                  className="flex-1 rounded-lg px-3 py-2 text-sm font-bold"
+                  style={{
+                    backgroundColor: "var(--accent)",
+                    color: "var(--accent-text)",
+                    opacity: unblockChecking ? 0.6 : 1,
+                  }}
+                >
+                  {unblockChecking
+                    ? "Checking…"
+                    : "I've activated it — check again"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="mt-3 flex items-center justify-between gap-2">
           <p className="text-sm font-bold">
             Counted {countedCount} of {scope.length}
@@ -3171,12 +4106,33 @@ function RoundsTab({
         </p>
       </div>
 
-      {groups.map((g) => (
+      {searching && visible.length === 0 && (
+        <p className="text-sm font-semibold text-[var(--dim)]">
+          No items in this check match “{search.trim()}”.
+        </p>
+      )}
+
+      {groups.map((g) => {
+        // While searching, groups open automatically so matches
+        // show without tapping each category header.
+        const isOpen = searching || expandedGroups.has(g.category);
+        const countedInGroup = g.items.filter(
+          (it) => counts[it.id] != null,
+        ).length;
+        return (
         <section key={g.category} aria-label={g.category}>
-          <h3
-            className="flex items-center gap-2 rounded-lg px-2 py-1 text-sm font-bold"
-            style={{ backgroundColor: "var(--accent-soft)" }}
+          <button
+            type="button"
+            aria-expanded={isOpen}
+            aria-label={g.category}
+            onClick={() => toggleCheckGroup(g.category)}
+            className="flex w-full items-center gap-2 rounded-lg border-2 px-2 py-2 text-left text-sm font-bold"
+            style={{
+              backgroundColor: "var(--accent-soft)",
+              borderColor: "var(--accent)",
+            }}
           >
+            <Chevron collapsed={!isOpen} />
             <span
               aria-hidden="true"
               className="h-3 w-3 shrink-0 rounded-full"
@@ -3184,8 +4140,16 @@ function RoundsTab({
                 backgroundColor: catColor(business.colors, g.category),
               }}
             />
-            {g.category}
-          </h3>
+            <span className="min-w-0 flex-1 truncate">
+              {g.category} - {g.items.length}
+            </span>
+            {countedInGroup > 0 && (
+              <span className="shrink-0 text-xs font-bold text-[var(--dim)]">
+                {countedInGroup} counted
+              </span>
+            )}
+          </button>
+          {isOpen && (
           <div className="mt-1 flex flex-col gap-1">
             {g.items.map((it) => {
               const counted = counts[it.id];
@@ -3292,8 +4256,10 @@ function RoundsTab({
               );
             })}
           </div>
+          )}
         </section>
-      ))}
+        );
+      })}
       {visible.length === 0 && (
         <p className="py-4 text-center text-sm text-[var(--dim)]">
           {remainingOnly && scope.length > 0
@@ -3311,8 +4277,24 @@ function RoundsTab({
             backgroundColor: "var(--surface)",
           }}
         >
-          <h3 className="text-base font-bold">Freezer check</h3>
-          <p className="text-xs text-[var(--dim)]">
+          <button
+            type="button"
+            aria-expanded={freezerOpen}
+            aria-label="Freezer check"
+            onClick={() => setFreezerOpen((v) => !v)}
+            className="flex w-full items-center gap-2 text-left"
+          >
+            <Chevron collapsed={!freezerOpen} />
+            <span className="min-w-0 flex-1 text-base font-bold">
+              Freezer check
+            </span>
+            <span className="shrink-0 text-xs font-bold text-[var(--dim)]">
+              {freezerOpen ? "Hide" : "Show"}
+            </span>
+          </button>
+          {freezerOpen && (
+            <>
+          <p className="mt-1 text-xs text-[var(--dim)]">
             Record each freezer's temperature during this check. Anything
             warmer than −18°C is flagged as a food-safety alert in the
             check summary and the order email. Freezers run below zero —
@@ -3398,6 +4380,8 @@ function RoundsTab({
               );
             })}
           </div>
+            </>
+          )}
         </section>
       )}
 
@@ -3429,17 +4413,33 @@ function RoundsTab({
 
       {rounds.length > 0 && (
         <section aria-label="Recent inventory checks" className="mt-2">
-          <h3 className="text-base font-bold">Recent inventory checks</h3>
+          <button
+            type="button"
+            aria-expanded={recentOpen}
+            aria-label="Recent inventory checks"
+            onClick={() => setRecentOpen((v) => !v)}
+            className="flex w-full items-center gap-2 rounded-lg px-2 py-2 text-left"
+            style={{ backgroundColor: "var(--accent-soft)" }}
+          >
+            <Chevron collapsed={!recentOpen} />
+            <span className="min-w-0 flex-1 text-base font-bold">
+              Recent inventory checks - {rounds.length}
+            </span>
+            <span className="shrink-0 text-xs font-bold text-[var(--dim)]">
+              {recentOpen ? "Hide" : "Show"}
+            </span>
+          </button>
+          {recentOpen && (
           <div className="mt-1 flex flex-col gap-1">
             {rounds.map((r) => {
               const alerts = isFoodBusiness
                 ? r.freezerReadings.filter((f) => f.alert)
                 : [];
-              // TFS rounds store the shift letter as the counter
+              // Requisition-business rounds store the shift letter as the counter
               // identity and read "Shift A"; anything else stored
               // (a name) shows as-is.
               const counterLabel =
-                isTfs && /^[A-D]$/.test(r.counterName)
+                usesRequisition && /^[A-D]$/.test(r.counterName)
                   ? `Shift ${r.counterName}`
                   : r.counterName;
               return (
@@ -3472,6 +4472,7 @@ function RoundsTab({
               );
             })}
           </div>
+          )}
         </section>
       )}
     </div>
@@ -3797,10 +4798,6 @@ function PosPanel({
     },
     onError: () => setTestMsg("That sale couldn't be applied. Try again."),
   });
-  const undoTx = useMutation({
-    mutationFn: async (id: number) => await api.undoBitPosTransaction({ id }),
-    onSuccess: () => invalidatePos(),
-  });
   const matchTx = useMutation({
     mutationFn: async (vars: { id: number; itemId: number }) =>
       await api.matchBitPosUnmatched(vars),
@@ -3878,7 +4875,7 @@ function PosPanel({
     locationId: "",
     notes: "",
   });
-  // Backdrop guard (Beta 0.04, audit #6 — Derek approved: "a
+  // Backdrop guard (Beta 0.04, audit #6 — approved in review: "a
   // backdrop tap can never discard typed input"). The Custom POS
   // popup holds typed form input, so while any field differs from
   // its untouched state the popup counts as holding unsaved input
@@ -4779,21 +5776,9 @@ function PosPanel({
                     Below par
                   </span>
                 )}
-                {tx.undone ? (
+                {tx.undone && (
                   <span className="font-semibold text-[var(--dim)]">Undone</span>
-                ) : tx.permanent ? (
-                  <span className="font-semibold text-[var(--dim)]">Permanent</span>
-                ) : tx.canUndo ? (
-                  <button
-                    type="button"
-                    aria-label={`Undo sale of ${tx.itemName ?? tx.posRef}`}
-                    className={plainBtn}
-                    disabled={undoTx.isPending}
-                    onClick={() => undoTx.mutate(tx.id)}
-                  >
-                    Undo
-                  </button>
-                ) : null}
+                )}
               </li>
             ))}
           </ul>
@@ -4993,26 +5978,6 @@ function WasteLogPanel({
     },
   });
 
-  // Undo coverage (audit #5): an entry's Undo restores the stock
-  // it deducted and retires the entry (it stays, marked Undone).
-  const undoWaste = useMutation({
-    mutationFn: async (id: number) => await api.undoBitWaste({ id }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setError(null);
-        setMsg("Waste entry undone — the stock was put back.");
-      } else {
-        setMsg(null);
-        setError(res.error ?? "That waste entry couldn't be undone.");
-      }
-      void queryClient.invalidateQueries({ queryKey: ["bit"] });
-    },
-    onError: () => {
-      setMsg(null);
-      setError("That waste entry couldn't be undone. Try again.");
-    },
-  });
-
   const fieldCls =
     "rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]";
   const fieldStyle = {
@@ -5129,27 +6094,6 @@ function WasteLogPanel({
                   <span className="text-xs text-[var(--dim)]">
                     {roundDate(w.createdAt)}
                   </span>
-                  {!w.undone && w.permanent && (
-                    <span className="text-xs font-bold text-[var(--dim)]">
-                      Permanent
-                    </span>
-                  )}
-                  {!w.undone && w.canUndo && (
-                    <button
-                      type="button"
-                      aria-label={`Undo waste of ${w.quantity} ${w.unit} of ${w.itemName}`}
-                      disabled={undoWaste.isPending}
-                      onClick={() => undoWaste.mutate(w.id)}
-                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
-                      style={{
-                        backgroundColor: "var(--surface-alt)",
-                        color: "var(--accent)",
-                        border: "1px solid var(--border)",
-                      }}
-                    >
-                      Undo
-                    </button>
-                  )}
                 </span>
               </div>
             ))}
@@ -5266,37 +6210,6 @@ function InventoryTab({
       void queryClient.invalidateQueries({ queryKey: ["bit"] }),
   });
 
-  // Undo coverage (audit #5): a count change's Undo restores the
-  // count from before it; a manifest import's Undo reverts
-  // exactly the items and quantities that import touched.
-  const [undoMsg, setUndoMsg] = useState<string | null>(null);
-  const undoCountChange = useMutation({
-    mutationFn: async (id: number) => await api.undoBitStockEvent({ id }),
-    onSuccess: (res) => {
-      setUndoMsg(
-        res.ok
-          ? "Count change undone — the count is back to what it was."
-          : (res.error ?? "That count change couldn't be undone."),
-      );
-      void queryClient.invalidateQueries({ queryKey: ["bit"] });
-    },
-    onError: () =>
-      setUndoMsg("That count change couldn't be undone. Try again."),
-  });
-  const undoImport = useMutation({
-    mutationFn: async (id: number) =>
-      await api.undoBitManifestImport({ id }),
-    onSuccess: (res) => {
-      setUndoMsg(
-        res.ok
-          ? "Import undone — the items and counts it set are back to what they were."
-          : (res.error ?? "That import couldn't be undone."),
-      );
-      void queryClient.invalidateQueries({ queryKey: ["bit"] });
-    },
-    onError: () => setUndoMsg("That import couldn't be undone. Try again."),
-  });
-
   // Expiry dates (Alpha 0.75): only rendered for businesses whose
   // needs profile includes expiry tracking; the server refuses
   // the save for any other business.
@@ -5390,11 +6303,6 @@ function InventoryTab({
       <p className="text-sm font-semibold text-[var(--dim)]">
         {lastCountedLabel(rounds[0]?.createdAt ?? null)}
       </p>
-      {undoMsg && (
-        <p className="text-sm font-semibold" role="status">
-          {undoMsg}
-        </p>
-      )}
       <div className="flex flex-wrap items-center gap-2">
         <input
           type="search"
@@ -5576,27 +6484,6 @@ function InventoryTab({
                       <span className="text-xs text-[var(--dim)]">
                         {roundDate(imp.createdAt)}
                       </span>
-                      {!imp.undone && imp.permanent && (
-                        <span className="text-xs font-bold text-[var(--dim)]">
-                          Permanent
-                        </span>
-                      )}
-                      {!imp.undone && imp.canUndo && (
-                        <button
-                          type="button"
-                          aria-label="Undo this manifest import"
-                          disabled={undoImport.isPending}
-                          onClick={() => undoImport.mutate(imp.id)}
-                          className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
-                          style={{
-                            backgroundColor: "var(--surface-alt)",
-                            color: "var(--accent)",
-                            border: "1px solid var(--border)",
-                          }}
-                        >
-                          Undo
-                        </button>
-                      )}
                     </span>
                   </div>
                 ))}
@@ -6115,8 +7002,7 @@ function InventoryTab({
       )}
 
       {/* Recent count changes (audit #5): the Inventory tab's
-          own count edits, newest first — each carries an Undo
-          that restores the count from before the change. */}
+          own count edits, newest first. */}
       {stockEvents.length > 0 && (
         <section
           aria-label="Recent count changes"
@@ -6151,27 +7037,6 @@ function InventoryTab({
                   <span className="text-xs text-[var(--dim)]">
                     {roundDate(e.createdAt)}
                   </span>
-                  {!e.undone && e.permanent && (
-                    <span className="text-xs font-bold text-[var(--dim)]">
-                      Permanent
-                    </span>
-                  )}
-                  {!e.undone && e.canUndo && (
-                    <button
-                      type="button"
-                      aria-label={`Undo the count change for ${e.itemName}`}
-                      disabled={undoCountChange.isPending}
-                      onClick={() => undoCountChange.mutate(e.id)}
-                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
-                      style={{
-                        backgroundColor: "var(--surface-alt)",
-                        color: "var(--accent)",
-                        border: "1px solid var(--border)",
-                      }}
-                    >
-                      Undo
-                    </button>
-                  )}
                 </span>
               </div>
             ))}
@@ -6191,7 +7056,7 @@ function InventoryTab({
   );
 }
 
-// ---- Requisition tab (TFS SOG F-SUPP, requisition businesses only) -----
+// ---- Requisition tab (requisition businesses only) -----
 
 interface ReqBuildLine {
   key: string;
@@ -6210,6 +7075,444 @@ interface ReqBuildLine {
   manual: boolean;
 }
 
+/**
+ * The requisition review pop-up (the submission flow): opens the
+ * moment an inventory check finishes on a requisition
+ * business, showing the filled requisition form built from the items the
+ * check left at or below par. The header boxes and the typed
+ * initials can be adjusted right here — the preview rebuilds to
+ * match, so what is reviewed is what gets saved — and "Approve &
+ * save form" records the requisition as sent with exactly this
+ * form saved on it (approveBitRequisitionForm), so the
+ * Requisition tab's Download PDF button serves the approved
+ * copy. "Not yet" closes the pop-up without saving anything; the
+ * draft still waits in the Requisition tab.
+ */
+function ReqFormReviewPopup({
+  business,
+  lines,
+  onClose,
+  onApproved,
+}: {
+  business: BitBusiness;
+  lines: ReqBuildLine[];
+  onClose: () => void;
+  onApproved: (reqNo: string) => void;
+}) {
+  const reqCode = reqCodeOf(business);
+  const reqNo = reqNoToday(business);
+  const [division, setDivision] = useState(business.division ?? "");
+  const [preparerName, setPreparerName] = useState(business.preparerName ?? "");
+  const [approver, setApprover] = useState(business.approverName ?? "");
+  // Typed initials that "sign" the form, exactly as in the
+  // Requisition tab: rendered in cursive into the signature
+  // boxes; blank leaves that box blank. Not saved anywhere.
+  const [preparerInitials, setPreparerInitials] = useState("");
+  const [approverInitials, setApproverInitials] = useState("");
+  const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [approveError, setApproveError] = useState<string | null>(null);
+  const urlRef = useRef<string | null>(null);
+  const seqRef = useRef(0);
+
+  const formLines = lines.filter((l) => l.qty >= 1);
+  const linesKey = formLines
+    .map((l) => `${l.name}:${l.qty}:${l.unit}`)
+    .join("|");
+
+  // Build (and rebuild) the preview of the filled form from the
+  // header and initials exactly as they stand, debounced so
+  // typing doesn't rebuild on every keystroke.
+  useEffect(() => {
+    const seq = ++seqRef.current;
+    const timer = window.setTimeout(() => {
+      void (async () => {
+        try {
+          const res = await api.getBitRequisitionFormPdf({
+            businessId: business.id,
+            division: division.trim() || null,
+            preparerName: preparerName.trim() || null,
+            approverName: approver.trim() || null,
+            preparerSignaturePng: await renderSignaturePng(preparerInitials),
+            approverSignaturePng:
+              await renderSignaturePng(approverInitials),
+            lines: formLines.map((l) => ({
+              name: l.name,
+              materialNo: l.materialNo,
+              qty: l.qty,
+              unit: l.unit,
+            })),
+          });
+          if (seqRef.current !== seq) return;
+          if (!res.ok || !res.pdfBase64) {
+            setPreviewError(
+              res.error ?? "The form preview couldn't be built.",
+            );
+            return;
+          }
+          const bytes = Uint8Array.from(atob(res.pdfBase64), (c) =>
+            c.charCodeAt(0),
+          );
+          const url = URL.createObjectURL(
+            new Blob([bytes], { type: "application/pdf" }),
+          );
+          if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+          urlRef.current = url;
+          setPreviewUrl(url);
+          setPreviewError(null);
+        } catch {
+          if (seqRef.current === seq) {
+            setPreviewError("The form preview couldn't be built.");
+          }
+        }
+      })();
+    }, 450);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    business.id,
+    division,
+    preparerName,
+    approver,
+    preparerInitials,
+    approverInitials,
+    linesKey,
+  ]);
+
+  useEffect(
+    () => () => {
+      if (urlRef.current) URL.revokeObjectURL(urlRef.current);
+    },
+    [],
+  );
+
+  const approve = useMutation({
+    mutationFn: async () =>
+      await api.approveBitRequisitionForm({
+        businessId: business.id,
+        division: division.trim() || null,
+        preparerName: preparerName.trim() || null,
+        approverName: approver.trim() || null,
+        preparerSignaturePng: await renderSignaturePng(preparerInitials),
+        approverSignaturePng: await renderSignaturePng(approverInitials),
+        lines: formLines.map((l) => ({
+          itemId: l.itemId,
+          name: l.name,
+          materialNo: l.materialNo,
+          qty: l.qty,
+          unit: l.unit,
+          category: l.category,
+          resubmittedFromLineId: l.resubmittedFromLineId,
+        })),
+      }),
+    onSuccess: (res) => {
+      if (res.ok && res.reqNo) {
+        onApproved(res.reqNo);
+      } else {
+        setApproveError(
+          res.error ?? "The form couldn't be approved. Try again.",
+        );
+      }
+    },
+    onError: () =>
+      setApproveError("The form couldn't be approved. Try again."),
+  });
+
+  const fieldCls =
+    "rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]";
+  const fieldStyle = {
+    borderColor: "var(--border)",
+    backgroundColor: "var(--surface)",
+  } as const;
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-end justify-center p-4 sm:items-center"
+      style={{ backgroundColor: "rgba(0, 0, 0, 0.45)" }}
+      onClick={onClose}
+    >
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Review the requisition form"
+        className="max-h-[92vh] w-full max-w-lg overflow-y-auto rounded-2xl border p-4"
+        style={{
+          borderColor: "var(--border)",
+          backgroundColor: "var(--surface)",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <h3 className="text-base font-bold">Review the requisition form</h3>
+        <p className="mt-1 text-sm text-[var(--dim)]">
+          The inventory check is finished. The {formLines.length}{" "}
+          item{formLines.length === 1 ? "" : "s"} it left at or below
+          par are on the filled requisition form for Requisition {reqNo} —
+          {business.name}. Check the form over; approving saves
+          it and records the requisition as sent.
+        </p>
+        {previewError ? (
+          <p
+            role="alert"
+            className="mt-2 text-sm font-semibold text-[var(--red)]"
+          >
+            {previewError}
+          </p>
+        ) : previewUrl ? (
+          <PdfViewer
+            src={previewUrl}
+            ariaLabel="Filled requisition form preview"
+            className="mt-2 w-full rounded-lg border"
+            style={{ borderColor: "var(--border)", height: 360 }}
+          />
+        ) : (
+          <p className="mt-2 text-sm text-[var(--dim)]">
+            Building the filled form…
+          </p>
+        )}
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+            Division
+            <DivisionSelect value={division} onChange={setDivision} />
+          </label>
+          <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+            Prepared by
+            <input
+              value={preparerName}
+              aria-label="Preparer name"
+              onChange={(e) => setPreparerName(e.target.value)}
+              placeholder="Not set yet"
+              className={fieldCls}
+              style={fieldStyle}
+              autoComplete="off"
+            />
+          </label>
+        </div>
+        <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+          Approver
+          <input
+            value={approver}
+            aria-label="Approver name"
+            onChange={(e) => setApprover(e.target.value)}
+            placeholder="Not recorded yet"
+            className={fieldCls}
+            style={fieldStyle}
+            autoComplete="off"
+          />
+        </label>
+        {approver.trim() &&
+          preparerName.trim() &&
+          approver.trim().toLowerCase() ===
+            preparerName.trim().toLowerCase() && (
+            <p
+              role="alert"
+              className="mt-1 text-xs font-semibold text-[var(--red)]"
+            >
+              The approver must be different from the preparer who
+              prepared the requisition.
+            </p>
+          )}
+        {!approver.trim() && (
+          <p className="mt-1 text-xs text-[var(--dim)]">
+            An approver is required before the form can be approved.
+          </p>
+        )}
+        {/* Signatures: the same typed-initials boxes as the
+            Requisition tab — what is typed here signs the saved
+            form in a generic cursive. */}
+        <div className="mt-3 grid grid-cols-2 gap-2">
+          <div>
+            <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+              Preparer initials
+              <input
+                value={preparerInitials}
+                aria-label="Preparer initials"
+                onChange={(e) => setPreparerInitials(e.target.value)}
+                placeholder="Type initials"
+                maxLength={8}
+                className={fieldCls}
+                style={fieldStyle}
+                autoComplete="off"
+              />
+            </label>
+            <div
+              aria-label="Preparer signature"
+              className="mt-1 flex min-h-12 items-center overflow-hidden rounded-lg border px-2"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface-alt)",
+              }}
+            >
+              {preparerInitials.trim() ? (
+                <SignaturePreview text={preparerInitials.trim()} />
+              ) : (
+                <span className="text-xs text-[var(--dim)]">
+                  Preparer signature
+                </span>
+              )}
+            </div>
+          </div>
+          <div>
+            <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+              Approver Initials
+              <input
+                value={approverInitials}
+                aria-label="Approver initials"
+                onChange={(e) => setApproverInitials(e.target.value)}
+                placeholder="Type initials"
+                maxLength={8}
+                className={fieldCls}
+                style={fieldStyle}
+                autoComplete="off"
+              />
+            </label>
+            <div
+              aria-label="Approver signature"
+              className="mt-1 flex min-h-12 items-center overflow-hidden rounded-lg border px-2"
+              style={{
+                borderColor: "var(--border)",
+                backgroundColor: "var(--surface-alt)",
+              }}
+            >
+              {approverInitials.trim() ? (
+                <SignaturePreview text={approverInitials.trim()} />
+              ) : (
+                <span className="text-xs text-[var(--dim)]">
+                  Approver Signature
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+        {approveError && (
+          <p
+            role="alert"
+            className="mt-2 text-sm font-semibold text-[var(--red)]"
+          >
+            {approveError}
+          </p>
+        )}
+        <div className="mt-3 flex flex-wrap gap-2">
+          <button
+            type="button"
+            className="rounded-full px-4 py-2 text-sm font-bold"
+            style={{
+              backgroundColor: "var(--surface-alt)",
+              color: "var(--text)",
+            }}
+            onClick={onClose}
+          >
+            Not yet
+          </button>
+          <button
+            type="button"
+            className="rounded-full px-4 py-2 text-sm font-bold"
+            style={{
+              backgroundColor: "var(--accent)",
+              color: "var(--accent-text)",
+            }}
+            disabled={approve.isPending || formLines.length === 0}
+            onClick={() => {
+              setApproveError(null);
+              approve.mutate();
+            }}
+          >
+            {approve.isPending ? "Saving…" : "Approve & save form"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The requisition build order: the order sequence
+    (category rank), then by name. */
+function reqLineCompare(a: ReqBuildLine, b: ReqBuildLine): number {
+  return (
+    reqCategoryRank(a.category) - reqCategoryRank(b.category) ||
+    a.name.localeCompare(b.name)
+  );
+}
+
+/**
+ * The automatic part of the requisition build list, shared by
+ * the Requisition tab and the post-check review pop-up so both
+ * always show the same draft: items at or below par (qty =
+ * order-up-to minus on hand), merged with the not-received lines
+ * carried over from the last closed requisition (badged
+ * "Resubmitted" — there are no back orders) and the catalogue
+ * draft extras, all in the order sequence. Only items WITH
+ * a par auto-appear: an item with no par set (par 0 — e.g. the
+ * catalogue items) is ordered only when added by
+ * hand (the tab layers those on top of this list).
+ */
+function buildReqAutoLines(
+  items: BitItem[],
+  resubmittedLines: BitState["resubmittedLines"],
+  draftExtras: BitState["draftExtras"],
+): ReqBuildLine[] {
+  const lines: ReqBuildLine[] = [];
+  const byItemId = new Map<number, ReqBuildLine>();
+  const byName = new Map<string, ReqBuildLine>();
+  for (const it of items.filter((i) => i.par > 0 && i.onHand <= i.par)) {
+    const line: ReqBuildLine = {
+      key: `item-${it.id}`,
+      itemId: it.id,
+      name: it.name,
+      materialNo: it.sku,
+      qty: Math.max(0, it.par - it.onHand),
+      unit: it.unit,
+      category: it.category,
+      resubmittedFromLineId: null,
+      resubmitted: false,
+      draftExtraId: null,
+      manual: false,
+    };
+    lines.push(line);
+    byItemId.set(it.id, line);
+    byName.set(it.name.trim().toLowerCase(), line);
+  }
+  for (const rl of resubmittedLines) {
+    const match =
+      (rl.itemId != null ? byItemId.get(rl.itemId) : undefined) ??
+      byName.get(rl.name.trim().toLowerCase());
+    if (match) {
+      match.resubmitted = true;
+      match.resubmittedFromLineId = rl.id;
+    } else {
+      lines.push({
+        key: `resub-${rl.id}`,
+        itemId: rl.itemId,
+        name: rl.name,
+        materialNo: rl.materialNo,
+        qty: rl.qtyOrdered,
+        unit: rl.unit,
+        category: rl.category,
+        resubmittedFromLineId: rl.id,
+        resubmitted: true,
+        draftExtraId: null,
+        manual: false,
+      });
+    }
+  }
+  for (const ex of draftExtras) {
+    lines.push({
+      key: `extra-${ex.id}`,
+      itemId: null,
+      name: ex.name,
+      materialNo: ex.materialNo,
+      qty: ex.qty,
+      unit: ex.unit,
+      category: "Other",
+      resubmittedFromLineId: null,
+      resubmitted: false,
+      draftExtraId: ex.id,
+      manual: false,
+    });
+  }
+  lines.sort(reqLineCompare);
+  return lines;
+}
+
 function RequisitionTab({
   business,
   items,
@@ -6226,7 +7529,7 @@ function RequisitionTab({
   draftExtras: BitState["draftExtras"];
 }) {
   const queryClient = useQueryClient();
-  const stationNo = stationNoOf(business);
+  const reqCode = reqCodeOf(business);
   const reqNo = reqNoToday(business);
   const todayLong = new Date().toLocaleDateString("en-CA", {
     year: "numeric",
@@ -6235,8 +7538,18 @@ function RequisitionTab({
   });
 
   const [division, setDivision] = useState(business.division ?? "");
-  const [doName, setDoName] = useState(business.dutyOfficerName ?? "");
+  const [preparerName, setPreparerName] = useState(business.preparerName ?? "");
   const [approver, setApprover] = useState(business.approverName ?? "");
+  // Typed initials that "sign" the filled requisition form: whatever is
+  // typed here is rendered in a generic cursive into the matching
+  // signature box on the downloaded form (and shown in the
+  // signature boxes below). Signing is per-download — the
+  // initials are not saved with the header details.
+  const [preparerInitials, setPreparerInitials] = useState("");
+  const [approverInitials, setApproverInitials] = useState("");
+  // Who the requisition email goes to — typed per send, not
+  // stored: the supplier's email address.
+  const [sendTo, setSendTo] = useState("");
   const [profileMsg, setProfileMsg] = useState<string | null>(null);
   // Pre-send completeness popup (audit #8): opened by "Mark
   // requisition as sent" whenever a header box is unfilled. The
@@ -6306,7 +7619,7 @@ function RequisitionTab({
       await api.updateBitRequisitionProfile({
         businessId: business.id,
         division: division.trim() || null,
-        dutyOfficerName: doName.trim() || null,
+        preparerName: preparerName.trim() || null,
         // The pre-send popup can supply the approver it collected.
         approverName: (vars.approverName ?? approver).trim() || null,
       }),
@@ -6315,7 +7628,7 @@ function RequisitionTab({
         setProfileMsg("Saved.");
         void queryClient.invalidateQueries({ queryKey: ["bit"] });
       } else {
-        // E.g. approver recorded as the D.O.'s own name — the
+        // E.g. approver recorded as the preparer's own name — the
         // server rejects it and nothing was saved.
         setProfileMsg(res.error ?? "That didn't save. Try again.");
       }
@@ -6323,73 +7636,14 @@ function RequisitionTab({
     onError: () => setProfileMsg("That didn't save. Try again."),
   });
 
-  // The build list: items at or below par (qty = order-up-to
-  // minus on hand), merged with the not-received lines carried
-  // over from the last closed requisition (badged "Resubmitted" —
-  // the SOG has no back orders), the catalogue draft extras, and
-  // any items added by hand from the search — all laid out in the
-  // SOG order sequence. Only items WITH a par auto-appear: an
-  // item with no par set (par 0 — e.g. the Quartermaster
-  // catalogue items) is ordered only when added by hand.
+  // The build list: the shared automatic build (buildReqAutoLines
+  // — at/below-par items, resubmitted lines, catalogue draft
+  // extras) plus any items added by hand from the search.
   const buildLines = useMemo<ReqBuildLine[]>(() => {
-    const lines: ReqBuildLine[] = [];
+    const lines = buildReqAutoLines(items, resubmittedLines, draftExtras);
     const byItemId = new Map<number, ReqBuildLine>();
-    const byName = new Map<string, ReqBuildLine>();
-    for (const it of items.filter((i) => i.par > 0 && i.onHand <= i.par)) {
-      const line: ReqBuildLine = {
-        key: `item-${it.id}`,
-        itemId: it.id,
-        name: it.name,
-        materialNo: it.sku,
-        qty: Math.max(0, it.par - it.onHand),
-        unit: it.unit,
-        category: it.category,
-        resubmittedFromLineId: null,
-        resubmitted: false,
-        draftExtraId: null,
-        manual: false,
-      };
-      lines.push(line);
-      byItemId.set(it.id, line);
-      byName.set(it.name.trim().toLowerCase(), line);
-    }
-    for (const rl of resubmittedLines) {
-      const match =
-        (rl.itemId != null ? byItemId.get(rl.itemId) : undefined) ??
-        byName.get(rl.name.trim().toLowerCase());
-      if (match) {
-        match.resubmitted = true;
-        match.resubmittedFromLineId = rl.id;
-      } else {
-        lines.push({
-          key: `resub-${rl.id}`,
-          itemId: rl.itemId,
-          name: rl.name,
-          materialNo: rl.materialNo,
-          qty: rl.qtyOrdered,
-          unit: rl.unit,
-          category: rl.category,
-          resubmittedFromLineId: rl.id,
-          resubmitted: true,
-          draftExtraId: null,
-          manual: false,
-        });
-      }
-    }
-    for (const ex of draftExtras) {
-      lines.push({
-        key: `extra-${ex.id}`,
-        itemId: null,
-        name: ex.name,
-        materialNo: ex.materialNo,
-        qty: ex.qty,
-        unit: ex.unit,
-        category: "Other",
-        resubmittedFromLineId: null,
-        resubmitted: false,
-        draftExtraId: ex.id,
-        manual: false,
-      });
+    for (const l of lines) {
+      if (l.itemId != null) byItemId.set(l.itemId, l);
     }
     // Items added by hand from the search: a line each (qty 1 to
     // start), unless the item is already on the draft.
@@ -6413,16 +7667,12 @@ function RequisitionTab({
       lines.push(line);
       byItemId.set(it.id, line);
     }
-    lines.sort(
-      (a, b) =>
-        reqCategoryRank(a.category) - reqCategoryRank(b.category) ||
-        a.name.localeCompare(b.name),
-    );
+    lines.sort(reqLineCompare);
     return lines;
   }, [items, resubmittedLines, draftExtras, addedIds]);
 
   // The build list grouped by category for display. buildLines is
-  // already in the SOG order sequence, so first-appearance order
+  // already in the requisition order sequence, so first-appearance order
   // keeps the groups in that sequence: Medical, then Stationery /
   // Office Supplies, then Cleaning / General, then the rest.
   const lineGroups = useMemo(() => {
@@ -6465,6 +7715,134 @@ function RequisitionTab({
   );
   const [filledReqOpen, setFilledReqOpen] = useState(false);
 
+  // Pre-filled form scan: some halls keep a requisition form
+  // already filled in. The user uploads that file (the filled-in
+  // a filled-in requisition form (PDF) or a photo of the paper form; scanBitRequisitionForm
+  // reads it and cross-references its lines against this station's
+  // inventory list. The review in the tab lists what matched
+  // (ticked by default) and what didn't; "Add … to this
+  // requisition" puts the ticked matches onto the draft at the
+  // form's quantities. Nothing is added until that button.
+  const [formScan, setFormScan] = useState<ApiResponse<
+    typeof api,
+    "scanBitRequisitionForm"
+  > | null>(null);
+  const [formScanFile, setFormScanFile] = useState<string | null>(null);
+  const [formScanError, setFormScanError] = useState<string | null>(null);
+  const [formScanSelected, setFormScanSelected] = useState<Set<number>>(
+    new Set(),
+  );
+  const [formScanMsg, setFormScanMsg] = useState<string | null>(null);
+
+  const scanForm = useMutation({
+    mutationFn: async (vars: { dataBase64: string; mimeType: string }) =>
+      await api.scanBitRequisitionForm({
+        businessId: business.id,
+        file: vars,
+      }),
+    onSuccess: (res) => {
+      if (!res.ok) {
+        setFormScan(null);
+        setFormScanError(
+          res.error ?? "That form couldn't be scanned. Try again.",
+        );
+        return;
+      }
+      setFormScan(res);
+      setFormScanError(null);
+      setFormScanMsg(null);
+      setFormScanSelected(
+        new Set(
+          res.lines
+            .map((l) => l.matchedItemId)
+            .filter((id): id is number => id != null),
+        ),
+      );
+      // Fill any header box the form can fill and this draft
+      // hasn't yet — the form's own Division / preparer / approver.
+      const h = res.header;
+      if (h) {
+        if (h.division && !division.trim()) setDivision(h.division);
+        if (h.preparerName && !preparerName.trim())
+          setPreparerName(h.preparerName);
+        if (h.approverName && !approver.trim()) setApprover(h.approverName);
+      }
+    },
+    onError: () =>
+      setFormScanError("That form couldn't be scanned. Try again."),
+  });
+
+  async function handleFormScanFile(file: File) {
+    setFormScanError(null);
+    setFormScanMsg(null);
+    setFormScanFile(file.name);
+    try {
+      if (file.type === "application/pdf") {
+        const { dataBase64 } = await fileToBase64(file);
+        scanForm.mutate({ dataBase64, mimeType: "application/pdf" });
+      } else {
+        // Downscaled to a legible ~2000px JPEG, like a manifest
+        // photo — the reader needs the lines, not the megapixels.
+        const image = await prepareManifestImage(file);
+        scanForm.mutate(image);
+      }
+    } catch {
+      setFormScanError("That file couldn't be read. Try again.");
+    }
+  }
+
+  /** Put the scan review's ticked matches onto this draft, at the
+      quantities the form asked for. Matches already on the draft
+      keep the quantity they already have. */
+  function applyFormScan() {
+    if (!formScan) return;
+    const newIds: number[] = [];
+    const qtyUpdates: Record<string, number> = {};
+    const cats = new Set<string>();
+    let already = 0;
+    for (const line of formScan.lines) {
+      if (line.matchedItemId == null) continue;
+      if (!formScanSelected.has(line.matchedItemId)) continue;
+      const item = items.find((i) => i.id === line.matchedItemId);
+      if (!item) continue;
+      if (
+        buildLines.some((l) => l.itemId === item.id) ||
+        addedIds.includes(item.id) ||
+        newIds.includes(item.id)
+      ) {
+        already++;
+        continue;
+      }
+      newIds.push(item.id);
+      if (line.qty != null && line.qty > 0) {
+        qtyUpdates[`manual-${item.id}`] = line.qty;
+      }
+      cats.add(item.category);
+    }
+    if (newIds.length > 0) {
+      setAddedIds((prev) => [
+        ...prev,
+        ...newIds.filter((id) => !prev.includes(id)),
+      ]);
+    }
+    if (Object.keys(qtyUpdates).length > 0) {
+      setQtyEdits((prev) => ({ ...prev, ...qtyUpdates }));
+    }
+    cats.forEach((c) => expandGroup(c));
+    const parts: string[] = [];
+    if (newIds.length > 0) {
+      parts.push(
+        `Added ${newIds.length} ${newIds.length === 1 ? "item" : "items"} from the form to this requisition.`,
+      );
+    }
+    if (already > 0) {
+      parts.push(
+        `${already} ${already === 1 ? "was" : "were"} already on the requisition.`,
+      );
+    }
+    setFormScanMsg(parts.length > 0 ? parts.join(" ") : "Nothing was ticked to add.");
+  }
+
   function addFromSearch(item: BitItem) {
     const existing = buildLines.find((l) => l.itemId === item.id);
     if (existing) {
@@ -6497,18 +7875,18 @@ function RequisitionTab({
     .map((l) => ({ line: l, qty: qtyOf(l) }))
     .filter((x) => x.qty >= 1);
 
-  const emailSubject = `Requisition ${reqNo} — TFS Station ${stationNo}`;
+  const emailSubject = `Requisition ${reqNo}`;
   const requisitionText = useMemo(() => {
     const out: string[] = [
-      "TORONTO FIRE SERVICES",
-      "QUARTERMASTER SECTION — REQUISITION",
-      "SEND TO: tfsqm@toronto.ca",
+      business.name.toUpperCase(),
+      "REQUISITION",
+      `SEND TO: ${sendTo.trim() || "—"}`,
       "",
       `Division: ${division.trim() || ""}`,
-      `Station: ${stationNo}`,
+      `Business: ${business.name}`,
       `Date: ${todayLong}`,
       `Req. No.: ${reqNo}`,
-      `D.O. Name: ${doName.trim() || ""}`,
+      `Prepared by: ${preparerName.trim() || ""}`,
       `Approver: ${approver.trim() || ""}`,
       "",
       "Item / Description | Qty | Unit | Material # | GL | Comments",
@@ -6520,19 +7898,37 @@ function RequisitionTab({
     }
     out.push(
       "",
-      "D.O. Signature: ______________________",
-      "DC/PC/DVC Signature: ______________________",
+      // Plain text can't carry the cursive, so the email / copy
+      // text shows the typed initials themselves on the
+      // signature line; the filled PDF form signs in cursive.
+      preparerInitials.trim()
+        ? `Preparer signature: ${preparerInitials.trim()}`
+        : "Preparer signature: ______________________",
+      approverInitials.trim()
+        ? `Approver signature: ${approverInitials.trim()}`
+        : "Approver signature: ______________________",
     );
     return out.join("\n");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sendLines, division, doName, approver, reqNo, todayLong, stationNo]);
+  }, [
+    sendLines,
+    division,
+    preparerName,
+    approver,
+    preparerInitials,
+    approverInitials,
+    reqNo,
+    todayLong,
+    sendTo,
+    business.name,
+  ]);
 
-  const mailto = `mailto:tfsqm@toronto.ca?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(requisitionText)}`;
+  const mailto = `mailto:${sendTo.trim()}?subject=${encodeURIComponent(emailSubject)}&body=${encodeURIComponent(requisitionText)}`;
 
   async function copyText() {
     try {
       await navigator.clipboard.writeText(
-        `To: tfsqm@toronto.ca\nSubject: ${emailSubject}\n\n${requisitionText}`,
+        `To: ${sendTo}\nSubject: ${emailSubject}\n\n${requisitionText}`,
       );
       setCopied(true);
       window.setTimeout(() => setCopied(false), 2500);
@@ -6540,6 +7936,108 @@ function RequisitionTab({
       setCopied(false);
     }
   }
+
+  // The filled requisition form (PDF): the server builds the
+  // generic requisition form with this draft's header and lines;
+  // the returned base64 becomes a download named for the requisition.
+  const [formPdfMsg, setFormPdfMsg] = useState<string | null>(null);
+  const [formPdfError, setFormPdfError] = useState<string | null>(null);
+  const formPdf = useMutation({
+    mutationFn: async () =>
+      await api.getBitRequisitionFormPdf({
+        businessId: business.id,
+        division: division.trim() || null,
+        preparerName: preparerName.trim() || null,
+        approverName: approver.trim() || null,
+        // The typed initials, rendered in cursive, sign the
+        // form's two signature boxes (null = left blank).
+        preparerSignaturePng: await renderSignaturePng(preparerInitials),
+        approverSignaturePng: await renderSignaturePng(approverInitials),
+        lines: sendLines.map(({ line, qty }) => ({
+          name: line.name,
+          materialNo: line.materialNo,
+          qty,
+          unit: line.unit,
+        })),
+      }),
+    onSuccess: (res) => {
+      if (!res.ok || !res.pdfBase64) {
+        setFormPdfMsg(null);
+        setFormPdfError(
+          res.error ?? "The filled form couldn't be built.",
+        );
+        return;
+      }
+      if (
+        downloadPdfBase64(
+          res.pdfBase64,
+          res.filename ?? `Requisition ${reqNo}.pdf`,
+        )
+      ) {
+        setFormPdfError(null);
+        setFormPdfMsg(
+          res.pageCount > 1
+            ? `Filled requisition form downloaded — ${res.pageCount} pages, numbered page by page.`
+            : "Filled requisition form downloaded.",
+        );
+      } else {
+        setFormPdfMsg(null);
+        setFormPdfError("The filled form couldn't be downloaded.");
+      }
+    },
+    onError: () => {
+      setFormPdfMsg(null);
+      setFormPdfError("The filled form couldn't be built. Try again.");
+    },
+  });
+
+  // The saved approved form (the post-check review flow): once a
+  // form has been approved in the review pop-up and saved,
+  // "Download PDF" serves that exact copy; until then it builds
+  // one from the current draft (the formPdf mutation above).
+  const savedFormInfo = useQuery({
+    queryKey: ["bit-req-saved-form", business.id],
+    queryFn: async () =>
+      await api.getBitSavedRequisitionFormInfo({
+        businessId: business.id,
+      }),
+  });
+  const hasSavedForm = savedFormInfo.data?.exists === true;
+  const savedDownload = useMutation({
+    mutationFn: async () =>
+      await api.downloadBitSavedRequisitionForm({
+        businessId: business.id,
+      }),
+    onSuccess: (res) => {
+      if (!res.ok || !res.pdfBase64) {
+        setFormPdfMsg(null);
+        setFormPdfError(
+          res.error ?? "The saved form couldn't be downloaded.",
+        );
+        return;
+      }
+      if (
+        downloadPdfBase64(
+          res.pdfBase64,
+          res.filename ?? `Requisition ${reqNo}.pdf`,
+        )
+      ) {
+        setFormPdfError(null);
+        setFormPdfMsg(
+          res.pageCount > 1
+            ? `Saved requisition form downloaded — ${res.pageCount} pages, numbered page by page.`
+            : "Saved requisition form downloaded.",
+        );
+      } else {
+        setFormPdfMsg(null);
+        setFormPdfError("The saved form couldn't be downloaded.");
+      }
+    },
+    onError: () => {
+      setFormPdfMsg(null);
+      setFormPdfError("The saved form couldn't be downloaded. Try again.");
+    },
+  });
 
   const send = useMutation({
     mutationFn: async () =>
@@ -6599,28 +8097,6 @@ function RequisitionTab({
     onError: () => setCheckMsg("That check-off didn't save. Try again."),
   });
 
-  // Undo coverage (audit #5): a Received / Not received mark can
-  // be undone — the line goes back to pending, any stock the
-  // receipt applied comes back off, and a requisition the
-  // check-off closed reopens.
-  const undoCheckOff = useMutation({
-    mutationFn: async (lineId: number) =>
-      await api.undoBitRequisitionCheckOff({ lineId }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setCheckMsg(
-          res.reopened
-            ? "Check-off undone — the requisition is outstanding again and the line is waiting to be checked off."
-            : "Check-off undone — the line is waiting to be checked off again.",
-        );
-      } else {
-        setCheckMsg(res.error ?? "That check-off couldn't be undone.");
-      }
-      void queryClient.invalidateQueries({ queryKey: ["bit"] });
-    },
-    onError: () => setCheckMsg("That check-off couldn't be undone. Try again."),
-  });
-
   const removeExtra = useMutation({
     mutationFn: async (id: number) =>
       await api.removeBitRequisitionDraftExtra({ id }),
@@ -6630,18 +8106,18 @@ function RequisitionTab({
 
   const profileDirty =
     division !== (business.division ?? "") ||
-    doName !== (business.dutyOfficerName ?? "") ||
+    preparerName !== (business.preparerName ?? "") ||
     approver !== (business.approverName ?? "");
 
   // Pre-send completeness (audit #8): which header boxes are
   // unfilled, read from the fields exactly as they stand.
   const missingDivision = division.trim() === "";
-  const missingDoName = doName.trim() === "";
+  const missingDoName = preparerName.trim() === "";
   const missingApprover = approver.trim() === "";
   const anyMissing = missingDivision || missingDoName || missingApprover;
 
   /** Save any unsaved header edits, then mark the requisition
-      sent. A rejected save (approver recorded as the D.O.'s own
+      sent. A rejected save (approver recorded as the preparer's own
       name) stops the send and surfaces its message. */
   async function doSend() {
     if (profileDirty) {
@@ -6675,25 +8151,25 @@ function RequisitionTab({
     void doSend();
   }
 
-  /** The popup's send button. Division / D.O. Name gaps are
+  /** The popup's send button. Division / Prepared by gaps are
       waived ("Send anyway"); a missing approver is not — the
       popup's own approver field must hold a name different from
-      the D.O.'s, which is recorded before the send. */
+      the preparer's, which is recorded before the send. */
   async function confirmPopupSend() {
     if (missingApprover) {
       const name = popupApprover.trim();
       if (!name) {
         setPopupError(
-          "An approver is required before sending — enter the District Chief's name.",
+          "An approver is required before sending — enter the approver's name.",
         );
         return;
       }
       if (
-        doName.trim() &&
-        name.toLowerCase() === doName.trim().toLowerCase()
+        preparerName.trim() &&
+        name.toLowerCase() === preparerName.trim().toLowerCase()
       ) {
         setPopupError(
-          "The approver must be different from the D.O. who prepared the requisition.",
+          "The approver must be different from the preparer.",
         );
         return;
       }
@@ -6724,22 +8200,31 @@ function RequisitionTab({
   // (audit #15). A recorded date shows when the name on screen is
   // the one on file; a name still being typed has no date yet.
   const draftPreparedDate =
-    doName.trim() && doName.trim() === (business.dutyOfficerName ?? "")
-      ? longDateOrEmpty(business.dutyOfficerRecordedAt)
+    preparerName.trim() && preparerName.trim() === (business.preparerName ?? "")
+      ? longDateOrEmpty(business.preparerRecordedAt)
       : "";
   const draftApprovedDate =
     approver.trim() && approver.trim() === (business.approverName ?? "")
       ? longDateOrEmpty(business.approverRecordedAt)
       : "";
   const draftState = [
-    doName.trim()
-      ? `Prepared by ${doName.trim()}${draftPreparedDate ? ` · ${draftPreparedDate}` : ""}`
+    preparerName.trim()
+      ? `Prepared by ${preparerName.trim()}${draftPreparedDate ? ` · ${draftPreparedDate}` : ""}`
       : "Prepared by —",
     approver.trim()
       ? `Approved by ${approver.trim()}${draftApprovedDate ? ` · ${draftApprovedDate}` : ""}`
       : "Approved by —",
     "Not sent yet",
   ].join(" → ");
+
+  // The form scan's lines, split for the review: matched against
+  // the inventory list vs. on the form but not found on it.
+  const formScanMatched = formScan?.ok
+    ? formScan.lines.filter((l) => l.matchedItemId != null)
+    : [];
+  const formScanUnmatched = formScan?.ok
+    ? formScan.lines.filter((l) => l.matchedItemId == null)
+    : [];
 
   const fieldCls =
     "rounded-lg border px-2 py-1.5 text-sm font-normal text-[var(--text)]";
@@ -6769,7 +8254,7 @@ function RequisitionTab({
                 month: "long",
                 day: "numeric",
               })}{" "}
-              to the Quartermaster Section. When the supplies come
+              to the supplier. When the supplies come
               back with the marked requisition, check off each item
               received and remark the ones not received — items not
               received are never back-ordered; they are resubmitted
@@ -6778,6 +8263,45 @@ function RequisitionTab({
             <div className="mt-1">
               <RequisitionStateLine req={requisition} />
             </div>
+            {hasSavedForm && savedFormInfo.data && (
+              <div className="mt-2 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  className="rounded-full px-4 py-2 text-sm font-bold"
+                  style={{
+                    backgroundColor: "var(--surface-alt)",
+                    color: "var(--text)",
+                  }}
+                  disabled={savedDownload.isPending}
+                  onClick={() => savedDownload.mutate()}
+                >
+                  {savedDownload.isPending
+                    ? "Preparing PDF…"
+                    : "Download PDF"}
+                </button>
+                <span className="text-sm text-[var(--dim)]">
+                  The approved form for Requisition{" "}
+                  {savedFormInfo.data.reqNo}
+                  {savedFormInfo.data.savedAt
+                    ? `, saved ${longDateOrEmpty(savedFormInfo.data.savedAt)}`
+                    : ""}
+                  .
+                </span>
+              </div>
+            )}
+            {formPdfError && (
+              <p
+                role="alert"
+                className="mt-2 text-sm font-semibold text-[var(--red)]"
+              >
+                {formPdfError}
+              </p>
+            )}
+            {formPdfMsg && (
+              <p className="mt-2 text-sm font-semibold" role="status">
+                {formPdfMsg}
+              </p>
+            )}
             {checkMsg && (
               <p className="mt-2 text-sm font-semibold" role="status">
                 {checkMsg}
@@ -6837,22 +8361,6 @@ function RequisitionTab({
                             : "Primary"}
                           {l.permanent ? " · Permanent" : ""}
                         </span>
-                      )}
-                      {l.status !== "pending" && l.canUndo && (
-                        <button
-                          type="button"
-                          aria-label={`Undo the check-off for ${l.name}`}
-                          disabled={undoCheckOff.isPending}
-                          onClick={() => undoCheckOff.mutate(l.id)}
-                          className="shrink-0 rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
-                          style={{
-                            backgroundColor: "var(--surface-alt)",
-                            color: "var(--accent)",
-                            border: "1px solid var(--border)",
-                          }}
-                        >
-                          Undo
-                        </button>
                       )}
                     </div>
                     {l.status === "pending" && (
@@ -6925,11 +8433,11 @@ function RequisitionTab({
       ) : (
         <>
           <p className="text-sm text-[var(--dim)]">
-            Built from everything at or below par after the Fire
-            Station Supply Inventory, in the requisition's order —
+            Built from everything at or below par after the latest
+            inventory check, in the requisition's order —
             Medical supplies first, then Stationery, then general
-            items. The Duty Officer signs, the District Chief reviews
-            and signs, and it goes to the Quartermaster Section.
+            items. The preparer signs, the approver reviews
+            and signs, and it goes to the supplier.
           </p>
 
           <div
@@ -6942,22 +8450,14 @@ function RequisitionTab({
             <div className="grid grid-cols-2 gap-2">
               <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
                 Division
-                <input
-                  value={division}
-                  aria-label="Division"
-                  onChange={(e) => setDivision(e.target.value)}
-                  placeholder="Not set yet"
-                  className={fieldCls}
-                  style={fieldStyle}
-                  autoComplete="off"
-                />
+                <DivisionSelect value={division} onChange={setDivision} />
               </label>
               <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
-                D.O. Name
+                Prepared by
                 <input
-                  value={doName}
-                  aria-label="Duty Officer name"
-                  onChange={(e) => setDoName(e.target.value)}
+                  value={preparerName}
+                  aria-label="Preparer name"
+                  onChange={(e) => setPreparerName(e.target.value)}
                   placeholder="Not set yet"
                   className={fieldCls}
                   style={fieldStyle}
@@ -6965,13 +8465,13 @@ function RequisitionTab({
                 />
               </label>
             </div>
-            {/* Approver separation (audit #15): the District
-                Chief who approves — the form's DC name/signature
-                line — recorded apart from the D.O. who prepared
-                it. No approver, no send; and the approver can
-                never be the preparer's own name. */}
+            {/* Approver separation (audit #15): the approver —
+                the form's approver name/signature line — recorded
+                apart from the preparer who prepared it. No
+                approver, no send; and the approver can never be
+                the preparer's own name. */}
             <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
-              Approver — District Chief
+              Approver
               <input
                 value={approver}
                 aria-label="Approver name"
@@ -6983,14 +8483,14 @@ function RequisitionTab({
               />
             </label>
             {approver.trim() &&
-              doName.trim() &&
+              preparerName.trim() &&
               approver.trim().toLowerCase() ===
-                doName.trim().toLowerCase() && (
+                preparerName.trim().toLowerCase() && (
                 <p
                   role="alert"
                   className="mt-1 text-xs font-semibold text-[var(--red)]"
                 >
-                  The approver must be different from the D.O. who
+                  The approver must be different from the preparer who
                   prepared the requisition.
                 </p>
               )}
@@ -6999,8 +8499,81 @@ function RequisitionTab({
                 ? `Approver recorded ${longDateOrEmpty(business.approverRecordedAt)}.`
                 : "No approver recorded yet — one is required before this requisition can be sent."}
             </p>
+            {/* Signatures: type initials in a box and they sign
+                the matching signature box of the filled requisition form
+                in a generic cursive — the boxes below preview
+                exactly what the form gets. Blank initials leave
+                that signature box blank. */}
+            <div className="mt-3 grid grid-cols-2 gap-2">
+              <div>
+                <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+                  Preparer initials
+                  <input
+                    value={preparerInitials}
+                    aria-label="Preparer initials"
+                    onChange={(e) => setPreparerInitials(e.target.value)}
+                    placeholder="Type initials"
+                    maxLength={8}
+                    className={fieldCls}
+                    style={fieldStyle}
+                    autoComplete="off"
+                  />
+                </label>
+                <div
+                  aria-label="Preparer signature"
+                  className="mt-1 flex min-h-12 items-center overflow-hidden rounded-lg border px-2"
+                  style={{
+                    borderColor: "var(--border)",
+                    backgroundColor: "var(--surface-alt)",
+                  }}
+                >
+                  {preparerInitials.trim() ? (
+                    <SignaturePreview text={preparerInitials.trim()} />
+                  ) : (
+                    <span className="text-xs text-[var(--dim)]">
+                      Preparer signature
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <label className="flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+                  Approver Initials
+                  <input
+                    value={approverInitials}
+                    aria-label="Approver initials"
+                    onChange={(e) => setApproverInitials(e.target.value)}
+                    placeholder="Type initials"
+                    maxLength={8}
+                    className={fieldCls}
+                    style={fieldStyle}
+                    autoComplete="off"
+                  />
+                </label>
+                <div
+                  aria-label="Approver signature"
+                  className="mt-1 flex min-h-12 items-center overflow-hidden rounded-lg border px-2"
+                  style={{
+                    borderColor: "var(--border)",
+                    backgroundColor: "var(--surface-alt)",
+                  }}
+                >
+                  {approverInitials.trim() ? (
+                    <SignaturePreview text={approverInitials.trim()} />
+                  ) : (
+                    <span className="text-xs text-[var(--dim)]">
+                      Approver Signature
+                    </span>
+                  )}
+                </div>
+              </div>
+            </div>
+            <p className="mt-1 text-xs text-[var(--dim)]">
+              Typed initials sign the filled requisition form&rsquo;s
+              signature boxes in cursive when you download it below.
+            </p>
             <p className="mt-2 text-sm">
-              <strong>Station:</strong> {stationNo} ·{" "}
+              <strong>Business:</strong> {business.name} ·{" "}
               <strong>Date:</strong> {todayLong} ·{" "}
               <strong>Req. No.:</strong> {reqNo}
             </p>
@@ -7027,6 +8600,245 @@ function RequisitionTab({
               </div>
             )}
           </div>
+
+          <section
+            aria-label="Scan a pre-filled requisition form"
+            className="rounded-xl border p-3"
+            style={{
+              borderColor: "var(--border)",
+              backgroundColor: "var(--surface)",
+            }}
+          >
+            <h3 className="text-sm font-bold">
+              Already have a filled-in form?
+            </h3>
+            <p className="mt-1 text-xs text-[var(--dim)]">
+              Some halls keep a requisition form already filled in.
+              Upload that file — the filled-in requisition form — or take a
+              photo of the paper form. It&rsquo;s scanned and checked
+              against this station&rsquo;s inventory list, and the
+              items it finds can go straight onto this requisition.
+            </p>
+            <div className="mt-2 flex flex-wrap items-center gap-2">
+              <label
+                className="inline-flex cursor-pointer items-center rounded-full px-3 py-1.5 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--accent)",
+                  color: "var(--accent-text)",
+                  opacity: scanForm.isPending ? 0.6 : 1,
+                }}
+              >
+                {scanForm.isPending ? "Scanning…" : "Upload the form (PDF)"}
+                <input
+                  type="file"
+                  accept="application/pdf,.pdf"
+                  className="sr-only"
+                  aria-label="Upload a filled-in requisition form PDF"
+                  disabled={scanForm.isPending}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleFormScanFile(f);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              <label
+                className="inline-flex cursor-pointer items-center rounded-full px-3 py-1.5 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--surface-alt)",
+                  color: "var(--text)",
+                  opacity: scanForm.isPending ? 0.6 : 1,
+                }}
+              >
+                Take a photo of the form
+                <input
+                  type="file"
+                  accept="image/*"
+                  className="sr-only"
+                  aria-label="Take or upload a photo of a filled-in requisition form"
+                  disabled={scanForm.isPending}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) void handleFormScanFile(f);
+                    e.target.value = "";
+                  }}
+                />
+              </label>
+              {formScanFile && (
+                <span className="text-xs text-[var(--dim)]">
+                  {formScanFile}
+                </span>
+              )}
+            </div>
+            {formScanError && (
+              <p
+                role="alert"
+                className="mt-2 text-sm font-semibold text-[var(--red)]"
+              >
+                {formScanError}
+              </p>
+            )}
+            {formScan && formScan.ok && (
+              <div
+                className="mt-3 border-t pt-3"
+                style={{ borderColor: "var(--border)" }}
+              >
+                <p className="text-sm font-semibold">
+                  Scanned {formScan.lines.length}{" "}
+                  {formScan.lines.length === 1 ? "line" : "lines"} from
+                  the {formScan.source === "pdf" ? "file" : "photo"} —{" "}
+                  {formScanMatched.length} matched this station&rsquo;s
+                  inventory list
+                  {formScanUnmatched.length > 0
+                    ? `, ${formScanUnmatched.length} didn't`
+                    : ""}
+                  .
+                </p>
+                {formScan.header &&
+                  (formScan.header.division ||
+                    formScan.header.preparerName ||
+                    formScan.header.approverName) && (
+                    <p className="mt-1 text-xs text-[var(--dim)]">
+                      On the form:{" "}
+                      {[
+                        formScan.header.division &&
+                          `Division ${formScan.header.division}`,
+                        formScan.header.preparerName &&
+                          `Preparer ${formScan.header.preparerName}`,
+                        formScan.header.approverName &&
+                          `Approver ${formScan.header.approverName}`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
+                      . Any header box above that was blank has been
+                      filled from it.
+                    </p>
+                  )}
+                {formScanMatched.length > 0 && (
+                  <div className="mt-2 flex flex-col gap-1">
+                    {formScanMatched.map((l) => (
+                      <label
+                        key={l.matchedItemId}
+                        className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5"
+                        style={{
+                          backgroundColor: "var(--surface-alt)",
+                        }}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={formScanSelected.has(
+                            l.matchedItemId ?? -1,
+                          )}
+                          onChange={(e) => {
+                            const id = l.matchedItemId;
+                            if (id == null) return;
+                            setFormScanSelected((prev) => {
+                              const next = new Set(prev);
+                              if (e.target.checked) next.add(id);
+                              else next.delete(id);
+                              return next;
+                            });
+                          }}
+                          aria-label={`Add ${l.matchedName} from the scanned form`}
+                          className="h-4 w-4 shrink-0"
+                        />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-sm font-semibold leading-tight">
+                            {l.matchedName}
+                          </span>
+                          <span className="block text-xs text-[var(--dim)]">
+                            {l.matchedCategory}
+                            {l.matchedMaterialNo
+                              ? ` · Material # ${l.matchedMaterialNo}`
+                              : ""}
+                            {` · ${l.matchedOnHand} on hand`}
+                            {l.matchKind === "material"
+                              ? " · matched by Material #"
+                              : ""}
+                          </span>
+                          <span className="block text-xs text-[var(--dim)]">
+                            Form says: &ldquo;{l.scannedName}&rdquo;
+                            {l.qty != null
+                              ? ` × ${l.qty}${l.unit ? ` ${l.unit}` : ""}`
+                              : ""}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                )}
+                {formScanUnmatched.length > 0 && (
+                  <div className="mt-2">
+                    <p className="text-xs font-bold text-[var(--dim)]">
+                      On the form, but not in this station&rsquo;s
+                      inventory list:
+                    </p>
+                    <div className="mt-1 flex flex-col gap-1">
+                      {formScanUnmatched.map((l, i) => (
+                        <div
+                          key={`${l.scannedName}-${i}`}
+                          className="rounded-lg px-2 py-1.5 text-sm"
+                          style={{
+                            backgroundColor: "var(--surface-alt)",
+                          }}
+                        >
+                          {l.scannedName}
+                          <span className="text-xs text-[var(--dim)]">
+                            {l.qty != null
+                              ? ` · × ${l.qty}${l.unit ? ` ${l.unit}` : ""}`
+                              : ""}
+                            {l.materialNo
+                              ? ` · Material # ${l.materialNo}`
+                              : ""}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                    <p className="mt-1 text-xs text-[var(--dim)]">
+                      If one of these is on the list under a different
+                      name, the search below can add it by hand.
+                    </p>
+                  </div>
+                )}
+                <div className="mt-2 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="rounded-full px-3 py-1.5 text-sm font-bold disabled:opacity-50"
+                    style={{
+                      backgroundColor: "var(--accent)",
+                      color: "var(--accent-text)",
+                    }}
+                    disabled={formScanSelected.size === 0}
+                    onClick={applyFormScan}
+                  >
+                    Add {formScanSelected.size} ticked{" "}
+                    {formScanSelected.size === 1 ? "item" : "items"} to
+                    this requisition
+                  </button>
+                  <button
+                    type="button"
+                    className="rounded-full px-3 py-1.5 text-sm font-bold"
+                    style={{
+                      backgroundColor: "var(--surface-alt)",
+                      color: "var(--text)",
+                    }}
+                    onClick={() => {
+                      setFormScan(null);
+                      setFormScanMsg(null);
+                      setFormScanFile(null);
+                    }}
+                  >
+                    Dismiss scan
+                  </button>
+                </div>
+                {formScanMsg && (
+                  <p className="mt-2 text-sm font-semibold" role="status">
+                    {formScanMsg}
+                  </p>
+                )}
+              </div>
+            )}
+          </section>
 
           <div>
             <input
@@ -7339,8 +9151,20 @@ function RequisitionTab({
             }}
           >
             <h3 className="text-base font-bold">Requisition</h3>
+            <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
+              Send to (email)
+              <input
+                value={sendTo}
+                aria-label="Send to email address"
+                onChange={(e) => setSendTo(e.target.value)}
+                placeholder="Supplier's email address"
+                className={fieldCls}
+                style={fieldStyle}
+                autoComplete="off"
+              />
+            </label>
             <p className="mt-1 text-xs font-semibold text-[var(--dim)]">
-              To: tfsqm@toronto.ca · Subject: {emailSubject}
+              To: {sendTo.trim() || "Not set yet"} · Subject: {emailSubject}
             </p>
             <pre
               className="mt-2 overflow-x-auto whitespace-pre-wrap rounded-lg border p-2 text-xs"
@@ -7380,6 +9204,27 @@ function RequisitionTab({
                   backgroundColor: "var(--surface-alt)",
                   color: "var(--text)",
                 }}
+                disabled={
+                  formPdf.isPending ||
+                  savedDownload.isPending ||
+                  (!hasSavedForm && sendLines.length === 0)
+                }
+                onClick={() => {
+                  if (hasSavedForm) savedDownload.mutate();
+                  else formPdf.mutate();
+                }}
+              >
+                {formPdf.isPending || savedDownload.isPending
+                  ? "Preparing PDF…"
+                  : "Download PDF"}
+              </button>
+              <button
+                type="button"
+                className="rounded-full px-4 py-2 text-sm font-bold"
+                style={{
+                  backgroundColor: "var(--surface-alt)",
+                  color: "var(--text)",
+                }}
                 disabled={send.isPending || sendLines.length === 0}
                 onClick={attemptSend}
               >
@@ -7408,6 +9253,30 @@ function RequisitionTab({
             {sendMsg && (
               <p className="mt-2 text-sm font-semibold" role="status">
                 {sendMsg}
+              </p>
+            )}
+            {formPdfError && (
+              <p
+                role="alert"
+                className="mt-2 text-sm font-semibold text-[var(--red)]"
+              >
+                {formPdfError}
+              </p>
+            )}
+            {formPdfMsg && (
+              <p className="mt-2 text-sm font-semibold" role="status">
+                {formPdfMsg}
+              </p>
+            )}
+            {hasSavedForm && savedFormInfo.data && (
+              <p className="mt-2 text-sm text-[var(--dim)]">
+                Download PDF gets the approved form for Requisition{" "}
+                {savedFormInfo.data.reqNo}
+                {savedFormInfo.data.savedAt
+                  ? `, saved ${longDateOrEmpty(savedFormInfo.data.savedAt)}`
+                  : ""}{" "}
+                — the copy reviewed and approved after the inventory
+                check.
               </p>
             )}
           </div>
@@ -7490,9 +9359,8 @@ function RequisitionTab({
                           .join(", ")}`
                       : ""}
                   </p>
-                  {/* Each line's check-off mark, with its Undo
-                      (audit #5): undoing one reopens this
-                      requisition and returns the line to pending. */}
+                  {/* Each line's check-off mark (audit #5
+                      attribution). */}
                   <div className="mt-1 flex flex-col gap-1">
                     {h.lines.map((l) => (
                       <div
@@ -7535,22 +9403,6 @@ function RequisitionTab({
                             {l.permanent ? " · Permanent" : ""}
                           </span>
                         )}
-                        {l.status !== "pending" && l.canUndo && (
-                          <button
-                            type="button"
-                            aria-label={`Undo the check-off for ${l.name}`}
-                            disabled={undoCheckOff.isPending}
-                            onClick={() => undoCheckOff.mutate(l.id)}
-                            className="shrink-0 rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
-                            style={{
-                              backgroundColor: "var(--surface-alt)",
-                              color: "var(--accent)",
-                              border: "1px solid var(--border)",
-                            }}
-                          >
-                            Undo
-                          </button>
-                        )}
                       </div>
                     ))}
                   </div>
@@ -7562,7 +9414,7 @@ function RequisitionTab({
       )}
 
       {/* Pre-send completeness popup (audit #8): lists exactly
-          which header boxes are unfilled. Division and D.O. Name
+          which header boxes are unfilled. Division and Prepared by
           can be waived with "Send anyway"; a missing approver
           cannot — the popup offers the approver field right here
           and that is the only way through. The backdrop follows
@@ -7594,19 +9446,19 @@ function RequisitionTab({
             </p>
             <ul className="mt-2 flex list-disc flex-col gap-1 pl-5 text-sm font-semibold">
               {missingDivision && <li>Division</li>}
-              {missingDoName && <li>D.O. Name</li>}
-              {missingApprover && <li>Approver (District Chief)</li>}
+              {missingDoName && <li>Prepared by</li>}
+              {missingApprover && <li>Approver</li>}
             </ul>
             {missingApprover ? (
               <>
                 <p className="mt-2 text-sm">
                   An approver is required before sending — this one
                   can&rsquo;t be waived. The approver must be
-                  different from the D.O. who prepared the
+                  different from the preparer who prepared the
                   requisition.
                 </p>
                 <label className="mt-2 flex flex-col gap-0.5 text-xs font-semibold text-[var(--dim)]">
-                  Approver — District Chief
+                  Approver
                   <input
                     value={popupApprover}
                     aria-label="Approver name"
@@ -7614,7 +9466,7 @@ function RequisitionTab({
                       setPopupApprover(e.target.value);
                       setPopupError(null);
                     }}
-                    placeholder="District Chief's name"
+                    placeholder="Approver's name"
                     className={fieldCls}
                     style={fieldStyle}
                     autoComplete="off"
@@ -8678,8 +10530,9 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
   // reachable from here as well as from HIT.
   const [policyOpen, setPolicyOpen] = useState(false);
   // Settings drawer: opened by the gear beside the BIT title; it
-  // holds the Accessibility entry and the Switch to HIT control
-  // (moved out of this strip and the business box).
+  // holds the Accessibility entry, the Switch to HIT control
+  // (moved out of this strip and the business box), and the Undo
+  // last action button under it (Beta 0.15).
   const [settingsOpen, setSettingsOpen] = useState(false);
   const state = useQuery({
     queryKey: ["bit", activeBusinessId],
@@ -8707,9 +10560,10 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
           with the settings gear beside it. The title flexes and
           truncates first — the gear is shrink-0 and is never
           crowded out. The gear opens the settings drawer from the
-          left, which now holds the Accessibility entry and the
+          left, which now holds the Accessibility entry, the
           Switch to HIT control (moved out of this strip and the
-          business box), so there is always exactly one way back
+          business box), and the Undo last action button under
+          Switch, so there is always exactly one way back
           to HIT, whatever state the business side is in. */}
       <div className="flex items-center gap-2 pt-2">
         <span
@@ -8742,6 +10596,10 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
             onSwitch();
           }}
         />
+        {/* The app's one Undo (Beta 0.15), under Switch to:
+            reverts the last action taken anywhere in the app.
+            There are no per-record Undo buttons. */}
+        <UndoLastActionItem />
       </SettingsDrawer>
 
       {policyOpen && (
@@ -8819,7 +10677,7 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
                         // audit #3): an item needs ordering when it
                         // is at or below par AND a par is set
                         // (par > 0). No-par items (par 0 — e.g. the
-                        // Quartermaster catalogue group) never count.
+                        // catalogue group) never count.
                         i.onHand <= i.par && i.par > 0,
                     ).length
                   }{" "}
@@ -8877,7 +10735,7 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
                         (i) => i.onHand <= i.par && i.par > 0,
                       ).length
                     : 0;
-                // Requisition businesses (TFS) call the third tab
+                // Requisition businesses call the third tab
                 // "Requisition"; every other business keeps
                 // "Order Email".
                 const label =
@@ -8937,6 +10795,8 @@ export function BitApp({ onSwitch }: { onSwitch: () => void }) {
               business={business}
               items={data.items}
               rounds={data.rounds}
+              resubmittedLines={data.resubmittedLines}
+              draftExtras={data.draftExtras}
             />
           )}
           {tab === "inventory" && (

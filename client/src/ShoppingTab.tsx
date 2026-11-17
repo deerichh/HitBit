@@ -345,39 +345,15 @@ function ItemRow({
     : bracketNote;
   const [savingsOpen, setSavingsOpen] = useState(false);
   // Source dropdown: every row carrying a found price gets a small
-  // "Source" toggle. Expanding shows the exact page the price was
-  // verified on (recorded by the scan jobs) as the FULL URL, styled
-  // as a hyperlink; tapping the URL opens a tiny menu with exactly
-  // "Open link" and "Copy link". When no source has been recorded
+  // "Source" toggle. Expanding shows where the price was found
+  // (e.g. "Found on Flipp"), with the website's name itself as the
+  // hyperlink — tapping it opens the exact page the price was
+  // verified on (recorded by the scan jobs) in a new tab. The full
+  // URL is never shown as text. When no source has been recorded
   // for the item, the expanded area says so — no URL is ever
   // guessed or constructed here.
   const [sourceOpen, setSourceOpen] = useState(false);
-  const [sourceMenuOpen, setSourceMenuOpen] = useState(false);
-  const [sourceCopied, setSourceCopied] = useState(false);
   const hasPrice = item.priceCents !== null;
-  const copySourceLink = async () => {
-    if (!item.source) return;
-    try {
-      await navigator.clipboard.writeText(item.source.url);
-    } catch {
-      // Clipboard API unavailable (older webview): fall back to a
-      // temporary textarea + execCommand copy.
-      const ta = document.createElement("textarea");
-      ta.value = item.source.url;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-      } catch {
-        /* copy unavailable — the URL stays visible to copy by hand */
-      }
-      document.body.removeChild(ta);
-    }
-    setSourceCopied(true);
-    window.setTimeout(() => setSourceCopied(false), 2000);
-  };
   // One dismissal spec for the row's dropdown menus (Beta 0.04,
   // audit #6): while the Savings or Source menu is open, a tap
   // outside this row's content, a scroll, or Escape closes it —
@@ -386,7 +362,6 @@ function ItemRow({
   useMenuDismiss(savingsOpen || sourceOpen, rowMenuRef, () => {
     setSavingsOpen(false);
     setSourceOpen(false);
-    setSourceMenuOpen(false);
   });
   // Two-step purchase: striking the item off alone changes nothing.
   // While it's struck and unconfirmed, the row grows a −/+ counter
@@ -553,7 +528,6 @@ function ItemRow({
                 aria-label={`${sourceOpen ? "Hide" : "Show"} source for ${item.item}`}
                 onClick={() => {
                   setSourceOpen((v) => !v);
-                  setSourceMenuOpen(false);
                 }}
                 className="hit24y inline-flex items-center gap-[3.45px] rounded-full px-[6.9px] py-[1.725px] text-[12px] leading-none font-bold"
                 style={{
@@ -596,61 +570,37 @@ function ItemRow({
         {sourceOpen && hasPrice && (
           <div className="mt-1.5">
             {item.source ? (
-              <>
-                <p className="text-[13px] font-medium text-[var(--dim)]">
+              <p className="flex flex-wrap items-center gap-x-1.5 text-[13px] font-medium text-[var(--dim)]">
+                <span>
                   {item.source.sourceType === "flipp"
-                    ? "Found on Flipp"
+                    ? "Found on"
                     : item.source.store
-                      ? `Found on the ${item.source.store} website`
-                      : "Found on a store website"}
-                </p>
-                <button
-                  type="button"
-                  aria-haspopup="menu"
-                  aria-expanded={sourceMenuOpen}
-                  aria-label={`Source link options for ${item.item}`}
-                  onClick={() => setSourceMenuOpen((v) => !v)}
-                  className="mt-0.5 block max-w-full text-left text-xs font-medium break-all underline"
+                      ? "Found on the"
+                      : "Found on a"}
+                </span>
+                <a
+                  href={item.source.url}
+                  target="_blank"
+                  rel="noreferrer"
+                  aria-label={`Open the ${
+                    item.source.sourceType === "flipp"
+                      ? "Flipp"
+                      : item.source.store
+                        ? `${item.source.store} website`
+                        : "store website"
+                  } page for ${item.item}`}
+                  className="font-bold underline"
                   style={{ color: "var(--accent)" }}
                 >
-                  {item.source.url}
-                </button>
-                {sourceMenuOpen && (
-                  <div
-                    role="menu"
-                    aria-label="Source link actions"
-                    className="mt-1.5 inline-flex overflow-hidden rounded-lg"
-                    style={{ border: "1px solid var(--border)" }}
-                  >
-                    <a
-                      role="menuitem"
-                      href={item.source.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center px-3 text-xs font-bold"
-                      style={{
-                        backgroundColor: "var(--surface)",
-                        color: "var(--accent)",
-                        minHeight: "2rem",
-                      }}
-                    >
-                      Open link
-                    </a>
-                    <button
-                      type="button"
-                      role="menuitem"
-                      onClick={copySourceLink}
-                      className="px-3 text-xs font-bold"
-                      style={{
-                        backgroundColor: "var(--surface-alt)",
-                        color: "var(--accent)",
-                      }}
-                    >
-                      {sourceCopied ? "Copied ✓" : "Copy link"}
-                    </button>
-                  </div>
-                )}
-              </>
+                  {item.source.sourceType === "flipp"
+                    ? "Flipp"
+                    : item.source.store
+                      ? item.source.store
+                      : "store website"}
+                </a>
+                {item.source.sourceType !== "flipp" &&
+                  item.source.store && <span>website</span>}
+              </p>
             ) : (
               <p className="text-xs italic text-[var(--dim)]">
                 No source recorded yet
@@ -818,12 +768,24 @@ function RecipeNeedRow({
             {price?.sourceUrl && (
               <SourceDropdown
                 name={entry.name}
-                heading={
+                headingBefore={
                   price.sourceType === "flipp"
-                    ? "Found on Flipp"
+                    ? "Found on"
                     : shownStore
-                      ? `Found on the ${shownStore} website`
-                      : "Found on a store website"
+                      ? "Found on the"
+                      : "Found on a"
+                }
+                siteName={
+                  price.sourceType === "flipp"
+                    ? "Flipp"
+                    : shownStore
+                      ? shownStore
+                      : "store website"
+                }
+                headingAfter={
+                  price.sourceType !== "flipp" && shownStore
+                    ? "website"
+                    : undefined
                 }
                 url={price.sourceUrl}
                 itemLabel={entry.name}
@@ -1062,7 +1024,13 @@ function RecipeNeedsSection({
   );
 }
 
-export function ShoppingTab() {
+export function ShoppingTab({
+  onAddReceiptItem,
+}: {
+  // A leftover (unmatched) receipt line's Add button: jumps to
+  // the HIT List tab with its Add item form open.
+  onAddReceiptItem: () => void;
+}) {
   const queryClient = useQueryClient();
   const [view, setView] = useState<"section" | "store">("section");
   const [hidePurchased, setHidePurchased] = useState(false);
@@ -1918,7 +1886,7 @@ export function ShoppingTab() {
         needsSection}
 
       {/* Receipt scans — receipt-photo purchased-item proposals to review */}
-      <ReceiptScansSection />
+      <ReceiptScansSection onAddItem={onAddReceiptItem} />
 
       {items.length > 0 && (
         <p className="mt-4 text-center text-xs text-[var(--dim)]">

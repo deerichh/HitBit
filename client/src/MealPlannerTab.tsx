@@ -104,26 +104,6 @@ function formatLong(key: string): string {
   return `${WEEKDAYS[(d.getDay() + 6) % 7]}, ${MONTHS[d.getMonth()]} ${d.getDate()}`;
 }
 
-/**
- * Derek's workdays — Toronto Fire Services, A platoon, on a 28-day
- * rotation of 24-hour shifts (source: TPFFA 2026 shift calendar,
- * verified across three consecutive cycles). A platoon works on
- * cycle offsets {0, 2, 5, 8, 11, 17, 20} of a 28-day cycle anchored
- * at 2026-11-06; a date is a workday when its offset from the anchor
- * (mod 28) is in that set. A workday is the day the 24-hour shift
- * starts (07:00). Computed at render time — nothing is stored, so
- * the marker works for any month, past or future.
- */
-const WORKDAY_ANCHOR_UTC = Date.UTC(2026, 10, 6);
-const WORKDAY_OFFSETS: ReadonlySet<number> = new Set([0, 2, 5, 8, 11, 17, 20]);
-
-function isWorkday(d: Date): boolean {
-  const dayUtc = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
-  const days = Math.round((dayUtc - WORKDAY_ANCHOR_UTC) / 86_400_000);
-  const offset = ((days % 28) + 28) % 28;
-  return WORKDAY_OFFSETS.has(offset);
-}
-
 function statusClasses(status: Status): string {
   if (status === "in") return "bg-[var(--ok-bg)] text-[var(--ok-text)]";
   if (status === "out") return "bg-[var(--out-bg)] text-[var(--out-text)]";
@@ -399,14 +379,14 @@ export function MealPlannerTab({
   // Week view is an accordion: every day has a header row, the
   // selected day's header is expanded to show its day box, and
   // tapping the expanded day's header collapses it back to a slim
-  // row (this flag). ALL days start COLLAPSED (Derek's review,
+  // row (this flag). ALL days start COLLAPSED (review,
   // Nov 16, 2026): the Week tab opens with every day a slim header
   // row, and nothing — picking a day elsewhere, pressing Today, or
   // switching to Week view — expands one on its own. Only tapping
   // a day's header expands that day.
   const [weekDayCollapsed, setWeekDayCollapsed] = useState(true);
   // The Meal List block sits between the day panel (the pick-a-meal
-  // box) and the protein stock box: the collapsible "Meal List"
+  // box): the collapsible "Meal List"
   // banner, a slim full-width bar carrying the title, the three
   // action buttons (Add, Scan, Generate) spread across the space
   // between the title and the meal count, and the count. The
@@ -550,28 +530,6 @@ export function MealPlannerTab({
     onError: () =>
       setEatenError("That usage couldn't be logged. Try again."),
   });
-  // Undo coverage (audit #5): the Eaten tap's Undo lives on the
-  // pick row itself, beside the "Eaten ✓" it produced — it
-  // reverses the whole tap's deductions (undoPickEaten) instead
-  // of only being reachable from the HIT List's Activity log.
-  const undoEaten = useMutation({
-    mutationFn: async (pickId: number) =>
-      await api.undoPickEaten({ pickId }),
-    onSuccess: (res) => {
-      if (res.ok) {
-        setEatenError(null);
-        queryClient.invalidateQueries({ queryKey: ["usage"] });
-        queryClient.invalidateQueries({ queryKey: ["hit"] });
-        queryClient.invalidateQueries({ queryKey: ["planner"] });
-        queryClient.invalidateQueries({ queryKey: ["list"] });
-        queryClient.invalidateQueries({ queryKey: ["activity"] });
-      } else {
-        setEatenError(res.error ?? "That usage couldn't be undone.");
-      }
-    },
-    onError: () => setEatenError("That usage couldn't be undone. Try again."),
-  });
-
   const data = planner.data;
   // All of a day's picks (up to 5), already in meal-of-day order from
   // the server.
@@ -762,30 +720,21 @@ export function MealPlannerTab({
   const renderEatenButton = (p: Pick) => {
     const m = data?.meals.find((x) => x.id === p.mealId) ?? null;
     if (!m) return null;
-    // Attribution + policy (audit #5): the pick's Eaten tap
-    // carries its actor and undo state — the Undo shows only
-    // when the current role may undo this tap (Reversible type,
-    // ownership satisfied); a Permanent Eaten type shows
-    // "Permanent" instead.
+    // Attribution (audit #5): the pick's Eaten tap carries its
+    // actor, shown beside the "Eaten ✓". (No Undo here since
+    // Beta 0.15 — the app's one Undo is in Settings.)
     const pickUndo = usageLog.data?.pickUndo.find((u) => u.pickId === p.id);
     return (
       <EatenButton
         mealName={p.mealName}
         eaten={eatenPickIds.has(p.id)}
         actor={pickUndo?.actor ?? null}
-        permanent={pickUndo?.permanent ?? false}
-        canUndo={pickUndo?.canUndo ?? false}
         pending={
           markEaten.isPending && markEaten.variables?.pick.id === p.id
         }
-        undoPending={undoEaten.isPending && undoEaten.variables === p.id}
         onMarkEaten={() => {
           setEatenError(null);
           markEaten.mutate({ pick: p, meal: m });
-        }}
-        onUndoEaten={() => {
-          setEatenError(null);
-          undoEaten.mutate(p.id);
         }}
       />
     );
@@ -1038,16 +987,6 @@ export function MealPlannerTab({
                               >
                                 {cell.date.getDate()}
                               </span>
-                              {isWorkday(cell.date) && (
-                                <span
-                                  aria-hidden="true"
-                                  title="Workday"
-                                  className="text-xs font-bold"
-                                  style={{ color: "var(--red)" }}
-                                >
-                                  W
-                                </span>
-                              )}
                             </span>
                             {/* Picks show as colour-coded letters
                                 only — no meal names in the month
@@ -1256,16 +1195,6 @@ export function MealPlannerTab({
                           >
                             {isExpanded ? "▾" : "▸"}
                           </button>
-                          {isWorkday(cell.date) && (
-                            <span
-                              aria-hidden="true"
-                              title="Workday"
-                              className="shrink-0 self-start text-xs font-bold"
-                              style={{ color: "var(--red)" }}
-                            >
-                              W
-                            </span>
-                          )}
                         </span>
                       </div>
                       {isExpanded && (
@@ -1285,7 +1214,7 @@ export function MealPlannerTab({
       {data && (
         <>
           {/* Meal List block: below the pick-a-meal box (day panel),
-              above the protein stock box. The banner bar carries
+              below the pick-a-meal box. The banner bar carries
               the "Meal List" title on the left and the meal count
               with the collapse chevron on the right; between them,
               spread to fill the space, sit the three action
@@ -1388,12 +1317,6 @@ export function MealPlannerTab({
             </div>
           </div>
 
-          <InventoryPanel
-            inventory={data.inventory}
-            updatedAt={data.inventoryUpdatedAt}
-            flags={flagSet}
-            onToggleFlag={toggleFlag}
-          />
         </>
       )}
       {activeMatch && activeMatchKey !== closedMatchKey && (
@@ -1491,9 +1414,7 @@ function HeartMatchPopup({
  * usage logged it reads "Eaten ✓". Tapping it
  * logs the meal's protein usage immediately — no popup. Once the
  * pick has usage logged it renders filled and disabled, so the
- * same pick can't be logged twice — and an Undo beside it (audit
- * #5) reverses the tap's deductions right here on the pick row,
- * returning the pick to its un-eaten state. Month view has no
+ * same pick can't be logged twice. Month view has no
  * button: it shows a plain ✓ beside the meal name of a pick that
  * has been marked eaten here.
  */
@@ -1501,26 +1422,16 @@ function EatenButton({
   mealName,
   eaten,
   actor,
-  permanent,
-  canUndo,
   pending,
-  undoPending,
   onMarkEaten,
-  onUndoEaten,
 }: {
   mealName: string;
   eaten: boolean;
   /** Attribution (audit #5): the role whose Eaten tap logged
       this pick's usage; null until the usage log reports it. */
   actor: "primary" | "connected" | null;
-  /** True when the Eaten action type is set Permanent. */
-  permanent: boolean;
-  /** True when the current role may undo this tap. */
-  canUndo: boolean;
   pending: boolean;
-  undoPending: boolean;
   onMarkEaten: () => void;
-  onUndoEaten: () => void;
 }) {
   if (eaten) {
     return (
@@ -1543,30 +1454,6 @@ function EatenButton({
         {actor && (
           <span className="text-xs text-[var(--dim)]">
             {actor === "connected" ? "Connected account" : "Primary"}
-          </span>
-        )}
-        {canUndo && (
-          <button
-            type="button"
-            disabled={undoPending}
-            aria-label={`Undo marking ${mealName} as eaten — restore the deducted stock`}
-            onClick={(e) => {
-              e.stopPropagation();
-              onUndoEaten();
-            }}
-            className="min-h-6 shrink-0 rounded-full border px-2 py-0.5 text-xs font-bold disabled:opacity-50"
-            style={{
-              borderColor: "var(--border)",
-              color: "var(--accent)",
-              backgroundColor: "var(--surface)",
-            }}
-          >
-            {undoPending ? "Undoing…" : "Undo"}
-          </button>
-        )}
-        {!canUndo && permanent && (
-          <span className="text-xs font-bold text-[var(--dim)]">
-            Permanent
           </span>
         )}
       </span>
@@ -1595,7 +1482,7 @@ function EatenButton({
 
 /**
  * The day box (week view). Section order: the date, then the
- * "Plan a…" section, then the day's chosen meals (Derek's review,
+ * "Plan a…" section, then the day's chosen meals (review,
  * Nov 16, 2026). A single first-step query asks "Plan a…" with four
  * tappable choices — Breakfast, Lunch, Dinner, Snack. Below it the
  * day's existing picks display, grouped by meal of the day, each
@@ -1706,7 +1593,7 @@ function DayPanel({
         </p>
       )}
 
-      {/* Section order in the day box (Derek's review, Nov 16,
+      {/* Section order in the day box (review, Nov 16,
           2026): the date first, then the "Plan a…" section, then
           the chosen meals. Step 1 of picking: the "Plan a…" query.
           Tapping a choice reveals that type's picking flow beneath
@@ -2595,8 +2482,12 @@ function CoverageFraction({
   );
 }
 
-/** One ingredient's on-hand mark, beside its name in a list. */
+/** One ingredient's on-hand mark, beside its name in a list.
+    Missing ingredients (not in the inventory, or matched but out
+    of stock) get no mark at all — the list shows every ingredient,
+    and only what's on hand (or short) is labelled. */
 function CoverageChip({ mark }: { mark: CoverageMark }) {
+  if (mark.status === "missing") return null;
   if (mark.status === "covered") {
     return (
       <span
@@ -2625,14 +2516,7 @@ function CoverageChip({ mark }: { mark: CoverageMark }) {
       </span>
     );
   }
-  return (
-    <span
-      className="min-w-0 rounded-full px-2 py-0.5 text-[13px] font-bold"
-      style={{ backgroundColor: "var(--red-soft)", color: "var(--red)" }}
-    >
-      {mark.matchedItem ? `Out of stock · ${mark.matchedItem}` : "Not in the inventory"}
-    </span>
-  );
+  return null;
 }
 
 type IngredientDraft = { name: string; quantity: string; unit: string };
@@ -4275,7 +4159,8 @@ function RecipeGenerator({
               ) : null}
               <SourceDropdown
                 name={recipe.source.dishName}
-                heading={`Recipe from ${recipe.source.site}`}
+                headingBefore="Recipe from"
+                siteName={recipe.source.site}
                 url={recipe.source.url}
                 itemLabel={recipe.source.dishName}
               />
@@ -4332,186 +4217,12 @@ function RecipeGenerator({
   );
 }
 
-/**
- * Protein stock panel: the proteins the meals reference, with counts
- * read from this app's HIT List cache. Refreshing runs the same HIT
- * List refresh as the HIT List tab, so one sync feeds both.
- */
-function InventoryPanel({
-  inventory,
-  updatedAt,
-  flags,
-  onToggleFlag,
-}: {
-  inventory: Planner["inventory"];
-  updatedAt: string | null;
-  flags: Set<string>;
-  onToggleFlag: (sheetName: string) => void;
-}) {
-  const queryClient = useQueryClient();
-  const [message, setMessage] = useState<string | null>(null);
-  const [expanded, setExpanded] = useState(false);
-  const refresh = useMutation({
-    mutationFn: async () => await api.refreshHitList({}),
-    onSuccess: (result) => {
-      setMessage(
-        result.started
-          ? "Refreshing from the HIT List — new counts land here within a minute or so."
-          : "The refresh couldn't start. Try again in a bit.",
-      );
-      // Give the background task a head start, then refetch.
-      setTimeout(() => {
-        queryClient.invalidateQueries({ queryKey: ["planner"] });
-        queryClient.invalidateQueries({ queryKey: ["hit"] });
-      }, 20000);
-    },
-    onError: () =>
-      setMessage("The refresh couldn't start. Try again in a bit."),
-  });
-
-  const uncounted = inventory.filter((i) => i.stock == null);
-
-  const syncedLabel = updatedAt
-    ? `Last synced ${new Date(updatedAt).toLocaleString(undefined, {
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-      })}`
-    : null;
-
-  return (
-    <section
-      aria-label="Protein stock"
-      className="mt-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] text-[var(--text)]"
-    >
-      <div className="flex items-center justify-between gap-2 p-4">
-        <button
-          type="button"
-          aria-expanded={expanded}
-          aria-controls="protein-stock-panel"
-          onClick={() => setExpanded((v) => !v)}
-          className="flex min-w-0 flex-1 items-center justify-between gap-3 text-left"
-        >
-          <span className="min-w-0">
-            <span className="block text-xl font-semibold">
-              Protein stock
-            </span>
-            <span className="mt-0.5 block truncate text-sm text-[var(--dim)]">
-              {inventory.length} items
-              {syncedLabel ? ` · ${syncedLabel}` : ""}
-              {flags.size > 0
-                ? ` · ${flags.size} flagged for shopping`
-                : ""}
-            </span>
-          </span>
-          <span
-            aria-hidden="true"
-            className="shrink-0 text-lg text-[var(--dim)]"
-          >
-            {expanded ? "▾" : "▸"}
-          </span>
-        </button>
-      </div>
-      {expanded && (
-        <div
-          id="protein-stock-panel"
-          className="border-t border-[var(--border)] px-4 pt-3 pb-4"
-        >
-          <div className="flex items-center justify-between gap-2">
-            <p className="text-sm text-[var(--dim)]">
-              Counts come from the HIT List tab — the same inventory as
-              the HIT List tab in this app.
-            </p>
-            <button
-              type="button"
-              disabled={refresh.isPending}
-              onClick={() => {
-                setMessage(null);
-                refresh.mutate();
-              }}
-              className="shrink-0 rounded-lg border border-[var(--border)] bg-[var(--surface)] px-3 py-1.5 text-sm font-medium disabled:opacity-40"
-            >
-              {refresh.isPending ? "Starting…" : "Refresh from HIT List"}
-            </button>
-          </div>
-          {message && <p className="mt-2 text-sm">{message}</p>}
-          <ul className="mt-3 grid grid-cols-1 gap-1.5 sm:grid-cols-2">
-            {inventory.map((item) => {
-              const status: Status =
-                item.stock == null ? "unknown" : item.stock > 0 ? "in" : "out";
-              const flagged = flags.has(item.sheetName);
-              return (
-                <li
-                  key={item.sheetName}
-                  className={`flex items-center justify-between gap-2 rounded-lg px-3 py-2 ${statusClasses(status)}`}
-                >
-                  <span className="font-medium">{item.sheetName}</span>
-                  <span className="flex items-center gap-2">
-                    <span className="text-sm">
-                      {item.stock == null
-                        ? "Not counted yet"
-                        : item.stock === 0
-                          ? "Out"
-                          : `${item.stock} on hand`}
-                    </span>
-                    {(item.stock === 0 || flagged) && (
-                      <button
-                        type="button"
-                        onClick={() => onToggleFlag(item.sheetName)}
-                        className="shrink-0 rounded-md border border-[var(--border)] bg-[var(--surface)] px-2 py-1 text-xs font-medium text-[var(--text)]"
-                      >
-                        {flagged ? "Flagged ✓ · Unflag" : "Flag for shopping"}
-                      </button>
-                    )}
-                  </span>
-                </li>
-              );
-            })}
-          </ul>
-          {uncounted.length > 0 && (
-            <p className="mt-2 text-sm text-[var(--dim)]">
-              {uncounted.map((i) => i.sheetName).join(", ")}{" "}
-              {uncounted.length === 1 ? "isn't" : "aren't"} in the HIT List
-              yet — add a row there and the next sync will count{" "}
-              {uncounted.length === 1 ? "it" : "them"} here.
-            </p>
-          )}
-          {flags.size > 0 && (
-            <div className="mt-4">
-              <h3 className="text-sm font-semibold">Flagged for shopping</h3>
-              <ul className="mt-1.5 flex flex-wrap gap-1.5">
-                {[...flags].sort().map((sheetName) => (
-                  <li
-                    key={sheetName}
-                    className="flex items-center gap-1 rounded-full bg-[var(--out-bg)] py-1 pr-1 pl-3 text-sm font-medium text-[var(--out-text)]"
-                  >
-                    {sheetName}
-                    <button
-                      type="button"
-                      aria-label={`Remove shopping flag for ${sheetName}`}
-                      onClick={() => onToggleFlag(sheetName)}
-                      className="rounded-full px-1.5 font-medium"
-                    >
-                      ✕
-                    </button>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
-    </section>
-  );
-}
-
 type OptionDraft = { label: string; sheetName: string };
 
 /**
  * The Meal List dropdown body and the add-meal form. The "Meal
- * List" banner sits in the Meal List block, between the day panel
- * (the pick-a-meal box) and the protein stock box, and carries the
+ * List" banner sits in the Meal List block, below the day panel
+ * (the pick-a-meal box), and carries the
  * Add, Scan, and Generate buttons between its title and its meal
  * count; the dropdown's list holds only meals, and the list and
  * the form each render directly under the banner.

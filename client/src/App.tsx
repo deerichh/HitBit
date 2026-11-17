@@ -10,6 +10,7 @@ import {
 GearButton,
 SettingsDrawer,
 SettingsDrawerItem,
+UndoLastActionItem,
 } from "./SettingsDrawer";
 import { RecipeVideosSection } from "./RecipeVideosSection";
 
@@ -24,7 +25,7 @@ type Side = "chooser" | "hit" | "bit";
     carrying into the integer at 0.99 → 1.00. (The counter ran as
     Alpha up to 0.99; update 101 renamed it Beta and restarted the
     numbering at 0.01.) */
-export const APP_TITLE = "HitBit - Beta 0.01";
+export const APP_TITLE = "HitBit - Beta 0.15";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "meals", label: "Meal Planner" },
@@ -397,8 +398,9 @@ function TruckScene() {
  * Two large tappable choices — HIT (the household side, unchanged)
  * and BIT (the business side, its own data). Each side's settings
  * drawer (the gear beside its title) carries the switch control
- * that returns here — "Switch to BIT" on the household side,
- * "Switch to HIT" on the business side.
+ * that goes straight to the other side — "Switch to BIT" on the
+ * household side lands directly on BIT, "Switch to HIT" on the
+ * business side lands directly on HIT; neither returns here.
  */
 function LaunchChooser({ onPick }: { onPick: (side: Side) => void }) {
   return (
@@ -442,11 +444,18 @@ function LaunchChooser({ onPick }: { onPick: (side: Side) => void }) {
 
 export function App() {
   // A fresh launch lands on the chooser; entering a side shows that
-  // side's interface, and each side's switch control returns
-  // here. Component state only — nothing is persisted, so relaunching
-  // the app always shows the chooser again.
+  // side's interface, and each side's switch control jumps straight
+  // to the other side (never back here). Component state only —
+  // nothing is persisted, so relaunching the app always shows the
+  // chooser again.
   const [side, setSide] = useState<Side>("chooser");
   const [tab, setTab] = useState<Tab>("meals");
+  // Leftover receipt lines' Add button (Shopping List tab): each
+  // tap bumps this signal and lands the user on the HIT List tab,
+  // whose Add item form opens on the signal — the same place the
+  // HIT List's own "Add item" button leads. The HIT List tab
+  // resets the signal to 0 once it has opened the form.
+  const [hitAddSignal, setHitAddSignal] = useState(0);
   // HIT setup questionnaire (Alpha 0.90): opened from the Setup
   // entry in the settings drawer; an in-flow page that takes
   // the place of the tab content while it's open. It never opens
@@ -478,9 +487,7 @@ export function App() {
           <LaunchChooser onPick={(s) => setSide(s)} />
         )}
 
-        {side === "bit" && (
-          <BitApp onSwitch={() => setSide("chooser")} />
-        )}
+        {side === "bit" && <BitApp onSwitch={() => setSide("hit")} />}
 
         {side === "hit" && (
           <>
@@ -490,8 +497,8 @@ export function App() {
                 and is never crowded out. The gear opens the
                 settings drawer from the left, which now holds the
                 Accessibility entry, Household Setup, Recipe
-                Videos, and the switch control that returns to the
-                launch chooser (all moved out of this strip). */}
+                Videos, and the switch control that goes straight
+                to the BIT side (all moved out of this strip). */}
             <div className="flex items-center gap-2 pt-2">
               <span
                 className="min-w-0 flex-1 truncate text-2xl font-extrabold sm:text-3xl"
@@ -531,9 +538,13 @@ export function App() {
                   setSettingsOpen(false);
                   setHitSetupOpen(false);
                   setAccountOpen(false);
-                  setSide("chooser");
+                  setSide("bit");
                 }}
               />
+              {/* The app's one Undo (Beta 0.15), under Switch to:
+                  reverts the last action taken anywhere in the
+                  app. There are no per-record Undo buttons. */}
+              <UndoLastActionItem />
               {/* Recipe Videos lives in the drawer now (moved out
                   of the bottom of the Meal Planner tab): its
                   collapsible section renders here in full. */}
@@ -575,8 +586,20 @@ export function App() {
               </div>
             </nav>
 
-            {tab === "shopping" && <ShoppingTab />}
-            {tab === "hit" && <HitListTab />}
+            {tab === "shopping" && (
+              <ShoppingTab
+                onAddReceiptItem={() => {
+                  setHitAddSignal((n) => n + 1);
+                  setTab("hit");
+                }}
+              />
+            )}
+            {tab === "hit" && (
+              <HitListTab
+                addItemSignal={hitAddSignal}
+                onAddItemSignalHandled={() => setHitAddSignal(0)}
+              />
+            )}
             {tab === "meals" && (
               <MealPlannerTab suggestionSeed={suggestionSeed} />
             )}

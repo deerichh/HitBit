@@ -22,7 +22,7 @@
 // The HIT List's per-item "Use" button and its quick-use sheet were
 // removed (Nov 13, 2026): there is no manual quick-use any more.
 // Usage is recorded by meal Eaten confirmations and read back in
-// the HIT List tab's Usage log dropdown (with Undo); older manual
+// the HIT List tab's Usage log dropdown; older manual
 // entries in that log remain as history.
 
 export type IngredientLike = {

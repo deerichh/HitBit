@@ -1,5 +1,5 @@
 {
-  "name": "hatch-ts-space-shopping-list",
+  "name": "hatch-ts-space-hitbit",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.3.10",
@@ -13,6 +13,7 @@
     "@hatch/space-sdk": "file:/opt/hatch/skills/spaces/ts-runtime/dist/space-sdk.tgz",
     "@tanstack/react-query": "5.100.10",
     "drizzle-orm": "0.45.2",
+    "pdf-lib": "1.17.1",
     "react": "19.2.5",
     "react-dom": "19.2.5",
     "recharts": "2.15.3",

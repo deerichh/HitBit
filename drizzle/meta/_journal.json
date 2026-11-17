@@ -188,7 +188,7 @@
       "idx": 26,
       "version": "6",
       "when": 1794679063675,
-      "tag": "0027_bit_tfs_remove_unchosen_categories",
+      "tag": "0027_bit_remove_unchosen_categories",
       "breakpoints": true
     },
     {
@@ -252,6 +252,27 @@
       "version": "6",
       "when": 1794802359509,
       "tag": "0036_account_roles_and_undo_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 36,
+      "version": "6",
+      "when": 1794863822298,
+      "tag": "0037_bit_requisition_saved_form",
+      "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "6",
+      "when": 1794880937164,
+      "tag": "0038_receipt_scan_total",
+      "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "6",
+      "when": 1794882863118,
+      "tag": "0039_bit_requisition_line_checked_off_stamp",
       "breakpoints": true
     }
   ]

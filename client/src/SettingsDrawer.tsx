@@ -1,7 +1,9 @@
 import { useEffect, useState, type ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { api } from "./api";
 
 /**
- * Settings gear + left drawer (Derek's review changes, Nov 16, 2026).
+ * Settings gear + left drawer.
  *
  * A gear button sits beside the app title in both the HIT and BIT
  * headers. The gear is pronounced — 44px, accent-filled, with a
@@ -12,8 +14,9 @@ import { useEffect, useState, type ReactNode } from "react";
  * side of the screen — the app's settings tab. The controls that
  * used to live in the side strips and the BIT business box moved
  * here: the Accessibility page entry, Household Setup (HIT side),
- * the Switch to HIT / BIT control, and the Recipe Videos section
- * (HIT side).
+ * the Switch to HIT / BIT control, the Undo last action button
+ * (Beta 0.15 — the app's only Undo, under Switch on both sides),
+ * and the Recipe Videos section (HIT side).
  *
  * Dismissal follows the app's existing popup rules: a tap on the
  * backdrop (outside the panel) or Escape closes it. The drawer
@@ -104,6 +107,71 @@ export function SettingsDrawerItem({
         ›
       </span>
     </button>
+  );
+}
+
+/**
+ * The app's ONE Undo (Beta 0.15): a drawer entry under the
+ * Switch control on both sides. There are no per-record Undo
+ * buttons anywhere anymore — this button reverts the LAST
+ * action taken anywhere in the app (the newest undoable one,
+ * under the undo policy), naming it underneath so it's clear
+ * what a press will revert; pressing again reverts the action
+ * before that. The result of a press is reported in place.
+ */
+export function UndoLastActionItem() {
+  const queryClient = useQueryClient();
+  const [msg, setMsg] = useState<string | null>(null);
+  const [msgIsError, setMsgIsError] = useState(false);
+  const last = useQuery({
+    queryKey: ["lastUndoableAction"],
+    queryFn: async () => await api.getLastUndoableAction({}),
+  });
+  const undo = useMutation({
+    mutationFn: async () => await api.undoLastAction({}),
+    onSuccess: (res) => {
+      if (res.ok) {
+        setMsg(`Undone — ${res.label ?? "the last action"}.`);
+        setMsgIsError(false);
+      } else {
+        setMsg(res.error ?? "That action couldn't be undone.");
+        setMsgIsError(true);
+      }
+      void queryClient.invalidateQueries();
+    },
+    onError: () => {
+      setMsg("That action couldn't be undone. Try again.");
+      setMsgIsError(true);
+    },
+  });
+  const label = last.data?.label ?? null;
+  return (
+    <div>
+      <button
+        type="button"
+        disabled={undo.isPending || last.isPending || label == null}
+        onClick={() => undo.mutate()}
+        className="flex w-full items-center justify-between gap-2 rounded-[var(--radius)] border border-[var(--border)] bg-[var(--surface)] px-4 py-3 text-left text-base font-semibold text-[var(--text)] disabled:opacity-50"
+      >
+        <span>{undo.isPending ? "Undoing…" : "↩ Undo last action"}</span>
+      </button>
+      <p className="px-1 pt-1.5 text-sm text-[var(--dim)]">
+        {last.isPending
+          ? "Checking the last action…"
+          : label != null
+            ? `Last action: ${label}`
+            : "Nothing to undo right now."}
+      </p>
+      {msg && (
+        <p
+          className="px-1 pt-1 text-sm font-semibold"
+          style={{ color: msgIsError ? "var(--red)" : "var(--accent)" }}
+          role="status"
+        >
+          {msg}
+        </p>
+      )}
+    </div>
   );
 }
 

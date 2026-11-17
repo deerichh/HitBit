@@ -88,7 +88,8 @@ function VideoCard({ entry }: { entry: VideoEntry }) {
         <div className="mt-3">
           <SourceDropdown
             name={entry.sourceName ?? entry.recipeName}
-            heading={`Recipe from ${entry.sourceSite}`}
+            headingBefore="Recipe from"
+            siteName={entry.sourceSite}
             url={entry.sourceUrl}
             itemLabel={entry.sourceName ?? entry.recipeName}
           />
@@ -137,7 +138,7 @@ function VideoCard({ entry }: { entry: VideoEntry }) {
  * drawer (the gear beside the app title), moved there from the
  * bottom of the Meal Planner tab (before that it was its own
  * top-level Media tab). Collapsed by default, styled like the Meal
- * List / Protein stock collapsibles. Expanded it shows exactly what
+ * List collapsible. Expanded it shows exactly what
  * the Media tab showed: every recipe with a video requested or
  * ready — name, meal type, protein, people, ingredients,
  * walkthrough, and the embedded player when a video URL is stored.

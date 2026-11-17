@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { fileToBase64 } from "@hatch/space-sdk/client";
 import { api, type ApiResponse } from "./api";
@@ -130,6 +130,11 @@ function alertTime(iso: string): string {
   });
 }
 
+/** A receipt money amount the way it belongs on a receipt: $12.34. */
+function receiptMoneyText(value: number): string {
+  return `$${value.toFixed(2)}`;
+}
+
 const ALERT_KIND_LABEL: Record<AlertItem["kind"], string> = {
   sale: "Sale",
   scan: "Scan",
@@ -171,21 +176,6 @@ export function AlertsStrip() {
     onSuccess: () =>
       queryClient.invalidateQueries({ queryKey: ["alerts"] }),
   });
-  // Undo coverage (audit #5): a dismissed alert can be restored
-  // from the Dismissed list below — dismissal is reversible.
-  // Policy (audit #5, second half): the Restore shows only when
-  // the current role may undo this dismissal (alert dismissals
-  // Reversible + ownership); a refusal from the server is shown.
-  const [restoreNote, setRestoreNote] = useState<string | null>(null);
-  const restore = useMutation({
-    mutationFn: async (id: number) => await api.restoreAlert({ id }),
-    onSuccess: (res) => {
-      setRestoreNote(res.ok ? null : (res.error ?? "That alert couldn't be restored."));
-      queryClient.invalidateQueries({ queryKey: ["alerts"] });
-    },
-    onError: () => setRestoreNote("That alert couldn't be restored. Try again."),
-  });
-
   const data = alerts.data;
   if (
     !data ||
@@ -322,34 +312,9 @@ export function AlertsStrip() {
                     <ActorTag actor={a.actor} permanent={a.permanent} />
                   </p>
                 </div>
-                {a.permanent ? (
-                  <span className="shrink-0 self-start rounded-full px-3 py-1 text-xs font-bold text-[var(--dim)]">
-                    Permanent
-                  </span>
-                ) : a.canUndo ? (
-                <button
-                  type="button"
-                  aria-label={`Restore alert: ${a.title}`}
-                  disabled={restore.isPending && restore.variables === a.id}
-                  onClick={() => restore.mutate(a.id)}
-                  className="shrink-0 self-start rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                  style={{
-                    backgroundColor: "var(--surface-alt)",
-                    color: "var(--accent)",
-                    border: "1px solid var(--border)",
-                  }}
-                >
-                  Restore
-                </button>
-                ) : null}
               </li>
             ))}
           </ul>
-          {restoreNote && (
-            <p className="mt-1 px-1 text-xs font-semibold text-[var(--red)]" role="alert">
-              {restoreNote}
-            </p>
-          )}
         </div>
       )}
     </section>
@@ -439,16 +404,58 @@ async function decodeQrCode(file: File): Promise<string | null> {
  * The review card for one proposed receipt scan: the items
  * purchased on the receipt matched to HIT List items, with editable
  * quantities (the quantities purchased) and a remove control,
- * unmatched receipt lines listed plainly (they add nothing), and
- * the Confirm / Dismiss pair. Nothing is recorded until Confirm is
- * pressed.
+ * unmatched receipt lines listed with an Add button beside each
+ * (it jumps to the HIT List's Add item form, so the leftover can
+ * be put on the list), and the Confirm / Dismiss pair. Nothing is
+ * recorded until Confirm is pressed.
  */
+
+/**
+ * One receipt line the reader couldn't match to the HIT List, with
+ * its Add button: tapping it takes the user to the HIT List tab
+ * with the Add item form open — the same place the HIT List's own
+ * "Add item" button leads — so the leftover item can be added to
+ * the list from there.
+ */
+function LeftoverLine({
+  line,
+  onAddItem,
+}: {
+  line: ReceiptLine;
+  onAddItem: () => void;
+}) {
+  return (
+    <li className="flex items-center gap-2">
+      <span className="min-w-0 flex-1 text-xs text-[var(--dim)]">
+        {line.receiptText}
+        {line.quantity > 0 ? ` × ${line.quantity}` : ""}
+        {line.price != null ? ` · ${receiptMoneyText(line.price)}` : ""}
+      </span>
+      <button
+        type="button"
+        aria-label={`Add ${line.receiptText} to the HIT List`}
+        onClick={onAddItem}
+        className="shrink-0 rounded-full px-3 py-0.5 text-xs font-bold"
+        style={{
+          backgroundColor: "var(--surface)",
+          color: "var(--accent)",
+          border: "1px solid var(--accent)",
+        }}
+      >
+        Add
+      </button>
+    </li>
+  );
+}
+
 function ReceiptProposal({
   scan,
   onDone,
+  onAddItem,
 }: {
   scan: ReceiptScan;
   onDone: (message: string) => void;
+  onAddItem: () => void;
 }) {
   const queryClient = useQueryClient();
   const [lines, setLines] = useState<ReceiptLine[]>(() =>
@@ -522,6 +529,12 @@ function ReceiptProposal({
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-semibold text-[var(--text)]">
                   {l.item}
+                  {l.price != null && (
+                    <span className="font-normal text-[var(--dim)]">
+                      {" "}
+                      · {receiptMoneyText(l.price)}
+                    </span>
+                  )}
                 </p>
                 {l.receiptText && l.receiptText !== l.item && (
                   <p className="truncate text-[13px] text-[var(--dim)]">
@@ -573,18 +586,17 @@ function ReceiptProposal({
           <p className="text-[13px] font-bold text-[var(--dim)]">
             On the receipt but not matched to the HIT List:
           </p>
-          <ul className="mt-0.5 flex flex-col gap-0.5">
+          <ul className="mt-0.5 flex flex-col gap-1">
             {unmatched.map((l, idx) => (
-              <li
-                key={idx}
-                className="text-xs text-[var(--dim)]"
-              >
-                {l.receiptText}
-                {l.quantity > 0 ? ` × ${l.quantity}` : ""}
-              </li>
+              <LeftoverLine key={idx} line={l} onAddItem={onAddItem} />
             ))}
           </ul>
         </div>
+      )}
+      {scan.total != null && (
+        <p className="mt-2 text-sm font-bold text-[var(--text)]">
+          Receipt total: {receiptMoneyText(scan.total)}
+        </p>
       )}
       <div className="mt-2 flex items-center gap-2">
         <button
@@ -624,28 +636,62 @@ function ReceiptProposal({
  * the "Receipt scan" entry point (take or upload a photo of a store
  * receipt — a printed receipt, a receipt photo carrying a QR code,
  * or a photo that is only a QR code), any proposal awaiting review,
- * pending scans waiting to be read, and past scans' outcomes in
- * brief. Sending a photo records nothing — stock only moves when a
- * proposal's Confirm is pressed. (The Meal Planner tab's separate
- * "Scan recipe" link / file import that saves a meal is a different
+ * scans whose read is still running, and past scans' outcomes in
+ * brief. Sending a photo reads it automatically in that same send
+ * (requestReceiptScan — the app scans the photo itself for the
+ * purchased items, so the review is usually ready right away), and
+ * any scan found still waiting gets read from here the same way
+ * (its stored photo is fetched and sent to readReceiptScanNow) —
+ * retried every few minutes while it stays waiting, with a
+ * "Read now" button on each waiting scan's card, so nothing
+ * sits unread. Sending a
+ * photo records nothing — stock only moves when a proposal's
+ * Confirm is pressed. (The Meal Planner tab's separate "Scan
+ * recipe" link / file import that saves a meal is a different
  * feature and is not touched by this area.)
  */
-export function ReceiptScansSection() {
+export function ReceiptScansSection({
+  onAddItem,
+}: {
+  onAddItem: () => void;
+}) {
   const queryClient = useQueryClient();
   const fileRef = useRef<HTMLInputElement>(null);
   const [openOverride, setOpenOverride] = useState<boolean | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // Scans whose total re-read a Restore started (Beta 0.14): the
+  // list polls while one is outstanding, so the total appears on
+  // its own when the re-read writes it back.
+  const [totalWatchIds, setTotalWatchIds] = useState<number[]>([]);
 
   const scans = useQuery({
     queryKey: ["receipt-scans"],
     queryFn: () => api.getReceiptScans({}),
     // A pending scan's proposal lands asynchronously; poll while
     // one is outstanding so the review card appears on its own.
+    // A restored scan's total re-read lands the same way.
     refetchInterval: (query) =>
-      query.state.data?.scans.some((s) => s.status === "pending")
+      query.state.data?.scans.some((s) => s.status === "pending") ||
+      (query.state.data?.scans ?? []).some(
+        (s) => totalWatchIds.includes(s.id) && s.total == null,
+      )
         ? 8000
         : false,
   });
+
+  // Stop watching a scan once its total has landed (or it has
+  // left the list) — the poll above keys off this list.
+  const watchedScans = scans.data?.scans;
+  useEffect(() => {
+    setTotalWatchIds((prev) => {
+      if (prev.length === 0 || !watchedScans) return prev;
+      const next = prev.filter((id) => {
+        const scan = watchedScans.find((s) => s.id === id);
+        return scan != null && scan.total == null;
+      });
+      return next.length === prev.length ? prev : next;
+    });
+  }, [watchedScans]);
 
   const send = useMutation({
     mutationFn: async (file: File) => {
@@ -664,9 +710,11 @@ export function ReceiptScansSection() {
     onSuccess: ({ res, qrFound }) => {
       if (res.ok) {
         setNote(
-          qrFound
-            ? "Receipt photo sent — QR code found, so the reader can follow it to the digital receipt. Once it's been read, the items you purchased will appear here for your review. Nothing is added until you confirm."
-            : "Receipt photo sent — once it's been read, the items you purchased will appear here for your review. Nothing is added until you confirm.",
+          res.status === "proposed"
+            ? "Receipt read — the items you purchased are below for your review. Nothing is added to the inventory until you confirm."
+            : qrFound
+              ? "Receipt photo sent — QR code found, so the reader can follow it to the digital receipt. It's being read now, and the items you purchased will appear here for your review. Nothing is added until you confirm."
+              : "Receipt photo sent — it's being read now, and the items you purchased will appear here for your review. Nothing is added until you confirm.",
         );
         setOpenOverride(true);
       } else {
@@ -677,23 +725,168 @@ export function ReceiptScansSection() {
     onError: () => setNote("That receipt photo couldn't be sent. Try again."),
   });
 
-  // Undo coverage (audit #5): a confirmed scan's own Undo,
-  // reversing the stock additions its confirmation recorded.
-  const undoScan = useMutation({
-    mutationFn: async (id: number) => await api.undoReceiptScan({ id }),
-    onSuccess: (res) => {
+  // Restore (Beta 0.13, recovery flow Beta 0.14): brings back a
+  // scan that was removed by accident — a dismissed scan returns
+  // to review, and a confirmed scan whose Undo was tapped by
+  // mistake gets the stock it added back. recoverReceiptScan does
+  // that restore and, when the scan has no total stored (its
+  // original read predates totals being captured, so none was
+  // ever saved even though the total is printed on the photo),
+  // also starts a re-read of the photo for the total, so the
+  // restored scan comes back complete.
+  const restoreScan = useMutation({
+    mutationFn: async (id: number) => await api.recoverReceiptScan({ id }),
+    onSuccess: (res, id) => {
+      if (res.ok && res.rereadStarted) {
+        setTotalWatchIds((prev) =>
+          prev.includes(id) ? prev : [...prev, id],
+        );
+      }
       setNote(
-        res.ok
-          ? "Receipt scan undone — the stock it added was taken back off."
-          : (res.error ?? "That scan couldn't be undone."),
+        !res.ok
+          ? (res.error ?? "That scan couldn't be restored.")
+          : res.rereadStarted
+            ? "Receipt scan restored — its photo is being re-read for the total, which will show here shortly."
+            : res.total != null
+              ? `Receipt scan restored — its total is ${receiptMoneyText(res.total)}.`
+              : "Receipt scan restored.",
       );
       queryClient.invalidateQueries({ queryKey: ["receipt-scans"] });
       queryClient.invalidateQueries({ queryKey: ["hit"] });
       queryClient.invalidateQueries({ queryKey: ["activity"] });
       queryClient.invalidateQueries({ queryKey: ["list"] });
     },
-    onError: () => setNote("That scan couldn't be undone. Try again."),
+    onError: () => setNote("That scan couldn't be restored. Try again."),
   });
+
+  // Re-read for the total (Beta 0.13): scans read before totals
+  // were captured have no total stored — the reader back then
+  // only pulled items and quantities — so their cards offer this:
+  // the tab fetches the scan's stored photo and sends it to
+  // rereadReceiptScan, which fills in the receipt's total and the
+  // line prices from the photo and changes nothing else.
+  const [rereadingIds, setRereadingIds] = useState<number[]>([]);
+  const rereadScan = useMutation({
+    mutationFn: async (scan: ReceiptScan) => {
+      if (!scan.imageUrl) throw new Error("no stored photo");
+      const res = await fetch(scan.imageUrl);
+      if (!res.ok) throw new Error("stored photo fetch failed");
+      const photo = await res.blob();
+      const image = await fileToBase64(photo);
+      if (!image.mimeType) {
+        image.mimeType = "image/jpeg";
+      }
+      return await api.rereadReceiptScan({ id: scan.id, image });
+    },
+    onMutate: (scan) =>
+      setRereadingIds((prev) =>
+        prev.includes(scan.id) ? prev : [...prev, scan.id],
+      ),
+    onSuccess: (res) => {
+      setNote(
+        !res.ok
+          ? (res.error ?? "That receipt couldn't be re-read.")
+          : res.total != null
+            ? `Receipt re-read — its total is ${receiptMoneyText(res.total)}.`
+            : "That receipt was re-read, but its total still couldn't be read from the photo.",
+      );
+      queryClient.invalidateQueries({ queryKey: ["receipt-scans"] });
+    },
+    onError: () => setNote("That receipt couldn't be re-read. Try again."),
+    onSettled: (_res, _err, scan) =>
+      setRereadingIds((prev) => prev.filter((x) => x !== scan.id)),
+  });
+
+  // Automatic reading for scans still waiting: any scan the list
+  // shows as pending gets read by the app's own reader — the tab
+  // fetches the scan's stored photo and sends it to
+  // readReceiptScanNow, which scans the image for the purchased
+  // items in that call. If the photo can't be fetched at all, the
+  // background reader is started instead (readPendingReceiptScans).
+  // This picks up scans sent before in-app reading existed, or
+  // whose read never finished, without the user sending anything
+  // new. The pickup is not one-shot: while a scan stays pending
+  // (its read fell back to the background reader, which can
+  // stall), the tab retries the in-app read every few minutes,
+  // up to a few attempts per scan — and each waiting scan's card
+  // carries its own "Read now" button running the same read on
+  // the spot.
+  const startReads = useMutation({
+    mutationFn: async () => await api.readPendingReceiptScans({}),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: ["receipt-scans"] }),
+  });
+  const startReadsMutate = startReads.mutate;
+  // Scans whose in-app read is running right now — drives the
+  // "Reading…" state on the cards' Read now buttons and keeps
+  // the automatic pickup from doubling up on a scan.
+  const [readingIds, setReadingIds] = useState<number[]>([]);
+  const readNow = useMutation({
+    mutationFn: async (scanId: number) => {
+      const pending = await api.getPendingReceiptScans({});
+      const entry = pending.pending.find((p) => p.id === scanId);
+      if (!entry?.imageUrl) throw new Error("no stored photo");
+      const res = await fetch(entry.imageUrl);
+      if (!res.ok) throw new Error("stored photo fetch failed");
+      const photo = await res.blob();
+      const image = await fileToBase64(photo);
+      if (!image.mimeType) {
+        image.mimeType = entry.imageMimeType ?? "image/jpeg";
+      }
+      return await api.readReceiptScanNow({ id: scanId, image });
+    },
+    onMutate: (scanId) =>
+      setReadingIds((prev) =>
+        prev.includes(scanId) ? prev : [...prev, scanId],
+      ),
+    onSuccess: (res) => {
+      if (res.status === "proposed") {
+        setNote(
+          "Receipt read — the items you purchased are below for your review. Nothing is added to the inventory until you confirm.",
+        );
+      } else if (!res.ok && res.error) {
+        setNote(res.error);
+      }
+      queryClient.invalidateQueries({ queryKey: ["receipt-scans"] });
+    },
+    onError: () => startReadsMutate(),
+    onSettled: (_res, _err, scanId) =>
+      setReadingIds((prev) => prev.filter((x) => x !== scanId)),
+  });
+  const readNowMutate = readNow.mutate;
+  const pendingIds = (scans.data?.scans ?? [])
+    .filter((s) => s.status === "pending")
+    .map((s) => s.id);
+  const pendingKey = pendingIds.join(",");
+  const readAttempts = useRef(
+    new Map<number, { count: number; lastAt: number }>(),
+  );
+  const scansUpdatedAt = scans.dataUpdatedAt;
+  useEffect(() => {
+    if (!pendingKey) return;
+    const now = Date.now();
+    for (const id of pendingIds) {
+      if (readingIds.includes(id)) continue;
+      const prev = readAttempts.current.get(id);
+      // Retry a still-waiting scan's in-app read every few
+      // minutes (the list polls every 8s while a scan is
+      // pending, which is what re-runs this), up to 4 attempts
+      // per scan per showing — after that the card's Read now
+      // button remains.
+      if (prev && (prev.count >= 4 || now - prev.lastAt < 150_000)) {
+        continue;
+      }
+      readAttempts.current.set(id, {
+        count: (prev?.count ?? 0) + 1,
+        lastAt: now,
+      });
+      readNowMutate(id);
+    }
+    // pendingIds is derived from pendingKey; scansUpdatedAt is
+    // the poll tick that re-checks the retries. readingIds is
+    // read for the in-flight guard only.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingKey, scansUpdatedAt, readNowMutate]);
 
   const rows = scans.data?.scans ?? [];
   const proposed = rows.filter((s) => s.status === "proposed");
@@ -775,7 +968,7 @@ export function ReceiptScansSection() {
             border: "1.5px solid var(--accent)",
           }}
         >
-          {send.isPending ? "Sending…" : "Receipt scan"}
+          {send.isPending ? "Reading…" : "Receipt scan"}
         </button>
         <input
           ref={fileRef}
@@ -801,6 +994,7 @@ export function ReceiptScansSection() {
               key={scan.id}
               scan={scan}
               onDone={setNote}
+              onAddItem={onAddItem}
             />
           ))}
           {pending.map((scan) => (
@@ -811,7 +1005,7 @@ export function ReceiptScansSection() {
             >
               <p className="text-xs font-bold text-[var(--text)]">
                 Receipt photo sent {alertTime(scan.createdAt)} — waiting
-                to be read…
+                to be read
               </p>
               {scan.qrValue && (
                 <p className="mt-0.5 text-xs text-[var(--dim)]">
@@ -819,27 +1013,63 @@ export function ReceiptScansSection() {
                   digital copy of this receipt.
                 </p>
               )}
+              {scan.note && (
+                <p className="mt-0.5 text-xs text-[var(--dim)]">
+                  {scan.note}
+                </p>
+              )}
               <p className="mt-0.5 text-xs text-[var(--dim)]">
-                The items you purchased will appear here for your
-                review. Nothing is added to the inventory until you
-                confirm it.
+                &ldquo;Waiting to be read&rdquo; means the photo is
+                saved but its read hasn&rsquo;t finished yet. Reads
+                run automatically — the app scans the photo for the
+                items you bought — and the items appear here for
+                your review when one lands. Nothing is added to the
+                inventory until you confirm it. If a read stalls,
+                tap Read now to run it again on the spot.
               </p>
-              <DismissPendingButton scanId={scan.id} onDone={setNote} />
+              <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  aria-label="Read this receipt scan now"
+                  disabled={readingIds.includes(scan.id)}
+                  onClick={() => readNow.mutate(scan.id)}
+                  className="rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+                  style={{
+                    backgroundColor: "var(--accent)",
+                    color: "var(--accent-text)",
+                  }}
+                >
+                  {readingIds.includes(scan.id) ? "Reading…" : "Read now"}
+                </button>
+                <DismissPendingButton scanId={scan.id} onDone={setNote} />
+              </div>
             </div>
           ))}
           {past.length > 0 && (
             <ul className="flex flex-col gap-1 px-1">
-              {past.map((scan) => (
+              {past.map((scan) => {
+                // Leftover lines on a confirmed scan: the reader
+                // read them off the receipt but they matched
+                // nothing on the HIT List, so confirming logged
+                // only the recognized items. They stay listed
+                // here, each with the same Add button as the
+                // review card's leftovers.
+                const leftovers =
+                  scan.status === "confirmed"
+                    ? scan.lines.filter((l) => l.item == null)
+                    : [];
+                return (
                 <li
                   key={scan.id}
-                  className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-[var(--dim)]"
+                  className="text-xs text-[var(--dim)]"
                 >
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span>
                     {scan.status === "confirmed"
                       ? `Confirmed · ${alertTime(scan.createdAt)} — ${scan.confirmedUnits ?? 0} ${
                           scan.confirmedUnits === 1 ? "item" : "items"
-                        } added from the receipt${scan.undone ? " · Undone" : ""}`
-                      : `Dismissed · ${alertTime(scan.createdAt)}`}
+                        } added from the receipt${scan.undone ? " · Undone" : ""}${scan.total != null ? ` · Total ${receiptMoneyText(scan.total)}` : ""}`
+                      : `Dismissed · ${alertTime(scan.createdAt)}${scan.total != null ? ` · Total ${receiptMoneyText(scan.total)}` : ""}`}
                     {scan.status === "confirmed" && (
                       <ActorTag
                         actor={scan.actor}
@@ -847,23 +1077,16 @@ export function ReceiptScansSection() {
                       />
                     )}
                   </span>
-                  {scan.status === "confirmed" &&
-                    !scan.undone &&
-                    scan.permanent && (
-                      <span className="font-bold text-[var(--dim)]">
-                        Permanent
-                      </span>
-                    )}
-                  {scan.status === "confirmed" &&
-                    !scan.undone &&
-                    scan.canUndo && (
+                  {((scan.status === "confirmed" && scan.undone) ||
+                    scan.status === "dismissed") && (
                     <button
                       type="button"
-                      aria-label="Undo this confirmed receipt scan"
+                      aria-label="Restore this receipt scan"
                       disabled={
-                        undoScan.isPending && undoScan.variables === scan.id
+                        restoreScan.isPending &&
+                        restoreScan.variables === scan.id
                       }
-                      onClick={() => undoScan.mutate(scan.id)}
+                      onClick={() => restoreScan.mutate(scan.id)}
                       className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
                       style={{
                         backgroundColor: "var(--surface)",
@@ -871,11 +1094,47 @@ export function ReceiptScansSection() {
                         border: "1px solid var(--border)",
                       }}
                     >
-                      Undo
+                      Restore
                     </button>
                   )}
+                  {scan.total == null && scan.imageUrl != null && (
+                    <button
+                      type="button"
+                      aria-label="Re-read this receipt photo to find its total"
+                      disabled={rereadingIds.includes(scan.id)}
+                      onClick={() => rereadScan.mutate(scan)}
+                      className="rounded-full px-2.5 py-0.5 text-xs font-bold disabled:opacity-50"
+                      style={{
+                        backgroundColor: "var(--surface)",
+                        color: "var(--accent)",
+                        border: "1px solid var(--border)",
+                      }}
+                    >
+                      {rereadingIds.includes(scan.id)
+                        ? "Reading…"
+                        : "Find total"}
+                    </button>
+                  )}
+                  </div>
+                  {leftovers.length > 0 && (
+                    <div className="mt-0.5">
+                      <p className="text-[13px] font-bold text-[var(--dim)]">
+                        Left on the receipt — not on the HIT List:
+                      </p>
+                      <ul className="mt-0.5 flex flex-col gap-1">
+                        {leftovers.map((l, idx) => (
+                          <LeftoverLine
+                            key={idx}
+                            line={l}
+                            onAddItem={onAddItem}
+                          />
+                        ))}
+                      </ul>
+                    </div>
+                  )}
                 </li>
-              ))}
+                );
+              })}
             </ul>
           )}
           {rows.length === 0 && !scans.isPending && (
@@ -915,7 +1174,7 @@ function DismissPendingButton({
       aria-label="Dismiss this receipt scan"
       disabled={dismissScan.isPending}
       onClick={() => dismissScan.mutate()}
-      className="mt-1.5 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
+      className="rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
       style={{
         backgroundColor: "var(--surface)",
         color: "var(--dim)",

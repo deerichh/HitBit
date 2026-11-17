@@ -3,13 +3,13 @@
    other rule is a build error, and it is reported against a line number in the
    expanded Tailwind output, far past the end of this file, so the message
    cannot point you at the mistake. */
-/* @import url('https://fonts.googleapis.com/css2?family=Your+Font:wght@400..700&display=swap'); */
+@import url('https://fonts.googleapis.com/css2?family=Great+Vibes&display=swap');
 @import "tailwindcss";
 @import "tailwindcss-safe-area";
 
 @theme {
   /* Scheme D text floor: the smallest named text size is ~13px.
-     Derek's explicitly-sized elements (the 10.4px Savings/Source
+     Explicitly-sized elements (the 10.4px Savings/Source
      toggles, the half-size Week-view meal choices, the 20px group
      titles, the Sales by Store header, the Membership Alternatives
      shrink-to-fit steps) set their own pixel sizes and are not
@@ -263,6 +263,15 @@
   right: 0;
   top: -4px;
   bottom: -4px;
+}
+
+/* Typed-initials signature (BIT Requisition tab): the initials
+   boxes render what the user types in this generic cursive, and
+   the same lettering is drawn into the filled REQ form's
+   signature boxes. Falls back to the platform cursive when the
+   web font can't load. */
+.req-signature {
+  font-family: "Great Vibes", "Snell Roundhand", cursive;
 }
 
 /* Heart popup entrance (Meal Planner tab). */

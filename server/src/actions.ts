@@ -1,7 +1,8 @@
-// Actions for the Shopping List artifact.
+// Actions for the HitBit app (household HIT + business BIT).
 //
-// The Google Sheet HIT-VANDERLANCAL ("Shopping List" tab) is the system
-// of record. This artifact caches its rows in ctx.db:
+// An optional Google Sheet ("Shopping List" tab) can be the system
+// of record for the household side — set SPREADSHEET_ID below to
+// your sheet's ID to enable it. This app caches its rows in ctx.db:
 //   getList     — client reads the cached rows + check-off state
 //   saveList    — the refresh agent task writes freshly read sheet rows
 //   refreshList — spawns that agent task (also the daily cron target)
@@ -13,11 +14,20 @@ z,
 type ActionsModule,
 type Ctx,
 } from "@hatch/space-sdk";
-import { and, asc, desc, eq, isNull, lt } from "drizzle-orm";
+import { and, asc, desc, eq, isNotNull, isNull, lt } from "drizzle-orm";
 import type { BatchItem } from "drizzle-orm/batch";
 import * as schema from "./schema";
+import bitScoopExportJson from "./migration/bit-daily-scoop.json";
+import bitAnalyticsExportJson from "./migration/bit-scoop-analytics.json";
+import accountSettingsExportJson from "./migration/account-settings.json";
+import { PDFDocument } from "pdf-lib";
+import { buildReqFormPdf } from "./reqFormTemplate";
 
-const SPREADSHEET_ID = "1jaQIWREtm98gLMr5zSQFmOEm-1dG3yO9lDqaUBy-xSU";
+// Your household Google Sheet's ID (its "Shopping List" and
+// "HIT List" tabs), or "" when no sheet is connected: the refresh
+// actions refuse until an ID is set, and everything else runs off
+// the app's own data. Never commit a real sheet ID here.
+const SPREADSHEET_ID = "";
 
 const priceTrendShape = z.object({
   lowestCents: z.number(),
@@ -31,7 +41,7 @@ const sourceShape = z.object({
   // "flipp" = found on Flipp; "website" = found on a store website.
   sourceType: z.enum(["flipp", "website"]),
   store: z.string().nullable(),
-  // Toronto date key the source was last recorded.
+  // Local date key the source was last recorded.
   updatedDate: z.string(),
 });
 
@@ -155,6 +165,7 @@ function base64ToBytes(dataBase64: string): Uint8Array {
   }
   return bytes;
 }
+
 
 // ---- Stock adjustments / watch / forecast helpers -------------------
 //
@@ -549,6 +560,997 @@ const undoMetaShape = z.object({
   canUndo: z.boolean(),
 });
 
+/**
+ * The undo performers (Beta 0.15): each undoable action type's
+ * reversal, factored out of its per-record action so BOTH the
+ * per-record action (kept for the user's agent) and the single
+ * Settings Undo (undoLastAction, which reverts the app's LAST
+ * action) run exactly the same reversal — gate check included.
+ * The app itself shows no per-record Undo buttons anymore; the
+ * one Undo lives in the Settings drawer, under Switch to.
+ */
+async function performUndoUsage(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.usageLog)
+    .where(eq(schema.usageLog.id, id));
+  const row = rows[0];
+  if (!row) return { ok: false, error: "That usage entry no longer exists." };
+  if (row.undone === 1) return { ok: false, error: "That entry is already undone." };
+  const gate = undoGate(await loadAccountSettings(ctx), "eaten", row.actor);
+  if (gate) return { ok: false, error: gate };
+  await db
+    .update(schema.usageLog)
+    .set({ undone: 1, undoneAt: new Date() })
+    .where(eq(schema.usageLog.id, id));
+  if (row.deducted > 0) {
+    await db.insert(schema.stockAdjustments).values({
+      item: row.item,
+      delta: row.deducted,
+      source: "usage-undo",
+    });
+  }
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoPickEaten(
+  ctx: Ctx,
+  pickId: number,
+): Promise<{ ok: boolean; undoneCount: number; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.usageLog)
+    .where(eq(schema.usageLog.pickId, pickId));
+  const active = rows.filter((r) => r.undone === 0);
+  if (active.length === 0) {
+    return {
+      ok: false,
+      undoneCount: 0,
+      error: "That pick has no logged usage to undo.",
+    };
+  }
+  // Policy + ownership (audit #5): the tap is undone as a
+  // whole, so every entry it logged must be undoable by the
+  // current role — a Permanent Eaten type blocks it, and a
+  // Connected account can't undo a tap the Primary user made.
+  const settings = await loadAccountSettings(ctx);
+  for (const row of active) {
+    const gate = undoGate(settings, "eaten", row.actor);
+    if (gate) return { ok: false, undoneCount: 0, error: gate };
+  }
+  const statements: BatchItem<"sqlite">[] = [];
+  for (const row of active) {
+    statements.push(
+      db
+        .update(schema.usageLog)
+        .set({ undone: 1, undoneAt: new Date() })
+        .where(eq(schema.usageLog.id, row.id)),
+    );
+    if (row.deducted > 0) {
+      statements.push(
+        db.insert(schema.stockAdjustments).values({
+          item: row.item,
+          delta: row.deducted,
+          source: "usage-undo",
+        }),
+      );
+    }
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, undoneCount: active.length, error: null };
+}
+
+async function performUndoStockAdjustment(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.stockAdjustments)
+    .where(eq(schema.stockAdjustments.id, id));
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, error: "That adjustment no longer exists." };
+  }
+  if (row.source !== "quick-adjust" && row.source !== "stocktake") {
+    return { ok: false, error: "That entry can't be undone here." };
+  }
+  if (row.undone === 1) {
+    return { ok: false, error: "That adjustment is already undone." };
+  }
+  const adjGate = undoGate(
+    await loadAccountSettings(ctx),
+    "stockAdjustments",
+    row.actor,
+  );
+  if (adjGate) return { ok: false, error: adjGate };
+  // A restock that settled a Shopping List purchase is undone
+  // from the purchase entry, which also clears the Purchased
+  // stamps — undoing the adjustment alone would strand them.
+  const purchaseRows = await db
+    .select()
+    .from(schema.purchaseLog)
+    .where(eq(schema.purchaseLog.adjustmentId, id));
+  if (purchaseRows.some((r) => r.undone === 0)) {
+    return {
+      ok: false,
+      error:
+        "That change settled a purchase — undo it from the purchase entry instead.",
+    };
+  }
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.stockAdjustments)
+      .set({ undone: 1, undoneAt: new Date() })
+      .where(eq(schema.stockAdjustments.id, id)),
+  ];
+  if (row.appliedAt != null) {
+    statements.push(
+      db.insert(schema.stockAdjustments).values({
+        item: row.item,
+        delta: -row.delta,
+        source: "adjustment-undo",
+      }),
+    );
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoPurchase(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.purchaseLog)
+    .where(eq(schema.purchaseLog.id, id));
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, error: "That purchase entry no longer exists." };
+  }
+  if (row.undone === 1) {
+    return { ok: false, error: "That purchase is already undone." };
+  }
+  const purchaseGate = undoGate(
+    await loadAccountSettings(ctx),
+    "purchases",
+    row.actor,
+  );
+  if (purchaseGate) return { ok: false, error: purchaseGate };
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.purchaseLog)
+      .set({ undone: 1, undoneAt: new Date() })
+      .where(eq(schema.purchaseLog.id, id)),
+  ];
+  // Reverse the stock effect.
+  let reversed = false;
+  if (row.adjustmentId != null) {
+    const adjRows = await db
+      .select()
+      .from(schema.stockAdjustments)
+      .where(eq(schema.stockAdjustments.id, row.adjustmentId));
+    const adj = adjRows[0];
+    if (adj && adj.undone === 1) {
+      // The adjustment's own Undo already reversed its stock
+      // effect — never reverse the same change twice.
+      reversed = true;
+    } else if (adj && adj.appliedAt == null) {
+      // Still pending: deleting the row reverses it exactly.
+      statements.push(
+        db
+          .delete(schema.stockAdjustments)
+          .where(eq(schema.stockAdjustments.id, adj.id)),
+      );
+      reversed = true;
+    }
+  }
+  if (!reversed) {
+    // Already applied to the sheet (or the link is missing):
+    // record the compensating negative adjustment.
+    statements.push(
+      db.insert(schema.stockAdjustments).values({
+        item: row.item,
+        delta: -row.quantity,
+        source: "purchase-undo",
+      }),
+    );
+  }
+  // Clear the Purchased stamp on the item's checked rows (all
+  // sections) so the purchase can be confirmed again.
+  const itemKey = row.item.trim().toLowerCase();
+  const checkedRows = await db.select().from(schema.checkedItems);
+  for (const cr of checkedRows) {
+    if (
+      cr.restockedAt != null &&
+      itemNameOfKey(cr.itemKey).trim().toLowerCase() === itemKey
+    ) {
+      statements.push(
+        db
+          .update(schema.checkedItems)
+          .set({ restockedAt: null })
+          .where(eq(schema.checkedItems.itemKey, cr.itemKey)),
+      );
+    }
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoReceiptScan(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.receiptScans)
+    .where(eq(schema.receiptScans.id, id));
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, error: "That receipt scan no longer exists." };
+  }
+  if (row.status !== "confirmed") {
+    return { ok: false, error: "That scan wasn't confirmed." };
+  }
+  if (row.undoneAt != null) {
+    return { ok: false, error: "That scan is already undone." };
+  }
+  const scanGate = undoGate(
+    await loadAccountSettings(ctx),
+    "receiptScans",
+    row.actor,
+  );
+  if (scanGate) return { ok: false, error: scanGate };
+  const statements: BatchItem<"sqlite">[] = [];
+  const linked = await db
+    .select()
+    .from(schema.stockAdjustments)
+    .where(eq(schema.stockAdjustments.receiptScanId, id));
+  const activeLinked = linked.filter((a) => a.undone === 0);
+  if (activeLinked.length > 0) {
+    for (const adj of activeLinked) {
+      statements.push(
+        db
+          .update(schema.stockAdjustments)
+          .set({ undone: 1, undoneAt: new Date() })
+          .where(eq(schema.stockAdjustments.id, adj.id)),
+      );
+      if (adj.appliedAt != null) {
+        statements.push(
+          db.insert(schema.stockAdjustments).values({
+            item: adj.item,
+            delta: -adj.delta,
+            source: "receipt-undo",
+          }),
+        );
+      }
+    }
+  } else {
+    // Legacy scan (confirmed before adjustments carried the
+    // scan link): reverse from the confirmed lines stored on
+    // the scan. Per line, retire a matching still-pending
+    // unlinked receipt adjustment when one is there;
+    // otherwise record the compensating adjustment (which is
+    // also the right correction when the original was already
+    // applied to the sheet).
+    let lines: { item: string | null; quantity: number }[] = [];
+    if (row.linesJson) {
+      try {
+        const parsed: unknown = JSON.parse(row.linesJson);
+        if (Array.isArray(parsed)) {
+          lines = parsed as typeof lines;
+        }
+      } catch {
+        lines = [];
+      }
+    }
+    const pool = (
+      await db
+        .select()
+        .from(schema.stockAdjustments)
+        .where(eq(schema.stockAdjustments.source, "receipt"))
+    ).filter(
+      (a) =>
+        a.receiptScanId == null && a.undone === 0 && a.appliedAt == null,
+    );
+    for (const line of lines) {
+      if (line.item == null || line.quantity <= 0) continue;
+      const key = line.item.trim().toLowerCase();
+      const idx = pool.findIndex(
+        (a) =>
+          a.item.trim().toLowerCase() === key &&
+          a.delta === line.quantity,
+      );
+      const match = idx >= 0 ? pool[idx] : undefined;
+      if (match) {
+        pool.splice(idx, 1);
+        statements.push(
+          db
+            .update(schema.stockAdjustments)
+            .set({ undone: 1, undoneAt: new Date() })
+            .where(eq(schema.stockAdjustments.id, match.id)),
+        );
+      } else {
+        statements.push(
+          db.insert(schema.stockAdjustments).values({
+            item: line.item,
+            delta: -line.quantity,
+            source: "receipt-undo",
+          }),
+        );
+      }
+    }
+  }
+  statements.push(
+    db
+      .update(schema.receiptScans)
+      .set({ undoneAt: new Date(), updatedAt: new Date() })
+      .where(eq(schema.receiptScans.id, id)),
+  );
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performRestoreAlert(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.alerts)
+    .where(eq(schema.alerts.id, id));
+  const row = rows[0];
+  if (!row) return { ok: false, error: "That alert no longer exists." };
+  if (row.dismissedAt != null) {
+    const settings = await loadAccountSettings(ctx);
+    const refusal = undoGate(settings, "alertDismissals", row.dismissedBy);
+    if (refusal) return { ok: false, error: refusal };
+  }
+  const res = await db
+    .update(schema.alerts)
+    .set({ dismissedAt: null, dismissedBy: null })
+    .where(eq(schema.alerts.id, id))
+    .returning({ id: schema.alerts.id });
+  ctx.invalidateQueries();
+  return { ok: res.length > 0, error: null };
+}
+
+async function performUndoBitStockEvent(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.bitStockEvents)
+    .where(eq(schema.bitStockEvents.id, id));
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, error: "That count change no longer exists." };
+  }
+  if (row.source !== "manual_count") {
+    return {
+      ok: false,
+      error:
+        "That change came from a requisition receipt — undo it from the requisition line instead.",
+    };
+  }
+  if (row.undone === 1) {
+    return { ok: false, error: "That count change is already undone." };
+  }
+  const eventGate = undoGate(
+    await loadAccountSettings(ctx),
+    "bitCountChanges",
+    row.actor,
+  );
+  if (eventGate) return { ok: false, error: eventGate };
+  if (row.itemId == null) {
+    return { ok: false, error: "That item is no longer tracked." };
+  }
+  const itemRows = await db
+    .select()
+    .from(schema.bitItems)
+    .where(eq(schema.bitItems.id, row.itemId));
+  const item = itemRows[0];
+  if (!item) {
+    return { ok: false, error: "That item is no longer tracked." };
+  }
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.bitStockEvents)
+      .set({ undone: 1 })
+      .where(eq(schema.bitStockEvents.id, row.id)),
+    db
+      .update(schema.bitItems)
+      .set({ onHand: Math.max(0, item.onHand - row.delta) })
+      .where(eq(schema.bitItems.id, item.id)),
+  ];
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoBitWaste(
+  ctx: Ctx,
+  id: number,
+): Promise<{
+  ok: boolean;
+  error: string | null;
+  onHand: number | null;
+}> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.bitWasteLog)
+    .where(eq(schema.bitWasteLog.id, id));
+  const row = rows[0];
+  if (!row) {
+    return {
+      ok: false,
+      error: "That waste entry no longer exists.",
+      onHand: null,
+    };
+  }
+  if (row.undone === 1) {
+    return {
+      ok: false,
+      error: "That waste entry is already undone.",
+      onHand: null,
+    };
+  }
+  const wasteGate = undoGate(
+    await loadAccountSettings(ctx),
+    "wasteLog",
+    row.actor,
+  );
+  if (wasteGate) {
+    return { ok: false, error: wasteGate, onHand: null };
+  }
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.bitWasteLog)
+      .set({ undone: 1 })
+      .where(eq(schema.bitWasteLog.id, row.id)),
+  ];
+  let onHand: number | null = null;
+  if (row.itemId != null) {
+    const itemRows = await db
+      .select()
+      .from(schema.bitItems)
+      .where(eq(schema.bitItems.id, row.itemId));
+    const item = itemRows[0];
+    if (item) {
+      onHand = item.onHand + (row.stockDeducted ?? row.quantity);
+      statements.push(
+        db
+          .update(schema.bitItems)
+          .set({ onHand })
+          .where(eq(schema.bitItems.id, item.id)),
+      );
+    }
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null, onHand };
+}
+
+async function performUndoBitManifestImport(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.bitManifestImports)
+    .where(eq(schema.bitManifestImports.id, id));
+  const row = rows[0];
+  if (!row) {
+    return { ok: false, error: "That import no longer exists." };
+  }
+  if (row.undone === 1) {
+    return { ok: false, error: "That import is already undone." };
+  }
+  const importGate = undoGate(
+    await loadAccountSettings(ctx),
+    "manifestImports",
+    row.actor,
+  );
+  if (importGate) return { ok: false, error: importGate };
+  const changes = bitParseManifestImportChanges(row.changesJson);
+  const itemRows = await db
+    .select()
+    .from(schema.bitItems)
+    .where(eq(schema.bitItems.businessId, row.businessId));
+  const byId = new Map(itemRows.map((r) => [r.id, r]));
+  const byName = new Map(
+    itemRows.map((r) => [r.name.trim().toLowerCase(), r]),
+  );
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.bitManifestImports)
+      .set({ undone: 1 })
+      .where(eq(schema.bitManifestImports.id, row.id)),
+  ];
+  for (const change of changes) {
+    const item =
+      (change.itemId != null ? byId.get(change.itemId) : undefined) ??
+      byName.get(change.name.trim().toLowerCase());
+    if (!item) continue;
+    if (change.added) {
+      statements.push(
+        db
+          .delete(schema.bitItems)
+          .where(eq(schema.bitItems.id, item.id)),
+      );
+    } else if (change.priorOnHand != null) {
+      statements.push(
+        db
+          .update(schema.bitItems)
+          .set({ onHand: change.priorOnHand })
+          .where(eq(schema.bitItems.id, item.id)),
+      );
+    }
+  }
+  if (row.scanId != null) {
+    statements.push(
+      db
+        .update(schema.bitManifestScans)
+        .set({ status: "proposed", updatedAt: new Date() })
+        .where(
+          and(
+            eq(schema.bitManifestScans.id, row.scanId),
+            eq(schema.bitManifestScans.status, "confirmed"),
+          ),
+        ),
+    );
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoBitPosTransaction(
+  ctx: Ctx,
+  id: number,
+): Promise<{ ok: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.bitPosTransactions)
+    .where(eq(schema.bitPosTransactions.id, id));
+  const row = rows[0];
+  if (!row) return { ok: false, error: "That entry no longer exists." };
+  if (row.matched !== 1 || row.undone === 1 || row.itemId == null) {
+    return { ok: false, error: "That entry can't be undone." };
+  }
+  const posGate = undoGate(
+    await loadAccountSettings(ctx),
+    "posSyncs",
+    row.actor,
+  );
+  if (posGate) return { ok: false, error: posGate };
+  const itemRows = await db
+    .select()
+    .from(schema.bitItems)
+    .where(eq(schema.bitItems.id, row.itemId));
+  const item = itemRows[0];
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.bitPosTransactions)
+      .set({ undone: 1 })
+      .where(eq(schema.bitPosTransactions.id, row.id)),
+  ];
+  if (item) {
+    statements.push(
+      db
+        .update(schema.bitItems)
+        .set({ onHand: Math.min(100000, item.onHand + row.quantity) })
+        .where(eq(schema.bitItems.id, item.id)),
+    );
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, error: null };
+}
+
+async function performUndoBitRequisitionCheckOff(
+  ctx: Ctx,
+  lineId: number,
+): Promise<{ ok: boolean; reopened: boolean; error: string | null }> {
+  const db = ctx.db<typeof schema>();
+  const lineRows = await db
+    .select()
+    .from(schema.bitRequisitionLines)
+    .where(eq(schema.bitRequisitionLines.id, lineId));
+  const line = lineRows[0];
+  if (!line) {
+    return { ok: false, reopened: false, error: "That line is gone." };
+  }
+  if (line.status === "pending") {
+    return {
+      ok: false,
+      reopened: false,
+      error: "That line hasn't been checked off.",
+    };
+  }
+  if (line.supersededBy != null) {
+    return {
+      ok: false,
+      reopened: false,
+      error:
+        "That line was already resubmitted on a newer requisition, so its check-off can't be undone.",
+    };
+  }
+  const lineGate = undoGate(
+    await loadAccountSettings(ctx),
+    "requisitionCheckOffs",
+    line.checkedOffBy,
+  );
+  if (lineGate) {
+    return { ok: false, reopened: false, error: lineGate };
+  }
+  const reqRows = await db
+    .select()
+    .from(schema.bitRequisitions)
+    .where(eq(schema.bitRequisitions.id, line.requisitionId));
+  const req = reqRows[0];
+  if (!req) {
+    return {
+      ok: false,
+      reopened: false,
+      error: "That requisition is gone.",
+    };
+  }
+  let reopened = false;
+  if (req.status === "closed") {
+    const others = await db
+      .select()
+      .from(schema.bitRequisitions)
+      .where(
+        and(
+          eq(schema.bitRequisitions.businessId, req.businessId),
+          eq(schema.bitRequisitions.status, "outstanding"),
+        ),
+      );
+    if (others.length > 0) {
+      return {
+        ok: false,
+        reopened: false,
+        error:
+          "Another requisition is outstanding, so this one can't reopen for the undo.",
+      };
+    }
+    reopened = true;
+  }
+  const statements: BatchItem<"sqlite">[] = [
+    db
+      .update(schema.bitRequisitionLines)
+      .set({
+        status: "pending",
+        qtyReceived: null,
+        checkedOffBy: null,
+        checkedOffAt: null,
+      })
+      .where(eq(schema.bitRequisitionLines.id, line.id)),
+  ];
+  if (reopened) {
+    statements.push(
+      db
+        .update(schema.bitRequisitions)
+        .set({ status: "outstanding", closedAt: null })
+        .where(eq(schema.bitRequisitions.id, req.id)),
+    );
+  }
+  // Take back the stock a "received" mark applied, and retire
+  // the stock event it logged.
+  if (
+    line.status === "received" &&
+    line.itemId != null &&
+    (line.qtyReceived ?? 0) !== 0
+  ) {
+    const qty = line.qtyReceived ?? 0;
+    const itemRows = await db
+      .select()
+      .from(schema.bitItems)
+      .where(eq(schema.bitItems.id, line.itemId));
+    const item = itemRows[0];
+    if (item) {
+      statements.push(
+        db
+          .update(schema.bitItems)
+          .set({ onHand: Math.max(0, item.onHand - qty) })
+          .where(eq(schema.bitItems.id, item.id)),
+      );
+      const eventRows = await db
+        .select()
+        .from(schema.bitStockEvents)
+        .where(
+          and(
+            eq(schema.bitStockEvents.itemId, item.id),
+            eq(schema.bitStockEvents.source, "requisition_received"),
+            eq(schema.bitStockEvents.undone, 0),
+          ),
+        )
+        .orderBy(desc(schema.bitStockEvents.id));
+      const event = eventRows.find((e) => e.delta === qty);
+      if (event) {
+        statements.push(
+          db
+            .update(schema.bitStockEvents)
+            .set({ undone: 1 })
+            .where(eq(schema.bitStockEvents.id, event.id)),
+        );
+      }
+    }
+  }
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return { ok: true, reopened, error: null };
+}
+
+type UndoCandidate = {
+  /** Ordering timestamp (ms since epoch) of the action. */
+  at: number;
+  /** Plain-words name of the action, shown in Settings. */
+  label: string;
+  /** Runs the reversal through the type's own performer. */
+  run: (ctx: Ctx) => Promise<{ ok: boolean; error: string | null }>;
+};
+
+/**
+ * Finds the app's LAST action that can still be undone (Beta
+ * 0.15): the newest not-yet-undone record across every undoable
+ * action type, on both the HIT and BIT sides, that the current
+ * role may undo under the undo policy (undoGate). Actions whose
+ * type is set Permanent, and — for a Connected account — the
+ * Primary user's actions, are not candidates: the Settings Undo
+ * reverts the last action it is allowed to revert. Returns null
+ * when nothing undoable remains.
+ */
+async function findLastUndoableAction(
+  ctx: Ctx,
+): Promise<UndoCandidate | null> {
+  const db = ctx.db<typeof schema>();
+  const settings = await loadAccountSettings(ctx);
+  const candidates: UndoCandidate[] = [];
+  const add = (
+    type: UndoPolicyType,
+    actor: ActorRole | null | undefined,
+    at: Date,
+    label: string,
+    run: UndoCandidate["run"],
+  ) => {
+    if (undoGate(settings, type, actor) != null) return;
+    candidates.push({ at: at.getTime(), label, run });
+  };
+  const latest = <T,>(rows: T[], time: (r: T) => Date): T | null => {
+    let best: T | null = null;
+    for (const r of rows) {
+      if (best == null || time(r).getTime() > time(best).getTime()) {
+        best = r;
+      }
+    }
+    return best;
+  };
+
+  // Purchases (Shopping List Purchased confirmations).
+  const purchase = latest(
+    (await db.select().from(schema.purchaseLog)).filter(
+      (r) => r.undone === 0,
+    ),
+    (r) => r.createdAt,
+  );
+  if (purchase) {
+    add("purchases", purchase.actor, purchase.createdAt,
+      `Purchase of ${purchase.item}`,
+      (c) => performUndoPurchase(c, purchase.id));
+  }
+
+  // Stock adjustments (HIT +/− steppers and stocktake
+  // corrections). One that settled a still-active purchase is
+  // the purchase's candidate above, never its own.
+  const settledAdjIds = new Set(
+    (await db.select().from(schema.purchaseLog))
+      .filter((r) => r.undone === 0 && r.adjustmentId != null)
+      .map((r) => r.adjustmentId as number),
+  );
+  const adjustment = latest(
+    (await db.select().from(schema.stockAdjustments)).filter(
+      (r) =>
+        r.undone === 0 &&
+        (r.source === "quick-adjust" || r.source === "stocktake") &&
+        !settledAdjIds.has(r.id),
+    ),
+    (r) => r.createdAt,
+  );
+  if (adjustment) {
+    add("stockAdjustments", adjustment.actor, adjustment.createdAt,
+      `Stock change for ${adjustment.item} (${adjustment.delta > 0 ? "+" : ""}${adjustment.delta})`,
+      (c) => performUndoStockAdjustment(c, adjustment.id));
+  }
+
+  // Eaten / usage: a Meal Planner pick's Eaten tap is ONE action
+  // (all its still-active entries together); a usage entry with
+  // no pick is its own action.
+  const usageRows = (await db.select().from(schema.usageLog)).filter(
+    (r) => r.undone === 0,
+  );
+  const byPick = new Map<number, typeof usageRows>();
+  for (const r of usageRows) {
+    if (r.pickId == null) {
+      add("eaten", r.actor, r.createdAt,
+        `Usage of ${r.item}`,
+        (c) => performUndoUsage(c, r.id));
+    } else {
+      const group = byPick.get(r.pickId) ?? [];
+      group.push(r);
+      byPick.set(r.pickId, group);
+    }
+  }
+  for (const [pickId, group] of byPick) {
+    // The tap is undone as a whole, so it is a candidate only
+    // when the current role may undo every entry it logged.
+    if (group.some((r) => undoGate(settings, "eaten", r.actor) != null)) {
+      continue;
+    }
+    const at = group.reduce(
+      (max, r) => (r.createdAt.getTime() > max.getTime() ? r.createdAt : max),
+      group[0]?.createdAt ?? new Date(0),
+    );
+    const mealName = group.find((r) => r.mealName)?.mealName ?? null;
+    candidates.push({
+      at: at.getTime(),
+      label: mealName
+        ? `Marking ${mealName} as eaten`
+        : "Marking a meal as eaten",
+      run: async (c) => {
+        const res = await performUndoPickEaten(c, pickId);
+        return { ok: res.ok, error: res.error };
+      },
+    });
+  }
+
+  // Receipt scans (confirmed, not yet undone). A scan's
+  // confirmation stamps updatedAt, so that is its action time.
+  const scan = latest(
+    (await db.select().from(schema.receiptScans)).filter(
+      (r) => r.status === "confirmed" && r.undoneAt == null,
+    ),
+    (r) => r.updatedAt,
+  );
+  if (scan) {
+    add("receiptScans", scan.actor, scan.updatedAt,
+      scan.note
+        ? `Receipt scan (${scan.note.slice(0, 60)})`
+        : "Receipt scan",
+      (c) => performUndoReceiptScan(c, scan.id));
+  }
+
+  // Alert dismissals (their undo is the restore).
+  const alert = latest(
+    (await db.select().from(schema.alerts)).filter(
+      (r) => r.dismissedAt != null,
+    ),
+    (r) => r.dismissedAt as Date,
+  );
+  if (alert?.dismissedAt) {
+    add("alertDismissals", alert.dismissedBy, alert.dismissedAt,
+      `Dismissed alert “${alert.title.slice(0, 60)}”`,
+      (c) => performRestoreAlert(c, alert.id));
+  }
+
+  // BIT count changes (Inventory-tab manual counts).
+  const countChange = latest(
+    (await db.select().from(schema.bitStockEvents)).filter(
+      (r) => r.undone === 0 && r.source === "manual_count",
+    ),
+    (r) => r.createdAt,
+  );
+  if (countChange) {
+    add("bitCountChanges", countChange.actor, countChange.createdAt,
+      `Count change for ${countChange.itemName}`,
+      (c) => performUndoBitStockEvent(c, countChange.id));
+  }
+
+  // BIT waste log entries.
+  const waste = latest(
+    (await db.select().from(schema.bitWasteLog)).filter(
+      (r) => r.undone === 0,
+    ),
+    (r) => r.createdAt,
+  );
+  if (waste) {
+    add("wasteLog", waste.actor, waste.createdAt,
+      `Waste log entry for ${waste.itemName}`,
+      async (c) => {
+        const res = await performUndoBitWaste(c, waste.id);
+        return { ok: res.ok, error: res.error };
+      });
+  }
+
+  // BIT manifest imports.
+  const manifestImport = latest(
+    (await db.select().from(schema.bitManifestImports)).filter(
+      (r) => r.undone === 0,
+    ),
+    (r) => r.createdAt,
+  );
+  if (manifestImport) {
+    add("manifestImports", manifestImport.actor, manifestImport.createdAt,
+      "Manifest import",
+      (c) => performUndoBitManifestImport(c, manifestImport.id));
+  }
+
+  // BIT requisition check-offs. A check-off's time is its
+  // checked-off stamp; check-offs from before the stamp existed
+  // order by their requisition's sent date.
+  const reqSentAt = new Map(
+    (await db.select().from(schema.bitRequisitions)).map(
+      (r) => [r.id, r.sentAt] as const,
+    ),
+  );
+  const checkOff = latest(
+    (await db.select().from(schema.bitRequisitionLines)).filter(
+      (r) => r.status !== "pending" && r.supersededBy == null,
+    ),
+    (r) => r.checkedOffAt ?? reqSentAt.get(r.requisitionId) ?? r.createdAt,
+  );
+  if (checkOff) {
+    add("requisitionCheckOffs", checkOff.checkedOffBy,
+      checkOff.checkedOffAt ??
+        reqSentAt.get(checkOff.requisitionId) ??
+        checkOff.createdAt,
+      `Delivery check-off for ${checkOff.name}`,
+      async (c) => {
+        const res = await performUndoBitRequisitionCheckOff(c, checkOff.id);
+        return { ok: res.ok, error: res.error };
+      });
+  }
+
+  // BIT POS transactions (applied sales).
+  const posTx = latest(
+    (await db.select().from(schema.bitPosTransactions)).filter(
+      (r) => r.matched === 1 && r.undone === 0 && r.itemId != null,
+    ),
+    (r) => r.createdAt,
+  );
+  if (posTx) {
+    add("posSyncs", posTx.actor, posTx.createdAt,
+      `POS sale of ${posTx.itemName ?? posTx.posRef}`,
+      (c) => performUndoBitPosTransaction(c, posTx.id));
+  }
+
+  let best: UndoCandidate | null = null;
+  for (const c of candidates) {
+    if (best == null || c.at > best.at) best = c;
+  }
+  return best;
+}
+
 // Household setup questionnaire (Alpha 0.90): the saved answer set
 // for the HIT setup questionnaire, and the starter-meal table the
 // finish seeds from — for each preset "meals you make often" entry,
@@ -598,7 +1600,7 @@ const priceInfoShape = z.object({
 const hitListResponse = z.object({
   refreshedAt: z.string().nullable(),
   // Counted-last stamp (audit #16): the most recent daily stock
-  // snapshot date ("YYYY-MM-DD", Toronto) — the last day the
+  // snapshot date ("YYYY-MM-DD", local) — the last day the
   // household's stock was counted into the app. Null when no
   // snapshot exists yet; the page then reads "Not counted yet".
   lastCountedDate: z.string().nullable(),
@@ -675,14 +1677,14 @@ function priceCheckPrompt(item: {
     `Price-check a newly added household inventory item: "${item.item}" (category ${item.category}, stock ${item.stock}, usual store ${item.store}).`,
     `The exact product to look up is "${product}"${item.sku ? ` (SKU / item number: ${item.sku})` : ""}.`,
     "",
-    "1. Search for this exact product (same brand and size — never a substitute) in this week's Flipp flyers for Newmarket, Ontario, and on the websites of the stores the household shops at: Walmart (walmart.ca), Real Canadian Superstore, Metro, No Frills, Food Basics, Costco (costco.ca), Canadian Tire, Giant Tiger, FreshCo, and Shoppers Drug Mart. If the usual store above is Costco, only a Costco price counts — never price a Costco item at another store.",
+    "1. Search for this exact product (same brand and size — never a substitute) in this week's flyers for the household's area, and on the websites of the stores the household shops at. If the usual store above is a membership-only store, only a price from that store counts — never price a membership-store item at another store.",
     "2. Determine, from pages you actually opened (never from a search snippet alone, and never guess a price):",
     "   - salePriceCents / saleStore / saleEnd: if the exact product is on sale anywhere in scope, the lowest sale price in cents, the store, and the sale end exactly as the flyer or page states it (e.g. \"6 days left\" if it gives a flyer end date relative to today, or the end date text) — nulls when it is not on sale.",
     "   - regularPriceCents / regularStore: the lowest verified current regular (non-sale) price for the exact product and where — nulls when no verified price can be found.",
     "   - altName / altPriceCents / altStore: ONLY when the exact product is not on sale — a similar alternative product whose price per comparable unit is at or below the exact product's regular price per unit. Nulls when there is no sale-free alternative that beats it, or when no verified regular price exists to compare against.",
     "   - note: one short line summarising what you found (e.g. \"No current sale; cheapest regular price at No Frills\" or \"Nothing verified in this week's flyers or store sites\").",
     `3. Call the saveItemPriceInfo action exactly once with { item: "${item.item}", ... } and the values above (integer cents, e.g. $1.49 is 149).`,
-    "Do not edit any spreadsheet. Do not invent prices, SKUs, or sale dates.",
+    "Do not invent prices, SKUs, or sale dates.",
   ];
   return lines.join("\n");
 }
@@ -1365,19 +2367,19 @@ function recipeNeedsPricePrompt(
     )
     .join("\n");
   return [
-    `Price-check the still-needed ingredients of the recipe "${mealName}" for a household shopping list in Newmarket, Ontario.`,
+    `Price-check the still-needed ingredients of the recipe "${mealName}" for a household shopping list.`,
     "Ingredients needed:",
     list,
     "",
     "For EACH ingredient:",
-    "1. Search for it in this week's Flipp flyers for Newmarket, Ontario, and on the websites of the stores the household shops at: Walmart (walmart.ca), Real Canadian Superstore, Metro, No Frills, Food Basics, Costco (costco.ca), Canadian Tire, Giant Tiger, FreshCo, and Shoppers Drug Mart. The ingredient is a plain grocery item, not one specific brand: a standard product for that ingredient is the match (for fresh produce / meat / dairy, the store's usual product for it).",
+    "1. Search for it in this week's flyers for the household's area, and on the websites of the stores the household shops at. The ingredient is a plain grocery item, not one specific brand: a standard product for that ingredient is the match (for fresh produce / meat / dairy, the store's usual product for it).",
     "2. Determine, from pages you actually opened (never from a search snippet alone, and never guess a price):",
     "   - salePriceCents / saleStore / saleEnd: if the ingredient is on sale anywhere in scope, the lowest sale price in cents (for the standard pack / per-unit basis the page states), the store, and the sale end exactly as the flyer or page states it — nulls when it is not on sale.",
     "   - regularPriceCents / regularStore: the lowest verified current regular (non-sale) price and where — nulls when no verified price can be found.",
     "   - sourceUrl / sourceType: the exact page the price you report was verified on — the Flipp flyer/item URL (sourceType \"flipp\") or the store product-page URL (sourceType \"website\").",
     "   - note: one short line summarising what you found (e.g. \"On sale at Metro until Wednesday\" or \"No sale; cheapest regular price at No Frills\").",
     `3. Call the saveRecipeNeedPrices action exactly once with { mealId: ${mealId}, results: [ { ingredient, salePriceCents, saleStore, saleEnd, regularPriceCents, regularStore, note, sourceUrl, sourceType }, … ] } — one result per ingredient above, echoing each ingredient's name EXACTLY as written in the list. Prices are integer cents (e.g. $1.49 is 149); use null for anything you could not verify.`,
-    "Do not edit any spreadsheet. Do not invent prices, stores, or sale dates.",
+    "Do not invent prices, stores, or sale dates.",
   ].join("\n");
 }
 
@@ -2170,7 +3172,7 @@ function isBitFoodAndBeverageType(type: string): boolean {
 // type, so it applies to every business created from a
 // questionnaire type — including ones set up before this build
 // (The Daily Scoop, an Ice Cream Shop, gains expiry tracking) —
-// while a custom business (type "Other", e.g. TFS station 226)
+// while a custom business (type "Other")
 // gets the empty profile and is completely unchanged. Freezer
 // temperature checks predate the profiles and keep their existing
 // food-&-beverage rule above. The client keeps the matching
@@ -2326,19 +3328,17 @@ const bitVarianceShape = z.object({
   counted: z.number(),
 });
 
-// ---- Quartermaster requisitions (Alpha 0.71) -----------------------
-// TFS SOG F-SUPP "Supplies and Ordering", applied to businesses with
-// uses_requisition set (TFS station 226 only). The Duty Officer
-// takes the Fire Station Supply Inventory, lists replenishment
-// needs on a Quartermaster Section Requisition in the form's order
+// ---- Requisitions (Alpha 0.71) -------------------------------------
+// Applied to businesses with uses_requisition set (chosen in the
+// setup wizard). The preparer takes the business's inventory,
+// lists replenishment needs on a requisition in the form's order
 // sequence (Medical first, then Stationery — the business's Office
-// Supplies — then General items), signs it, the District Chief
-// reviews and signs, and it goes to the Quartermaster Section
-// (tfsqm@toronto.ca). Quartermaster fills as stock allows and
-// returns the supplies with the marked requisition; the D.O.
-// checks off each item received and remarks items not received.
-// Items NOT received are never back-ordered — they are resubmitted
-// on a subsequent requisition.
+// Supplies — then General items), signs it, the approver reviews
+// and signs, and it goes to the supplier. The supplier fills as
+// stock allows and returns the supplies with the marked
+// requisition; the preparer checks off each item received and
+// remarks items not received. Items NOT received are never
+// back-ordered — they are resubmitted on a subsequent requisition.
 
 const bitRequisitionLineShape = z.object({
   id: z.number(),
@@ -2361,8 +3361,8 @@ const bitRequisitionShape = z.object({
   id: z.number(),
   reqNo: z.string(),
   status: z.enum(["outstanding", "closed"]),
-  // Approver separation (audit #15): who prepared it (the Duty
-  // Officer) and who approved it (the District Chief), with the
+  // Approver separation (audit #15): who prepared it (the
+  // preparer) and who approved it (the approver), with the
   // dates each was recorded — snapshotted at send time. Null on
   // requisitions sent before the approver step existed.
   preparedBy: z.string().nullable(),
@@ -2389,7 +3389,7 @@ const bitDraftExtraShape = z.object({
   unit: z.string(),
 });
 
-/** The SOG order sequence rank for a category: Medical supplies
+/** The requisition order sequence rank for a category: Medical supplies
     first, then Stationery (Office Supplies), then Cleaning
     supplies (general), then everything else. */
 function bitReqCategoryRank(category: string): number {
@@ -2401,15 +3401,16 @@ function bitReqCategoryRank(category: string): number {
   return 3;
 }
 
-/** The station number from the business name ("TFS station 226
-    Inventory" → "226"); the requisition number is built from it. */
-function bitStationNo(biz: BitBusinessRow): string {
+/** The short code from the business name (its first 2–4 digit
+    run, or "B" + the business id); the requisition number is built
+    from it. */
+function bitReqCode(biz: BitBusinessRow): string {
   const m = biz.name.match(/(\d{2,4})/);
-  return m?.[1] ?? "226";
+  return m?.[1] ?? `B${biz.id}`;
 }
 
-/** Requisition number in the form's format: Fire Station-YY-MM-DD,
-    dated in America/Toronto (the station's timezone). */
+/** Requisition number in the form's format: <code>-YY-MM-DD,
+    dated in America/Toronto (the app's default timezone). */
 function bitReqNo(biz: BitBusinessRow, at: Date): string {
   const parts = new Intl.DateTimeFormat("en-CA", {
     timeZone: "America/Toronto",
@@ -2419,8 +3420,221 @@ function bitReqNo(biz: BitBusinessRow, at: Date): string {
   }).formatToParts(at);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "";
   const yy = get("year").slice(-2);
-  return `${bitStationNo(biz)}-${yy}-${get("month")}-${get("day")}`;
+  return `${bitReqCode(biz)}-${yy}-${get("month")}-${get("day")}`;
 }
+
+/** Item rows on one page of the requisition form. */
+const REQ_FORM_LINES_PER_PAGE = 20;
+
+const bitRequisitionFormPdfResponse = z.object({
+  ok: z.boolean(),
+  filename: z.string().nullable(),
+  pdfBase64: z.string().nullable(),
+  pageCount: z.number().int(),
+  error: z.string().nullable(),
+});
+
+// ---- Pre-filled requisition form scan --------------------------------
+// Some businesses keep a requisition form already filled in: the
+// user uploads that file — a filled-in copy of the requisition
+// form (PDF) — or a photo of the paper form, and
+// scanBitRequisitionForm reads the lines off it and
+// cross-references each one against the business's inventory list
+// (the manifest). Nothing is recorded by
+// the scan: the Requisition tab reviews the matches and the user
+// chooses which ones go onto the requisition being built.
+
+interface ScannedReqFormLine {
+  name: string;
+  qty: number | null;
+  unit: string | null;
+  materialNo: string | null;
+}
+
+interface ScannedReqForm {
+  division: string | null;
+  preparerName: string | null;
+  approverName: string | null;
+  lines: ScannedReqFormLine[];
+}
+
+/**
+ * Read the lines off a filled-in copy of the requisition form
+ * itself: the form is fillable, so a copy filled in and saved (not
+ * printed / flattened) still carries its values in the form
+ * fields — the same field names buildReqFormPdf writes. Returns
+ * null when the PDF can't be read or carries no filled line rows
+ * (e.g. a flattened scan of a paper form — the photo path covers
+ * that).
+ */
+async function extractReqFormPdfLines(
+  bytes: Uint8Array,
+): Promise<ScannedReqForm | null> {
+  let doc: PDFDocument;
+  try {
+    doc = await PDFDocument.load(bytes, { ignoreEncryption: true });
+  } catch {
+    return null;
+  }
+  let form: ReturnType<PDFDocument["getForm"]>;
+  try {
+    form = doc.getForm();
+  } catch {
+    // Not a form-bearing PDF at all (or not really a PDF).
+    return null;
+  }
+  const read = (field: string): string => {
+    try {
+      return form.getTextField(field).getText()?.trim() ?? "";
+    } catch {
+      return "";
+    }
+  };
+  // The generic form names its fields per page (page 2+ carry a
+  // "_p2", "_p3", ... suffix, so every page's fields stay unique
+  // in one document); read every page in order.
+  const lines: ScannedReqFormLine[] = [];
+  for (let pg = 0; pg < doc.getPageCount(); pg++) {
+    const suffix = pg === 0 ? "" : `_p${pg + 1}`;
+    for (let n = 1; n <= REQ_FORM_LINES_PER_PAGE; n++) {
+      const name = read(`${n}${suffix}`);
+      if (!name) continue;
+      const qtyNum = Number.parseInt(read(`Qty${n}${suffix}`), 10);
+      lines.push({
+        name,
+        qty: Number.isFinite(qtyNum) && qtyNum > 0 ? qtyNum : null,
+        unit: read(`Unit${n}${suffix}`) || null,
+        materialNo: read(`Material ${n}${suffix}`) || null,
+      });
+    }
+  }
+  if (lines.length === 0) return null;
+  return {
+    division: read("Division") || null,
+    preparerName: read("Prepared by") || null,
+    approverName: read("Approved by") || null,
+    lines,
+  };
+}
+
+/** The shape the photo reader returns for one form photo. */
+const reqFormPhotoExtraction = z.object({
+  division: z.string().nullable(),
+  preparerName: z.string().nullable(),
+  approverName: z.string().nullable(),
+  lines: z.array(
+    z.object({
+      name: z.string(),
+      qty: z.number().nullable(),
+      unit: z.string().nullable(),
+      materialNo: z.string().nullable(),
+    }),
+  ),
+});
+
+function normalizeFormMatchText(s: string): string {
+  return s.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+function formMatchDigits(s: string | null | undefined): string {
+  return (s ?? "").replace(/\D+/g, "");
+}
+
+/**
+ * Word-based name matching, mirroring the client's
+ * bitItemMatchesSearch: every word of the scanned name must match
+ * a word of the item's name as a prefix, tolerating singular /
+ * plural differences ("ice pack" matches "Ice packs"); a plain
+ * containment of one full normalized name in the other also
+ * matches.
+ */
+function scannedWordsMatchItem(
+  scannedName: string,
+  itemName: string,
+): boolean {
+  const q = normalizeFormMatchText(scannedName);
+  const hay = normalizeFormMatchText(itemName);
+  if (!q || !hay) return false;
+  if (hay.includes(q) || q.includes(hay)) return true;
+  const nameTokens = hay.split(" ").filter(Boolean);
+  const queryTokens = q.split(" ").filter(Boolean);
+  if (queryTokens.length === 0) return false;
+  return queryTokens.every((qt) =>
+    nameTokens.some((nt) => {
+      if (nt.length < 2 || qt.length < 2) return nt === qt;
+      const forms = [qt, `${qt}s`, `${qt}es`];
+      if (qt.endsWith("s")) forms.push(qt.slice(0, -1));
+      return forms.some((f) => nt.startsWith(f) || f.startsWith(nt));
+    }),
+  );
+}
+
+type BitItemRowForScan = typeof schema.bitItems.$inferSelect;
+
+/**
+ * Cross-reference one scanned form line against the station's
+ * inventory list. A Material # match wins (the number is the
+ * form's own identifier), then an exact name match, then the
+ * word-based match. A match is only returned when it is
+ * unambiguous — exactly one item qualifies at the winning level;
+ * anything else is left unmatched rather than guessed.
+ */
+function matchScannedReqLine(
+  line: ScannedReqFormLine,
+  items: BitItemRowForScan[],
+): { item: BitItemRowForScan; kind: "material" | "name" | "words" } | null {
+  const mat = formMatchDigits(line.materialNo);
+  if (mat) {
+    const byMat = items.filter((it) => formMatchDigits(it.sku) === mat);
+    if (byMat.length === 1 && byMat[0])
+      return { item: byMat[0], kind: "material" };
+    if (byMat.length > 1) return null;
+  }
+  const target = normalizeFormMatchText(line.name);
+  if (!target) return null;
+  const byName = items.filter(
+    (it) => normalizeFormMatchText(it.name) === target,
+  );
+  if (byName.length === 1 && byName[0])
+    return { item: byName[0], kind: "name" };
+  if (byName.length > 1) return null;
+  const byWords = items.filter((it) =>
+    scannedWordsMatchItem(line.name, it.name),
+  );
+  if (byWords.length === 1 && byWords[0])
+    return { item: byWords[0], kind: "words" };
+  return null;
+}
+
+const bitRequisitionFormScanResponse = z.object({
+  ok: z.boolean(),
+  error: z.string().nullable(),
+  // How the form was read: its own fillable fields ("pdf") or a
+  // photo read by the model ("photo"). Null when nothing was read.
+  source: z.enum(["pdf", "photo"]).nullable(),
+  header: z
+    .object({
+      division: z.string().nullable(),
+      preparerName: z.string().nullable(),
+      approverName: z.string().nullable(),
+    })
+    .nullable(),
+  lines: z.array(
+    z.object({
+      scannedName: z.string(),
+      qty: z.number().int().nullable(),
+      unit: z.string().nullable(),
+      materialNo: z.string().nullable(),
+      matchedItemId: z.number().nullable(),
+      matchedName: z.string().nullable(),
+      matchedMaterialNo: z.string().nullable(),
+      matchedCategory: z.string().nullable(),
+      matchedUnit: z.string().nullable(),
+      matchedOnHand: z.number().nullable(),
+      matchKind: z.enum(["material", "name", "words"]).nullable(),
+    }),
+  ),
+});
 
 type BitRequisitionRow = typeof schema.bitRequisitions.$inferSelect;
 type BitRequisitionLineRow =
@@ -2468,180 +3682,6 @@ function bitRequisitionToShape(
   };
 }
 
-// The TFS Quartermaster catalogue: the OfficiallyDressed
-// "SHORELINE" PPE catalogue items 125–208, supplied by the user
-// (Nov 14, 2026) — [Material #, description]. Since Alpha 0.72
-// these are regular tracked TFS inventory items (converted by
-// convertBitTfsCatalogueToInventory), grouped under their own
-// "Quartermaster catalogue" category; this list is the canonical
-// source the conversion reads.
-const TFS_CATALOGUE: [string, string][] = [
-  ["125", "Parka, Winter Hi-Vis Yellow Green"],
-  ["126", "Liner, Cold Weather Jacket / Pant Liner ONLY (replacement)"],
-  ["127", "Pant, Dress Uniform - Male"],
-  ["128", "Pant, Dress Uniform - Female"],
-  ["129", "Pant, Dress Station Wear Navy / Cargo Pants Navy"],
-  ["130", "Pant, EMS, Navy Cargo"],
-  ["131", "Pant, Summer Station Wear, Navy Shorts"],
-  ["132", "Pant, Dress Uniform, Maternity"],
-  ["133", "Pant, Station Wear, Maternity"],
-  ["134", "Pant, Rain Hi-Vis Yellow Green Pant only"],
-  ["135", "Pant Shell, Nomex Station Wear Turnout"],
-  ["136", "Pant, Bunker (Please order your regular Bunker Pant size)"],
-  ["137", "Pant, Station Wear, Navy Trousers"],
-  ["138", "Pant, Yoga"],
-  ["139", "Pin, Collar Brass (Pair)"],
-  ["140", "Pin, Lapel, 35 Year Long Service (Enamel)"],
-  ["141", "Pin, Lapel, 25 Year Long Service"],
-  ["142", "Pin, Lapel, Canadian Flag"],
-  ["143", "Pin, Lapel, City Of Toronto"],
-  ["144", "Pin, Lapel, TFS Logo"],
-  ["145", "Pin, Years of Service (5,10,15,20 year etc.) Please indicate years:"],
-  ["146", "Pin, Service Cap, TFS (Silver)"],
-  ["147", "Rank Slide-ons TFS Pair"],
-  ["148", "Rank Epaulettes Shoulder Board TFS"],
-  ["149", "Raincoat, Hi-Vis Yellow Green"],
-  ["150", "Rain Wear, Full Set Jacket & Pant - Yellow Green"],
-  ["151", "Scarf, Black Winter"],
-  ["152", "Scarf, Dress, Black w/logo"],
-  ["153", "Shirt, Dress Long Sleeve, White"],
-  ["154", "Shirt, Dress Long Sleeve, Light Blue (Captains & Above)"],
-  ["155", "Shirt, Dress Short Sleeve, White"],
-  ["156", "Shirt, Dress Short Sleeve, Light Blue (Captains & Above)"],
-  ["157", "Shirt, Station Wear, Long Sleeve Dark Blue (with shoulder mic tab)"],
-  ["158", "Shirt, Station Wear, Short Sleeve Dark Blue (with shoulder mic tab)"],
-  ["159", "Shirt, Dress Uniform, Maternity"],
-  ["160", "Shirt, Dress, Mock Turtleneck white"],
-  ["161", "Shirt, Dress, Mock Turtleneck Black"],
-  ["162", "Shirt, Station Wear, Dress Golf (Polo) Long Sleeve navy with TFS Logo's"],
-  ["163", "Shirt, Station Wear, Dress Golf (Polo) Short Sleeve navy with TFS Logo's"],
-  ["164", "Shirt, Station Wear, Golf (Polo) Navy"],
-  ["165", "Shirt, Station Wear, T-Shirt Short Sleeve Navy"],
-  ["166", "Shirt, Station Wear, T-Shirt Long Sleeve Navy"],
-  ["167", "Shirt, Station Wear, T-Shirt Mock Long Sleeve Navy"],
-  ["168", "Skirt, Dress Uniform, Female"],
-  ["169", "Slide-Ons, Dress Silver"],
-  ["170", "Slide-Ons, Dress Gold (Senior Officers)"],
-  ["171", "Socks, Dress Black (6 pair)"],
-  ["172", "Socks, Station Black (6 pair)"],
-  ["173", "Socks, EMS Wicking Black (6 pair)"],
-  ["174", "Suspenders"],
-  ["175", "Sweater, Navy Wool"],
-  ["176", "Sweatshirt Crew Neck Navy (TFS, Fire etc on front)"],
-  ["177", "Sweatpants, Navy"],
-  ["178", "Tie, Clip-on, Navy"],
-  ["179", "Tie Bar, Long (2 1/4\")"],
-  ["180", "Tie Bar, Short (1 3/4\")"],
-  ["181", "Tie Tack"],
-  ["182", "Toe Cap, Safety - Black"],
-  ["183", "Tunic, Dress Uniform - Male"],
-  ["184", "Tunic, Dress Uniform - Female"],
-  ["185", "Tunic, Dress Uniform - Maternity"],
-  ["186", "Undershirt, White V-Neck (2 per package)"],
-  ["187", "Underwear, Black Briefs (6 per package)"],
-  ["188", "Underwear, Black Boxers (2 per package)"],
-  ["189", "Underwear, Women's Black full coverage, mid waist (3 per package)"],
-  ["190", "Vest (complete with accessories), Traffic Safety - Hi-Vis Green/Yellow * MTO Book 7 Compliant"],
-  ["191", "Watch Cap and/or Beanie"],
-  ["192", "Winter Coat System, Parka Shell, Arcteryx LEAF"],
-  ["193", "Winter Coat System, Soft Shell Jacket, Arcteryx LEAF"],
-  ["194", "Winter Coat System, Pant Shell, Arcteryx LEAF"],
-  ["195", "Winter Coat System, Insulated Jacket, Arcteryx LEAF"],
-  ["196", "Winter Coat System, Insulated Pant, Arcteryx LEAF"],
-  ["197", "Winter Coat System, Insulated Bib Pant, Arcteryx LEAF"],
-  ["198", "Winter Coat System, Baselayer, Top, Arcteryx LEAF"],
-  ["199", "Winter Coat System, Baselayer, Pant, Arcteryx LEAF"],
-  ["200", "Work Gloves, Leather Tan/Beige (for use at the supply truck only)"],
-  ["201", "Work Gloves, Black"],
-  ["202", "Work Gloves, Pig Skin"],
-  ["203", "Bag, Garment"],
-  ["204", "Bag, Kit, Small Black"],
-  ["205", "Bag, Kit, Large Black"],
-  ["206", "Bag, Duffel, Large Black"],
-  ["207", "Bag, Backpack Black"],
-  ["208", "Bag, PPE, Mesh Laundry, Blue"],
-];
-
-// The filled TFS requisition the user supplied as the third file
-// (Nov 14, 2026) — a completed Quartermaster Section requisition,
-// Station 232, dated 09/20/2026, three pages, 56 Item / Description
-// lines — transcribed verbatim from the form (its own spellings
-// kept, e.g. "Pecept wipes", "Mop bucket with stainer",
-// "Printer cartridge LazerJet CF289YC"): [name, category, unit].
-// The categories are TFS station 226's existing four, assigned in
-// the form's order sequence (Medical, then stationery / Office
-// Supplies, then Cleaning supplies, then Other); the unit is the
-// unit word in the form's Qty column (box → boxes, pc/Pc/Pcs →
-// pcs). The form's quantities were that station's order amounts,
-// NOT station 226 stock, so imported items open at count 0 with
-// no par. Items imported (or matched) by
-// importBitTfsFilledRequisitionItems carry TFS_FILLED_REQ_TAG in
-// their tags, which is how the app shows exactly which inventory
-// items came from this file.
-const TFS_FILLED_REQ_TAG = "Filled requisition form";
-const TFS_FILLED_REQUISITION: [string, string, string][] = [
-  // Page 1 — Medical
-  ["XL Medical gloves", "Medical", "boxes"],
-  ["L Gloves", "Medical", "boxes"],
-  ["M Gloves", "Medical", "boxes"],
-  ["Ice packs", "Medical", "pcs"],
-  ["Burn Kit", "Medical", "boxes"],
-  ["6\" roller gauze", "Medical", "pcs"],
-  ["Pecept wipes", "Medical", "jugs"],
-  ["Tourniquet", "Medical", "pcs"],
-  // Page 1 — Office Supplies (stationery)
-  ["Black pens", "Office Supplies", "boxes"],
-  ["Blue pens", "Office Supplies", "boxes"],
-  ["Sticky notes", "Office Supplies", "packs"],
-  ["Printer paper", "Office Supplies", "boxes"],
-  ["Printer cartridge LazerJet CF289YC", "Office Supplies", "units"],
-  ["Printer cartridge CF258XC", "Office Supplies", "units"],
-  ["Line paper pad", "Office Supplies", "pcs"],
-  ["Yellow Tags", "Office Supplies", "packs"],
-  ["Red tags", "Office Supplies", "packs"],
-  ["Silver paint marker", "Office Supplies", "packs"],
-  ["Clipboards", "Office Supplies", "pcs"],
-  ["Sharpie", "Office Supplies", "pcs"],
-  // Page 2 — Cleaning supplies
-  ["26 x 36 black garbage bags", "Cleaning supplies", "boxes"],
-  ["35 x 50 black garbage bags", "Cleaning supplies", "boxes"],
-  ["Clear gear decon bags", "Cleaning supplies", "boxes"],
-  ["Degreaser", "Cleaning supplies", "jugs"],
-  ["Hand wash", "Cleaning supplies", "jugs"],
-  ["Dishwasher pods", "Cleaning supplies", "bags"],
-  ["Paper towel rolls", "Cleaning supplies", "boxes"],
-  ["Fire wipes", "Cleaning supplies", "boxes"],
-  ["single fold paper towel", "Cleaning supplies", "boxes"],
-  ["double paper towel", "Cleaning supplies", "boxes"],
-  ["Toilet paper", "Cleaning supplies", "boxes"],
-  ["Sponges", "Cleaning supplies", "pcs"],
-  ["J cloth", "Cleaning supplies", "boxes"],
-  ["Laundry detergent", "Cleaning supplies", "jugs"],
-  ["Dish soap", "Cleaning supplies", "jugs"],
-  // Page 3 — Cleaning supplies
-  ["Dry mop head", "Cleaning supplies", "pcs"],
-  ["Wet mop head", "Cleaning supplies", "pcs"],
-  ["Mop bucket with stainer", "Cleaning supplies", "pcs"],
-  ["Truck wash brushes", "Cleaning supplies", "pcs"],
-  ["Broom handles", "Cleaning supplies", "pcs"],
-  ["Push Broom", "Cleaning supplies", "pcs"],
-  ["Corn Broom", "Cleaning supplies", "pcs"],
-  ["Squeegee", "Cleaning supplies", "pcs"],
-  ["Bathroom cleaner", "Cleaning supplies", "bottles"],
-  ["Truck wash", "Cleaning supplies", "jugs"],
-  // Pages 2–3 — Other (vehicle, equipment, kitchen)
-  ["Chainsaw bar oil", "Other", "jugs"],
-  ["50:1 fuel", "Other", "cans"],
-  ["Antifreeze", "Other", "jugs"],
-  ["Large wooden wedges", "Other", "bags"],
-  ["Small wooden wedges", "Other", "bags"],
-  ["Power steering fluid", "Other", "jugs"],
-  ["Bowls", "Other", "pcs"],
-  ["Glass Bowls", "Other", "pcs"],
-  ["Frying pan", "Other", "pcs"],
-  ["Transmission fluid", "Other", "jugs"],
-  ["G10", "Other", "jugs"],
-];
 
 function bitParseStringArray(json: string | null | undefined): string[] {
   if (!json) return [];
@@ -4278,10 +5318,572 @@ function bitRowToItem(r: BitItemRow): z.infer<typeof bitItemShape> {
   };
 }
 
+// ---- Bundled sample data (one-time sample import) -----------------
+// The generic sample dataset bundled as JSON: The Daily Scoop (a
+// sample ice-cream-shop business with its inventory), the Sim 01
+// analytics dataset for it, and the default account settings.
+// importSampleData loads them into an empty app exactly once, so a
+// new user can explore with sample data before setting up their own
+// businesses; the setup questionnaire is the clean-start path.
+// The shapes below are the exporting actions' response shapes
+// (getBitState / getBitAnalytics / getAccountSettings).
+
+interface MigrationBitExport {
+  business: {
+    id: number;
+    name: string;
+    type: string;
+    customType: string | null;
+    categories: string[];
+    colors: Record<string, string>;
+    freezers: string[];
+    usesRequisition: boolean;
+    division: string | null;
+    preparerName: string | null;
+    approverName: string | null;
+    teamSize: string | null;
+  };
+  items: {
+    id: number;
+    name: string;
+    category: string;
+    zone: string;
+    onHand: number;
+    unit: string;
+    par: number;
+    packSize: number;
+    supplier: string | null;
+    sku: string | null;
+    expiryDate: string | null;
+    tags: string[];
+  }[];
+}
+interface MigrationAnalyticsExport {
+  label: string | null;
+  periodLabel: string | null;
+  lostRevenue: number;
+  lostUnits: number;
+  stockoutEvents: number;
+  tubWaste: { name: string; tubs: number }[];
+  itemCosts: Record<string, number>;
+  months: {
+    monthKey: string;
+    label: string;
+    daysOpen: number;
+    transactions: number;
+    unitsSold: number;
+    revenue: number;
+    cogs: number;
+    wasteCost: number;
+    grossProfit: number;
+    netProfit: number;
+    ordersPlaced: number;
+    stockoutEvents: number;
+    endingInventoryValue: number;
+  }[];
+  menu: { name: string; units: number; revenue: number }[];
+}
+interface MigrationAccountExport {
+  role: "primary" | "connected";
+  policy: Record<string, string>;
+}
+
+const bitScoopExport = bitScoopExportJson as unknown as MigrationBitExport;
+const bitAnalyticsExport =
+  bitAnalyticsExportJson as unknown as MigrationAnalyticsExport;
+const accountSettingsExport =
+  accountSettingsExportJson as unknown as MigrationAccountExport;
+
+const sampleCountsShape = z.object({
+  scoopItems: z.number(),
+  scoopCategories: z.number(),
+  analyticsMonths: z.number(),
+});
+
+/** The bundled sample data's counts, read from stored rows. */
+async function sampleDataCounts(
+  ctx: Ctx,
+): Promise<z.infer<typeof sampleCountsShape>> {
+  const db = ctx.db<typeof schema>();
+  const [bizRows, bitItemRows] = await Promise.all([
+    db.select().from(schema.bitBusiness),
+    db.select().from(schema.bitItems),
+  ]);
+  const scoop = bizRows.find(
+    (b) => b.name.trim().toLowerCase() === "the daily scoop",
+  );
+  const scoopItems = scoop
+    ? bitItemRows.filter((r) => r.businessId === scoop.id)
+    : [];
+  const monthRows = scoop
+    ? await db
+        .select({ id: schema.bitAnalyticsMonths.id })
+        .from(schema.bitAnalyticsMonths)
+        .where(eq(schema.bitAnalyticsMonths.businessId, scoop.id))
+    : [];
+  return {
+    scoopItems: scoopItems.length,
+    scoopCategories: new Set(scoopItems.map((r) => r.category)).size,
+    analyticsMonths: monthRows.length,
+  };
+}
+
+/** The shape the in-app receipt reader returns for one photo. */
+const receiptPhotoExtraction = z.object({
+  lines: z.array(
+    z.object({
+      receiptText: z.string(),
+      item: z.string().nullable(),
+      quantity: z.number(),
+      // The price charged for the line, in dollars, as printed;
+      // null when no price is printed beside the item or it
+      // can't be read.
+      price: z.number().nullable(),
+    }),
+  ),
+  // The receipt's grand total (the TOTAL amount) in dollars as
+  // printed; null when it isn't legible in the photo.
+  total: z.number().nullable(),
+  note: z.string().nullable(),
+});
+
+/** A money amount read off a receipt, kept only when sane. */
+function receiptMoney(value: number | null | undefined): number | null {
+  if (value == null || !Number.isFinite(value)) return null;
+  if (value < 0 || value > 1_000_000) return null;
+  return Math.round(value * 100) / 100;
+}
+
+type ReceiptPhotoLine = {
+  receiptText: string;
+  item: string | null;
+  quantity: number;
+  price: number | null;
+};
+
+/**
+ * The vision read itself, shared by the in-app proposal read
+ * (readReceiptScanInline) and the totals re-read
+ * (rereadReceiptScan): scans the photo for the PURCHASED line
+ * items (each matched against the canonical HIT List names — a
+ * match is only kept when it names a real list item), each line's
+ * price as printed, and the receipt's grand total. Writes
+ * nothing; the callers decide what to store.
+ */
+async function extractReceiptPhoto(
+  ctx: Ctx,
+  scan: { id: number; qrValue: string | null },
+  image: { dataBase64: string; mimeType: "image/jpeg" | "image/png" },
+): Promise<{
+  lines: ReceiptPhotoLine[];
+  total: number | null;
+  note: string | null;
+}> {
+  const db = ctx.db<typeof schema>();
+  // Canonical HIT List names (sheet rows + app-added items) — a
+  // proposed match is only kept when it names a real item.
+  const [hitRows, addedRows] = await Promise.all([
+    db.select().from(schema.hitItems),
+    db.select().from(schema.hitAddedItems),
+  ]);
+  const canonical = new Map<string, string>();
+  for (const r of hitRows) {
+    canonical.set(r.item.trim().toLowerCase(), r.item);
+  }
+  for (const r of addedRows) {
+    const key = r.item.trim().toLowerCase();
+    if (!canonical.has(key)) canonical.set(key, r.item);
+  }
+  const itemNames = [...canonical.values()].sort((a, b) =>
+    a.localeCompare(b),
+  );
+  const read = await ctx.inference.complete(
+    [
+      "Read the store receipt in this photo and extract the items that were PURCHASED.",
+      "For each purchased item return one line: receiptText — the item's text exactly as printed on the receipt (when one item's name wraps over two printed lines, combine them into one line); quantity — how many were bought: when the receipt shows a quantity multiplier for the line (e.g. \"2 @ 3.99\") the quantity is that multiplier, for an item sold by weight (e.g. \"0.260 kg @ $8.80/kg\") the quantity is 1, otherwise 1; price — the amount charged for that line in dollars, as printed at the end of the line (for a \"2 @ 3.99\" line, the line's extended amount when one is printed, otherwise the unit price times the quantity), or null when no price is printed beside the item or it can't be read; item — the HIT List item this purchase plainly is, copied exactly from the list below, or null when no list item plainly matches it. Receipts abbreviate heavily, so match the line to the list item it plainly refers to (the same product); never force a match.",
+      "Also return total: the receipt's grand total in dollars — the TOTAL amount printed on the receipt — or null when it isn't legible in the photo. Skip department headers, subtotals, taxes, change, payment and loyalty / points lines, savings summaries, and per-item discount or \"Saving\" lines AS ITEMS — only the items bought become lines; the total is reported separately, never as a line. Do not invent items, quantities, prices or a total that aren't on the receipt.",
+      scan.qrValue
+        ? `A QR code was decoded from this photo; its value is: ${scan.qrValue}. Read the printed receipt in the photo itself.`
+        : "Read the printed receipt in the photo.",
+      "note: one short line naming the store and the receipt date when legible; when nothing could be read, say why in the note and return no lines.",
+      "",
+      "HIT List items:",
+      ...itemNames.map((n) => `- ${n}`),
+    ].join("\n"),
+    {
+      images: [
+        {
+          dataBase64: image.dataBase64,
+          mimeType: image.mimeType,
+          caption: "A photo of a store receipt",
+        },
+      ],
+      schema: receiptPhotoExtraction,
+      timeout_secs: 120,
+    },
+  );
+  const lines = read.lines
+    .filter((l) => l.receiptText.trim().length > 0)
+    .slice(0, 80)
+    .map((l) => ({
+      receiptText: l.receiptText.trim().slice(0, 300),
+      item:
+        l.item != null
+          ? (canonical.get(l.item.trim().toLowerCase()) ?? null)
+          : null,
+      quantity: Number.isFinite(l.quantity)
+        ? Math.min(999, Math.max(0, Math.floor(l.quantity)))
+        : 0,
+      price: receiptMoney(l.price),
+    }));
+  return {
+    lines,
+    total: receiptMoney(read.total),
+    note: read.note?.trim() ? read.note.trim().slice(0, 300) : null,
+  };
+}
+
+/**
+ * Reads one receipt scan's photo IN THE APP, synchronously: the
+ * vision model scans the image for the PURCHASED line items, each
+ * matched against the HIT List names (the list rides along in the
+ * prompt; a match is only kept when it names a real list item,
+ * exactly as setReceiptScanResult validates), each line's price
+ * as printed, and the receipt's grand total, and the proposal is
+ * written straight onto the scan (status "proposed") — the same
+ * write the background reader makes through setReceiptScanResult.
+ * This is the primary read: it runs inside the action that asked
+ * for it, so a scan's review is ready when the call returns
+ * instead of waiting on an outside process to pick the scan up
+ * (the failure the user hit — a legible photo sat "waiting to be
+ * read" for over an hour because the background task never wrote
+ * back). Returns { done: false } in the one case the in-app read
+ * can't cover: nothing readable in the photo itself, but the
+ * photo's QR code links to the digital receipt — the scan then
+ * stays "pending" for the background reader, which can open the
+ * link. A photo with nothing readable and no QR link still
+ * completes: proposed with no lines and the reader's note saying
+ * why. Throws when the model read itself fails; callers fall back
+ * to the background reader.
+ */
+async function readReceiptScanInline(
+  ctx: Ctx,
+  scan: { id: number; qrValue: string | null },
+  image: { dataBase64: string; mimeType: string },
+): Promise<{ done: boolean }> {
+  const mime = image.mimeType;
+  if (mime !== "image/jpeg" && mime !== "image/png") {
+    return { done: false };
+  }
+  const db = ctx.db<typeof schema>();
+  const { lines, total, note } = await extractReceiptPhoto(ctx, scan, {
+    dataBase64: image.dataBase64,
+    mimeType: mime,
+  });
+  const qrIsLink =
+    scan.qrValue != null && /^https?:\/\//i.test(scan.qrValue.trim());
+  if (lines.length === 0 && qrIsLink) {
+    // Nothing readable in the photo itself, but the QR code links
+    // to the digital receipt — leave the scan pending for the
+    // background reader, which can open the link.
+    return { done: false };
+  }
+  await db
+    .update(schema.receiptScans)
+    .set({
+      status: "proposed",
+      linesJson: JSON.stringify(lines),
+      total,
+      note,
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(schema.receiptScans.id, scan.id),
+        eq(schema.receiptScans.status, "pending"),
+      ),
+    );
+  return { done: true };
+}
+
+/**
+ * Fallback read for one receipt scan (status "pending"): a
+ * background agent task that fetches the scan's photo via
+ * getPendingReceiptScans, reads the PURCHASED line items off the
+ * receipt (following the photo's QR code to the digital receipt
+ * when one was decoded), matches each line to a HIT List item, and
+ * writes the proposal back with setReceiptScanResult. The in-app
+ * reader (readReceiptScanInline) is the primary read; this task is
+ * started only for the case it can't cover — a photo whose only
+ * readable content is a QR code linking to the digital receipt —
+ * or when the in-app read itself failed. The dedupe key makes
+ * repeat calls for the same scan safe. Returns the spawn outcome;
+ * on failure the scan keeps its "pending" status and the reason is
+ * stamped into its note, where the app shows it.
+ */
+async function spawnReceiptScanRead(
+  ctx: Ctx,
+  scan: { id: number; qrValue: string | null },
+): Promise<{ ok: boolean; error: string | null }> {
+  const result = await ctx.agent.spawnTask(
+    [
+      `Read a store receipt photo and extract the items purchased, for the HitBit Shopping List app's receipt-scan restock review. The scan is receipt scan #${scan.id}.`,
+      "",
+      `1. Call the getPendingReceiptScans action and find scan #${scan.id}; open its imageUrl to see the receipt photo.${
+        scan.qrValue
+          ? ` A QR code was decoded from the photo in the app; its value is: ${scan.qrValue} — when that value is a link to the digital receipt, open it and read the purchased items from the digital receipt. When the photo is only a QR code and the link can't be opened, read whatever the photo itself shows.`
+          : " The photo may carry a QR code linking to the digital receipt — if you can decode one from the photo and it links to the receipt, read the purchased items from there; otherwise read the printed receipt in the photo."
+      }`,
+      "2. Extract every PURCHASED line item on the receipt: the line's text as printed on the receipt, the quantity purchased — when a line shows a quantity multiplier (e.g. \"2 @ 3.99\") the quantity is that multiplier, otherwise 1 — and the price charged for the line in dollars as printed (null when no price is printed beside the item or it can't be read). Also read the receipt's grand total (the TOTAL amount) in dollars, or null when it isn't legible. Skip subtotals, taxes, change, payment and loyalty lines, and per-item discount/savings lines AS ITEMS — only the items bought become lines; the total is reported separately, never as a line. Do not invent items, quantities, prices or a total that aren't on the receipt.",
+      "3. Call the getHitList action and match each purchased line to a HIT List item by its exact item name. Receipts abbreviate, so match the line to the HIT List item it plainly refers to (the same product); when no HIT List item plainly matches, leave that line unmatched (item: null). Never force a match.",
+      `4. Call the setReceiptScanResult action exactly once with { id: ${scan.id}, lines: [{ receiptText, item, quantity, price }], total: <the receipt's grand total in dollars, or null>, note: <one short line: the store name and receipt date when legible, or why nothing could be read> }. If the photo can't be read, or it shows no purchased items, still call it exactly once with an empty lines list, a null total, and a note saying why.`,
+      "Do not confirm anything and do not record any stock — the user reviews the proposal in the app and confirms it themselves.",
+    ].join("\n"),
+    {
+      expectsAction: "setReceiptScanResult",
+      dedupeKey: `receipt-scan-${scan.id}`,
+    },
+  );
+  if (!result.ok) {
+    const db = ctx.db<typeof schema>();
+    await db
+      .update(schema.receiptScans)
+      .set({
+        note: `Automatic reading couldn't be started: ${result.error}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.receiptScans.id, scan.id));
+    return { ok: false, error: result.error };
+  }
+  return { ok: true, error: null };
+}
+
+/**
+ * The restore itself, shared by restoreReceiptScan (the Receipt
+ * scans Restore button) and recoverReceiptScan (Beta 0.14, which
+ * restores and then re-reads for the total in one step): a
+ * DISMISSED scan goes back to review ("proposed" when it has read
+ * lines, "pending" when it was dismissed before its read
+ * finished), and a CONFIRMED scan whose confirmation was undone
+ * gets its stock additions back — the exact inverse of
+ * undoReceiptScan. Returns an error message when the scan doesn't
+ * exist or isn't removed; null when the restore was written.
+ */
+async function performReceiptScanRestore(
+  ctx: Ctx,
+  id: number,
+): Promise<string | null> {
+  const db = ctx.db<typeof schema>();
+  const rows = await db
+    .select()
+    .from(schema.receiptScans)
+    .where(eq(schema.receiptScans.id, id));
+  const row = rows[0];
+  if (!row) {
+    return "That receipt scan no longer exists.";
+  }
+  if (row.status === "dismissed") {
+    let hasLines = false;
+    if (row.linesJson) {
+      try {
+        const parsed: unknown = JSON.parse(row.linesJson);
+        hasLines = Array.isArray(parsed) && parsed.length > 0;
+      } catch {
+        hasLines = false;
+      }
+    }
+    await db
+      .update(schema.receiptScans)
+      .set({
+        status: hasLines ? "proposed" : "pending",
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.receiptScans.id, id));
+    ctx.invalidateQueries();
+    return null;
+  }
+  if (row.status !== "confirmed" || row.undoneAt == null) {
+    return "That scan isn't removed — there's nothing to restore.";
+  }
+  const statements: BatchItem<"sqlite">[] = [];
+  const linked = await db
+    .select()
+    .from(schema.stockAdjustments)
+    .where(eq(schema.stockAdjustments.receiptScanId, id));
+  const undoneLinked = linked.filter((a) => a.undone === 1);
+  if (undoneLinked.length > 0) {
+    for (const adj of undoneLinked) {
+      if (adj.appliedAt == null) {
+        // Retired before it ever counted — let it count again.
+        statements.push(
+          db
+            .update(schema.stockAdjustments)
+            .set({ undone: 0, undoneAt: null })
+            .where(eq(schema.stockAdjustments.id, adj.id)),
+        );
+      } else {
+        // Already applied when the undo recorded its compensating
+        // 'receipt-undo' adjustment — re-add the quantity with a
+        // fresh linked adjustment, which nets against the
+        // compensation whether or not that has been applied yet.
+        statements.push(
+          db.insert(schema.stockAdjustments).values({
+            item: adj.item,
+            delta: adj.delta,
+            source: "receipt",
+            receiptScanId: id,
+            actor: row.actor,
+          }),
+        );
+      }
+    }
+  } else if (linked.length === 0) {
+    // Legacy scan (confirmed before adjustments carried the scan
+    // link): re-record from the confirmed lines stored on the
+    // scan, linked this time so a later undo reverses exactly
+    // these rows.
+    let lines: { item: string | null; quantity: number }[] = [];
+    if (row.linesJson) {
+      try {
+        const parsed: unknown = JSON.parse(row.linesJson);
+        if (Array.isArray(parsed)) {
+          lines = parsed as typeof lines;
+        }
+      } catch {
+        lines = [];
+      }
+    }
+    for (const line of lines) {
+      if (line.item == null || line.quantity <= 0) continue;
+      statements.push(
+        db.insert(schema.stockAdjustments).values({
+          item: line.item,
+          delta: line.quantity,
+          source: "receipt",
+          receiptScanId: id,
+          actor: row.actor,
+        }),
+      );
+    }
+  }
+  statements.push(
+    db
+      .update(schema.receiptScans)
+      .set({ undoneAt: null, updatedAt: new Date() })
+      .where(eq(schema.receiptScans.id, id)),
+  );
+  const [first, ...rest] = statements;
+  if (first) await db.batch([first, ...rest]);
+  ctx.invalidateQueries();
+  return null;
+}
+
+/**
+ * The totals merge, shared by rereadReceiptScan (the in-app
+ * re-read) and setReceiptScanTotal (the background recovery
+ * reader's write-back): a fresh read's prices are merged onto the
+ * scan's stored lines by receipt text and its total onto the scan
+ * — items, quantities, matches, status and recorded stock are
+ * never touched. A total already on the scan is kept. Writes only
+ * when something actually changed; returns the total now on the
+ * scan (null when neither the scan nor the fresh read has one).
+ */
+async function mergeReceiptReread(
+  ctx: Ctx,
+  row: { id: number; linesJson: string | null; total: number | null },
+  freshLines: { receiptText: string; price: number | null }[],
+  freshTotal: number | null,
+): Promise<number | null> {
+  const db = ctx.db<typeof schema>();
+  const norm = (s: string) => s.trim().toLowerCase().replace(/\s+/g, " ");
+  const priceByText = new Map<string, number>();
+  for (const l of freshLines) {
+    if (l.price != null) priceByText.set(norm(l.receiptText), l.price);
+  }
+  type StoredLine = {
+    receiptText: string;
+    item: string | null;
+    quantity: number;
+    price?: number | null;
+  };
+  let stored: StoredLine[] = [];
+  if (row.linesJson) {
+    try {
+      const parsed: unknown = JSON.parse(row.linesJson);
+      if (Array.isArray(parsed)) stored = parsed as StoredLine[];
+    } catch {
+      stored = [];
+    }
+  }
+  let mergedAny = false;
+  const nextLines = stored.map((l) => {
+    if (l.price != null) return l;
+    const price = priceByText.get(norm(l.receiptText ?? ""));
+    if (price == null) return l;
+    mergedAny = true;
+    return { ...l, price };
+  });
+  const total = row.total ?? receiptMoney(freshTotal);
+  if (mergedAny || total !== (row.total ?? null)) {
+    await db
+      .update(schema.receiptScans)
+      .set({
+        linesJson: JSON.stringify(nextLines),
+        total,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.receiptScans.id, row.id));
+  }
+  ctx.invalidateQueries();
+  return total;
+}
+
+/**
+ * Starts the background reader that fills in a recovered scan's
+ * missing total (recoverReceiptScan): the task fetches the scan's
+ * stored photo via getReceiptScans, reads the receipt's grand
+ * total and each line's price off it, and writes them back with
+ * setReceiptScanTotal. The dedupe key makes repeat recoveries of
+ * the same scan safe. Returns whether the read started; on failure
+ * the reason is stamped into the scan's note, where the app shows
+ * it, exactly as spawnReceiptScanRead does.
+ */
+async function spawnReceiptTotalRead(
+  ctx: Ctx,
+  scan: { id: number },
+): Promise<{ ok: boolean; error: string | null }> {
+  const result = await ctx.agent.spawnTask(
+    [
+      `Re-read a store receipt photo to capture its grand total and line prices, for the HitBit Shopping List app. The scan is receipt scan #${scan.id}; it already exists in the app's Receipt scans and its items were already read — only its total (and line prices) are missing, because its original read predates totals being captured.`,
+      "",
+      `1. Call the getReceiptScans action and find scan #${scan.id}; open its imageUrl to see the receipt photo.`,
+      "2. Read the receipt's grand total — the TOTAL amount printed on the receipt — in dollars, and the price charged for each purchased line (the amount at the end of the line, in dollars, as printed). Skip subtotals, taxes, change, payment and loyalty / points lines, savings summaries, and per-item discount or \"Saving\" lines — the total is the grand TOTAL only. Do not invent a total or prices that aren't legible in the photo.",
+      `3. Call the setReceiptScanTotal action exactly once with { id: ${scan.id}, total: <the grand total in dollars, or null when it isn't legible>, lines: [{ receiptText: <the purchased line's text exactly as printed on the receipt>, price: <the line's price in dollars, or null when none is printed or it can't be read> }] — one entry per purchased line you could read. If the photo can't be read at all, still call it exactly once with a null total and an empty lines list.`,
+      "Do not confirm anything and do not record any stock — this only fills in the total and line prices on a scan that already exists.",
+    ].join("\n"),
+    {
+      expectsAction: "setReceiptScanTotal",
+      dedupeKey: `receipt-total-${scan.id}`,
+    },
+  );
+  if (!result.ok) {
+    const db = ctx.db<typeof schema>();
+    await db
+      .update(schema.receiptScans)
+      .set({
+        note: `The total re-read couldn't be started: ${result.error}`,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.receiptScans.id, scan.id));
+    return { ok: false, error: result.error };
+  }
+  return { ok: true, error: null };
+}
+
 export const Actions = {
   getList: defineAction({
     description:
-      "Returns the cached Shopping List rows (from the HIT-VANDERLANCAL sheet) with check-off state and per-item purchase-confirmation (restocked) state, the sheet's updated stamp, and the last refresh time.",
+      "Returns the cached Shopping List rows (from the connected household sheet, when one is set) with check-off state and per-item purchase-confirmation (restocked) state, the sheet's updated stamp, and the last refresh time.",
     request: z.object({}),
     response: getListResponse,
     handler: async (ctx): Promise<z.infer<typeof getListResponse>> => {
@@ -4418,7 +6020,7 @@ export const Actions = {
 
   saveList: defineAction({
     description:
-      "Replaces the cached Shopping List with rows freshly read from the HIT-VANDERLANCAL sheet's Shopping List tab. Called by the refresh agent task; preserves check-off state for items still on the list and prunes the rest. Section titles are normalized to the canonical current titles (\"Out of Stock\", \"Low Stock on Sale Now\", \"Membership Alternatives\") as they're stored, so retired spellings (\"0 Stock\", \"FFS (Frequent Flyer Alternatives)\", \"Costco Alt.\") don't linger in the cache, and check-off rows recorded under an old spelling are re-keyed to the canonical one instead of being pruned. Also appends each priced item to the app's price-observation log (one observation per item per day per distinct price) that powers the lowest-seen price trends.",
+      "Replaces the cached Shopping List with rows freshly read from the household sheet's Shopping List tab. Called by the refresh agent task; preserves check-off state for items still on the list and prunes the rest. Section titles are normalized to the canonical current titles (\"Out of Stock\", \"Low Stock on Sale Now\", \"Membership Alternatives\") as they're stored, so retired spellings (\"0 Stock\", \"FFS (Frequent Flyer Alternatives)\", \"Costco Alt.\") don't linger in the cache, and check-off rows recorded under an old spelling are re-keyed to the canonical one instead of being pruned. Also appends each priced item to the app's price-observation log (one observation per item per day per distinct price) that powers the lowest-seen price trends.",
     request: z.object({
       updatedStamp: z.string().nullable(),
       items: z.array(
@@ -4638,7 +6240,7 @@ export const Actions = {
 
   refreshList: defineAction({
     description:
-      "Starts a background refresh that re-reads the Shopping List tab of the HIT-VANDERLANCAL Google Sheet and saves the current rows into this app.",
+      "Starts a background refresh that re-reads the Shopping List tab of the household Google Sheet and saves the current rows into this app.",
     request: z.object({}),
     response: z.object({
       started: z.boolean(),
@@ -4652,12 +6254,20 @@ export const Actions = {
       taskId: string | null;
       error: string | null;
     }> => {
+      if (!SPREADSHEET_ID) {
+        return {
+          started: false,
+          taskId: null,
+          error:
+            "No household sheet is configured — set SPREADSHEET_ID in server/src/actions.ts to your sheet's ID first.",
+        };
+      }
       const result = await ctx.agent.spawnTask(
         [
           "Refresh the Shopping List app's cached data from Google Sheets.",
           "",
           `1. Confirm Google Sheets is connected: run \`/opt/hatch/bin/hatch_gws_cli sheets status\`. If it is not connected, stop and report that.`,
-          `2. Read the Shopping List tab of the HIT-VANDERLANCAL spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"Shopping List!A1:Z80"}'\`.`,
+          `2. Read the Shopping List tab of the household spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"Shopping List!A1:Z80"}'\`.`,
           "3. Parse the values grid with these rules:",
           "   - Row 1 is the title (ignore). Row 2 is the updated stamp, e.g. \"Updated Nov 12, 2026\" — pass it verbatim as updatedStamp (null if absent).",
           "   - A row with a single non-empty cell whose text is one of \"Out of Stock\", \"Low Stock on Sale Now\", \"Membership Alternatives\" (older sheets may say \"Membership alternatives\", \"0 Stock\", \"FFS (Frequent Flyer Alternatives)\", \"FFS\", or \"Costco Alt.\") starts a new section; following rows belong to it. Pass the section name through verbatim.",
@@ -4804,7 +6414,7 @@ export const Actions = {
 
   getHitList: defineAction({
     description:
-      "Returns the household inventory: cached HIT List rows from the sheet merged with items added in the app (which carry their formal name/SKU and price-check results), with totals, the last refresh time, the most recent daily stock snapshot date (lastCountedDate — the counted-last stamp; null when no snapshot exists), and how many app-added items are still waiting to be included in the sync updates to Vanessa's app. Stock counts are effective stock (sheet count + app-side adjustments not yet applied to the sheet); each item also carries its sheet count, pending delta, sale-watch star state, a run-out forecast in days when snapshot history supports one, and its optional app-side expiry date. watchedItems lists every starred item so sale scans can include them regardless of stock.",
+      "Returns the household inventory: cached HIT List rows from the sheet merged with items added in the app (which carry their formal name/SKU and price-check results), with totals, the last refresh time, the most recent daily stock snapshot date (lastCountedDate — the counted-last stamp; null when no snapshot exists), and how many app-added items are still waiting to be included in the sync updates to the shared household copy. Stock counts are effective stock (sheet count + app-side adjustments not yet applied to the sheet); each item also carries its sheet count, pending delta, sale-watch star state, a run-out forecast in days when snapshot history supports one, and its optional app-side expiry date. watchedItems lists every starred item so sale scans can include them regardless of stock.",
     request: z.object({}),
     response: hitListResponse,
     handler: async (ctx): Promise<z.infer<typeof hitListResponse>> => {
@@ -4939,7 +6549,7 @@ export const Actions = {
 
   saveHitList: defineAction({
     description:
-      "Replaces the cached HIT List inventory with rows freshly read from the HIT-VANDERLANCAL sheet's HIT List tab. Called by the refresh agent task. Also records today's per-item stock snapshot (used for run-out forecasts; ~60 days kept).",
+      "Replaces the cached HIT List inventory with rows freshly read from the household sheet's HIT List tab. Called by the refresh agent task. Also records today's per-item stock snapshot (used for run-out forecasts; ~60 days kept).",
     request: z.object({
       items: z.array(
         z.object({
@@ -4979,7 +6589,7 @@ export const Actions = {
         );
       });
       // Daily stock snapshot for run-out forecasts: exactly ONE row
-      // per item per Toronto calendar day, upserted on the (date,
+      // per item per local calendar day, upserted on the (date,
       // item) unique index — a same-day re-refresh replaces that
       // day's row instead of adding another, so daily refreshes
       // accumulate the multi-date history the forecasts need.
@@ -5017,7 +6627,7 @@ export const Actions = {
 
   refreshHitList: defineAction({
     description:
-      "Starts a background refresh that re-reads the HIT List tab of the HIT-VANDERLANCAL Google Sheet and saves the current inventory rows into this app (also feeds the Meal Planner's protein stock).",
+      "Starts a background refresh that re-reads the HIT List tab of the household Google Sheet and saves the current inventory rows into this app (also feeds the Meal Planner's protein stock).",
     request: z.object({}),
     response: z.object({
       started: z.boolean(),
@@ -5031,12 +6641,20 @@ export const Actions = {
       taskId: string | null;
       error: string | null;
     }> => {
+      if (!SPREADSHEET_ID) {
+        return {
+          started: false,
+          taskId: null,
+          error:
+            "No household sheet is configured — set SPREADSHEET_ID in server/src/actions.ts to your sheet's ID first.",
+        };
+      }
       const result = await ctx.agent.spawnTask(
         [
           "Refresh the HIT List tab data in the Shopping List app from Google Sheets.",
           "",
           `1. Confirm Google Sheets is connected: run \`/opt/hatch/bin/hatch_gws_cli sheets status\`. If it is not connected, stop and report that.`,
-          `2. Read the HIT List tab of the HIT-VANDERLANCAL spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"HIT List!A1:E120"}'\`.`,
+          `2. Read the HIT List tab of the household spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"HIT List!A1:E120"}'\`.`,
           "3. Parse the values grid with these rules:",
           '   - Row 1 is the title ("Household Inventory Tracker") — ignore. Rows 2–3 are the totals header and totals — ignore. Row 5 is the column header (Category, Item Name, Stock, Store, Notes). Item rows start at row 6.',
           "   - For each row from row 6 on: category = col A (often empty — the sheet only fills it on the first row of each category group; pass the empty string through and the app carries the last category forward), item = col B (skip the row when empty), stock = col C parsed as an integer, store = col D.",
@@ -5054,7 +6672,7 @@ export const Actions = {
 
   addHitItem: defineAction({
     description:
-      "Adds a new item to the HIT List from the app: category, item name, stock count, store, and optionally the formal product name and SKU. The item shows in the HIT List right away, is queued for the sync updates to Vanessa's app, and an automatic Flipp/website price check starts for it (sale price, regular price, and a cheaper alternative when it isn't on sale). The Google Sheet itself is not edited — the sheet connection is read-only.",
+      "Adds a new item to the HIT List from the app: category, item name, stock count, store, and optionally the formal product name and SKU. The item shows in the HIT List right away, is queued for the sync updates to the shared household copy, and an automatic Flipp/website price check starts for it (sale price, regular price, and a cheaper alternative when it isn't on sale). The Google Sheet itself is not edited — the sheet connection is read-only.",
     request: z.object({
       category: z.string().trim().min(1).max(80),
       item: z.string().trim().min(1).max(120),
@@ -5385,6 +7003,53 @@ export const Actions = {
     },
   }),
 
+  getLastUndoableAction: defineAction({
+    description:
+      "Reports the app's LAST action that the single Settings Undo button would revert (Beta 0.15): the newest not-yet-undone undoable action across both sides (purchases, stock changes, eaten/usage, receipt scans, alert dismissals, BIT count changes, waste entries, manifest imports, requisition check-offs, POS sales) that the current role may undo under the undo policy — or label null when there is nothing to undo. Read-only; undoLastAction performs the reversal.",
+    request: z.object({}),
+    response: z.object({ label: z.string().nullable() }),
+    handler: async (ctx): Promise<{ label: string | null }> => {
+      const candidate = await findLastUndoableAction(ctx);
+      return { label: candidate?.label ?? null };
+    },
+  }),
+
+  undoLastAction: defineAction({
+    description:
+      "The app's one Undo (Beta 0.15, in Settings under Switch to): reverts the LAST action taken anywhere in the app — the newest not-yet-undone undoable action across both sides that the current role may undo under the undo policy — through that action type's own reversal, and reports what was undone by name. Pressing it again reverts the action before that. When nothing undoable remains it changes nothing and says so.",
+    request: z.object({}),
+    response: z.object({
+      ok: z.boolean(),
+      label: z.string().nullable(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{
+      ok: boolean;
+      label: string | null;
+      error: string | null;
+    }> => {
+      const candidate = await findLastUndoableAction(ctx);
+      if (!candidate) {
+        return {
+          ok: false,
+          label: null,
+          error: "There's nothing to undo — no action can be reverted right now.",
+        };
+      }
+      const res = await candidate.run(ctx);
+      if (!res.ok) {
+        return {
+          ok: false,
+          label: candidate.label,
+          error: res.error ?? "That action couldn't be undone.",
+        };
+      }
+      return { ok: true, label: candidate.label, error: null };
+    },
+  }),
+
   recheckItemPrice: defineAction({
     description:
       "Re-runs the automatic Flipp/website price check for an item that was added in the app (e.g. after a failed check, or in a new flyer week).",
@@ -5491,7 +7156,7 @@ export const Actions = {
 
   getPendingSync: defineAction({
     description:
-      "Lists the HIT List items added in this app that have not yet been included in the sync updates to Vanessa's app (category, item, stock, store, formal name, SKU), so the sync process can carry them in its next update.",
+      "Lists the HIT List items added in this app that have not yet been included in the sync updates to the shared household copy (category, item, stock, store, formal name, SKU), so the sync process can carry them in its next update.",
     request: z.object({}),
     response: z.object({
       pending: z.array(
@@ -5532,7 +7197,7 @@ export const Actions = {
 
   markItemsSynced: defineAction({
     description:
-      "Marks app-added HIT List items as included in the sync updates to Vanessa's app, clearing them from the pending-sync queue. Called by the sync process after the update carrying them has been sent.",
+      "Marks app-added HIT List items as included in the sync updates to the shared household copy, clearing them from the pending-sync queue. Called by the sync process after the update carrying them has been sent.",
     request: z.object({ ids: z.array(z.number().int().positive()).min(1) }),
     response: z.object({ marked: z.number() }),
     handler: async (ctx, args): Promise<{ marked: number }> => {
@@ -5962,34 +7627,7 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.usageLog)
-        .where(eq(schema.usageLog.id, args.id));
-      const row = rows[0];
-      if (!row) return { ok: false, error: "That usage entry no longer exists." };
-      if (row.undone === 1) return { ok: false, error: "That entry is already undone." };
-      const gate = undoGate(await loadAccountSettings(ctx), "eaten", row.actor);
-      if (gate) return { ok: false, error: gate };
-      await db
-        .update(schema.usageLog)
-        .set({ undone: 1, undoneAt: new Date() })
-        .where(eq(schema.usageLog.id, args.id));
-      if (row.deducted > 0) {
-        await db.insert(schema.stockAdjustments).values({
-          item: row.item,
-          delta: row.deducted,
-          source: "usage-undo",
-        });
-      }
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) => await performUndoUsage(ctx, args.id),
   }),
 
   undoPickEaten: defineAction({
@@ -6001,55 +7639,8 @@ export const Actions = {
       undoneCount: z.number(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; undoneCount: number; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.usageLog)
-        .where(eq(schema.usageLog.pickId, args.pickId));
-      const active = rows.filter((r) => r.undone === 0);
-      if (active.length === 0) {
-        return {
-          ok: false,
-          undoneCount: 0,
-          error: "That pick has no logged usage to undo.",
-        };
-      }
-      // Policy + ownership (audit #5): the tap is undone as a
-      // whole, so every entry it logged must be undoable by the
-      // current role — a Permanent Eaten type blocks it, and a
-      // Connected account can't undo a tap the Primary user made.
-      const settings = await loadAccountSettings(ctx);
-      for (const row of active) {
-        const gate = undoGate(settings, "eaten", row.actor);
-        if (gate) return { ok: false, undoneCount: 0, error: gate };
-      }
-      const statements: BatchItem<"sqlite">[] = [];
-      for (const row of active) {
-        statements.push(
-          db
-            .update(schema.usageLog)
-            .set({ undone: 1, undoneAt: new Date() })
-            .where(eq(schema.usageLog.id, row.id)),
-        );
-        if (row.deducted > 0) {
-          statements.push(
-            db.insert(schema.stockAdjustments).values({
-              item: row.item,
-              delta: row.deducted,
-              source: "usage-undo",
-            }),
-          );
-        }
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, undoneCount: active.length, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoPickEaten(ctx, args.pickId),
   }),
 
   recordStocktake: defineAction({
@@ -6304,65 +7895,8 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.stockAdjustments)
-        .where(eq(schema.stockAdjustments.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return { ok: false, error: "That adjustment no longer exists." };
-      }
-      if (row.source !== "quick-adjust" && row.source !== "stocktake") {
-        return { ok: false, error: "That entry can't be undone here." };
-      }
-      if (row.undone === 1) {
-        return { ok: false, error: "That adjustment is already undone." };
-      }
-      const adjGate = undoGate(
-        await loadAccountSettings(ctx),
-        "stockAdjustments",
-        row.actor,
-      );
-      if (adjGate) return { ok: false, error: adjGate };
-      // A restock that settled a Shopping List purchase is undone
-      // from the purchase entry, which also clears the Purchased
-      // stamps — undoing the adjustment alone would strand them.
-      const purchaseRows = await db
-        .select()
-        .from(schema.purchaseLog)
-        .where(eq(schema.purchaseLog.adjustmentId, args.id));
-      if (purchaseRows.some((r) => r.undone === 0)) {
-        return {
-          ok: false,
-          error:
-            "That change settled a purchase — undo it from the purchase entry instead.",
-        };
-      }
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.stockAdjustments)
-          .set({ undone: 1, undoneAt: new Date() })
-          .where(eq(schema.stockAdjustments.id, args.id)),
-      ];
-      if (row.appliedAt != null) {
-        statements.push(
-          db.insert(schema.stockAdjustments).values({
-            item: row.item,
-            delta: -row.delta,
-            source: "adjustment-undo",
-          }),
-        );
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoStockAdjustment(ctx, args.id),
   }),
 
   undoPurchase: defineAction({
@@ -6373,89 +7907,7 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.purchaseLog)
-        .where(eq(schema.purchaseLog.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return { ok: false, error: "That purchase entry no longer exists." };
-      }
-      if (row.undone === 1) {
-        return { ok: false, error: "That purchase is already undone." };
-      }
-      const purchaseGate = undoGate(
-        await loadAccountSettings(ctx),
-        "purchases",
-        row.actor,
-      );
-      if (purchaseGate) return { ok: false, error: purchaseGate };
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.purchaseLog)
-          .set({ undone: 1, undoneAt: new Date() })
-          .where(eq(schema.purchaseLog.id, args.id)),
-      ];
-      // Reverse the stock effect.
-      let reversed = false;
-      if (row.adjustmentId != null) {
-        const adjRows = await db
-          .select()
-          .from(schema.stockAdjustments)
-          .where(eq(schema.stockAdjustments.id, row.adjustmentId));
-        const adj = adjRows[0];
-        if (adj && adj.undone === 1) {
-          // The adjustment's own Undo already reversed its stock
-          // effect — never reverse the same change twice.
-          reversed = true;
-        } else if (adj && adj.appliedAt == null) {
-          // Still pending: deleting the row reverses it exactly.
-          statements.push(
-            db
-              .delete(schema.stockAdjustments)
-              .where(eq(schema.stockAdjustments.id, adj.id)),
-          );
-          reversed = true;
-        }
-      }
-      if (!reversed) {
-        // Already applied to the sheet (or the link is missing):
-        // record the compensating negative adjustment.
-        statements.push(
-          db.insert(schema.stockAdjustments).values({
-            item: row.item,
-            delta: -row.quantity,
-            source: "purchase-undo",
-          }),
-        );
-      }
-      // Clear the Purchased stamp on the item's checked rows (all
-      // sections) so the purchase can be confirmed again.
-      const itemKey = row.item.trim().toLowerCase();
-      const checkedRows = await db.select().from(schema.checkedItems);
-      for (const cr of checkedRows) {
-        if (
-          cr.restockedAt != null &&
-          itemNameOfKey(cr.itemKey).trim().toLowerCase() === itemKey
-        ) {
-          statements.push(
-            db
-              .update(schema.checkedItems)
-              .set({ restockedAt: null })
-              .where(eq(schema.checkedItems.itemKey, cr.itemKey)),
-          );
-        }
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) => await performUndoPurchase(ctx, args.id),
   }),
 
   setItemExpiry: defineAction({
@@ -8441,12 +9893,23 @@ export const Actions = {
 
   // ---- Receipt scans + alerts ---------------------------------------
   // Receipt-photo quick-restock scan: the user photographs a store
-  // RECEIPT (requestReceiptScan stores the photo in ctx.blobs and
-  // leaves the row "pending"); an external process (Muse, on a
-  // schedule, like the recipe-video pipeline) reads pending photos
-  // via getPendingReceiptScans, extracts the PURCHASED line items
-  // with the quantities bought, and writes a proposed restock list
-  // back with setReceiptScanResult. The user reviews the proposal
+  // RECEIPT and the app reads it itself, automatically —
+  // requestReceiptScan stores the photo in ctx.blobs, opens the
+  // row "pending", and reads the photo in that same call
+  // (readReceiptScanInline above: the vision model scans the image
+  // for the PURCHASED line items, matches each to a HIT List item,
+  // and writes the proposed restock list onto the scan, moving it
+  // to "proposed"). The background reader task
+  // (spawnReceiptScanRead, writing back via setReceiptScanResult)
+  // remains only as the fallback for a photo whose only readable
+  // content is a QR code linking to the digital receipt, or when
+  // the in-app read itself fails. Scans still "pending" (sent
+  // before in-app reading existed, or whose read never completed)
+  // are picked up whenever the app shows them: the Receipt scans
+  // area fetches the scan's stored photo and sends it to
+  // readReceiptScanNow, which reads it in the app the same way
+  // (readPendingReceiptScans remains the background-reader
+  // fallback starter). The user reviews the proposal
   // in the app — quantities editable, lines removable — and ONLY
   // confirmReceiptScan records stock (pending adjustments, source
   // "receipt"). Dismissing records nothing. The intake is
@@ -8459,7 +9922,7 @@ export const Actions = {
 
   requestReceiptScan: defineAction({
     description:
-      "Stores a photo of a store receipt the user took or uploaded via the Shopping List tab's 'Receipt scan' button and opens a receipt-scan request (status 'pending'). The photo may be a printed receipt, a receipt photo carrying a QR code, or a photo that is only a QR code linking to a digital receipt — all are accepted. The photo bytes go to blob storage; when the app decoded a QR code from the photo, its value is passed as qrValue and stored with the scan. Nothing is read and nothing is recorded into the inventory by this call. An external process picks pending requests up via getPendingReceiptScans, reads the receipt (following the QR code to the digital copy when one is present), extracts the purchased items, and writes a proposed restock list back with setReceiptScanResult; the user then reviews and confirms (or dismisses) it in the app.",
+      "Stores a photo of a store receipt the user took or uploaded via the Shopping List tab's 'Receipt scan' button, opens a receipt-scan request, and reads the photo automatically in this same call: the app's own reader scans the image for the purchased items, matches each to a HIT List item, and writes the proposed restock list onto the scan — so on success the response's status is usually 'proposed' and the review is ready immediately. The one case the in-app read can't cover (a photo whose only readable content is a QR code linking to the digital receipt) or an in-app read failure falls back to the background reader task, and the status stays 'pending' while it works. The photo may be a printed receipt, a receipt photo carrying a QR code, or a photo that is only a QR code linking to a digital receipt — all are accepted. The photo bytes go to blob storage; when the app decoded a QR code from the photo, its value is passed as qrValue and stored with the scan. This call records nothing into the inventory — the user reviews the proposal and confirms (or dismisses) it in the app. If neither read could be started, the response's ok is false and its error says so; the photo stays saved as a pending scan (its note carries the reason) that readPendingReceiptScans can pick up later.",
     request: z.object({
       image: z.object({
         // Base64 of the photo file (from fileToBase64 on the
@@ -8475,17 +9938,27 @@ export const Actions = {
     response: z.object({
       ok: z.boolean(),
       id: z.number().nullable(),
+      // Where the scan stands when this call returns: "proposed"
+      // when the in-app read already finished (the usual case),
+      // "pending" while the fallback background reader works.
+      status: z.enum(["pending", "proposed"]).nullable(),
       error: z.string().nullable(),
     }),
     handler: async (
       ctx,
       args,
-    ): Promise<{ ok: boolean; id: number | null; error: string | null }> => {
+    ): Promise<{
+      ok: boolean;
+      id: number | null;
+      status: "pending" | "proposed" | null;
+      error: string | null;
+    }> => {
       const mime = args.image.mimeType.trim().toLowerCase();
       if (mime !== "image/jpeg" && mime !== "image/png") {
         return {
           ok: false,
           id: null,
+          status: null,
           error: "That photo format isn't supported — use a JPEG or PNG.",
         };
       }
@@ -8496,11 +9969,17 @@ export const Actions = {
         return {
           ok: false,
           id: null,
+          status: null,
           error: "That photo couldn't be read. Try again.",
         };
       }
       if (bytes.length === 0) {
-        return { ok: false, id: null, error: "That photo was empty." };
+        return {
+          ok: false,
+          id: null,
+          status: null,
+          error: "That photo was empty.",
+        };
       }
       const qrValue = args.qrValue?.trim() ? args.qrValue.trim() : null;
       const db = ctx.db<typeof schema>();
@@ -8516,14 +9995,185 @@ export const Actions = {
         .update(schema.receiptScans)
         .set({ imageBlobKey: key, updatedAt: new Date() })
         .where(eq(schema.receiptScans.id, row.id));
+      // Read it automatically, right away, in this call — the
+      // app's own reader scans the photo for the purchased items,
+      // so the proposal is ready when the send returns. Only the
+      // case the in-app read can't cover (a QR-link-only photo) or
+      // an in-app read failure falls back to the background reader
+      // task; the scan then stays "pending" while that works.
+      let status: "pending" | "proposed" = "pending";
+      try {
+        const read = await readReceiptScanInline(
+          ctx,
+          { id: row.id, qrValue },
+          { dataBase64: args.image.dataBase64, mimeType: mime },
+        );
+        if (read.done) status = "proposed";
+      } catch {
+        // The in-app read failed — the background reader below is
+        // the fallback, so the scan is still read automatically.
+      }
+      if (status === "pending") {
+        const read = await spawnReceiptScanRead(ctx, {
+          id: row.id,
+          qrValue,
+        });
+        ctx.invalidateQueries();
+        if (!read.ok) {
+          return {
+            ok: false,
+            id: row.id,
+            status,
+            error:
+              "Your receipt photo was saved, but automatic reading couldn't be started. It's listed below — it will be picked up for reading, or you can dismiss it and send the photo again.",
+          };
+        }
+      }
       ctx.invalidateQueries();
-      return { ok: true, id: row.id, error: null };
+      return { ok: true, id: row.id, status, error: null };
+    },
+  }),
+
+  readPendingReceiptScans: defineAction({
+    description:
+      "Starts the background reader for every receipt scan still waiting to be read (status 'pending') — the fallback pickup, used when the app couldn't fetch a waiting scan's stored photo to read it in the app itself (readReceiptScanNow is the primary pickup: the Shopping List tab fetches the photo and sends it there to be read in the call). Each scan gets the background reader task (dedupe-keyed per scan, so calling this again while a read is already running starts nothing new). Returns how many scans are waiting and how many background reads this call started.",
+    request: z.object({}),
+    response: z.object({
+      waiting: z.number(),
+      started: z.number(),
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{ waiting: number; started: number }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.status, "pending"))
+        .orderBy(asc(schema.receiptScans.id));
+      let started = 0;
+      for (const row of rows) {
+        const read = await spawnReceiptScanRead(ctx, {
+          id: row.id,
+          qrValue: row.qrValue,
+        });
+        if (read.ok) started += 1;
+      }
+      if (started > 0) ctx.invalidateQueries();
+      return { waiting: rows.length, started };
+    },
+  }),
+
+  readReceiptScanNow: defineAction({
+    description:
+      "Reads one waiting receipt scan (status 'pending') in the app, now: the Shopping List tab fetches the scan's stored photo (via the URL getPendingReceiptScans returns for it) and sends the photo here; this call scans the image for the purchased items with the app's own reader, matches them to HIT List items, and writes the proposal onto the scan — the same read requestReceiptScan runs on a fresh send, for scans sent before in-app reading existed or whose read never finished. The sent photo is checked against the stored photo's size before anything is read, so a scan is only ever read from its own photo. A scan that isn't pending anymore is answered with its current status and nothing is read. The one case the in-app read can't cover (a photo whose only readable content is a QR code linking to the digital receipt) or an in-app read failure falls back to the background reader task, and the status stays 'pending' while it works. Records NO stock — only the user's in-app Confirm does that.",
+    request: z.object({
+      id: z.number().int().positive(),
+      image: z.object({
+        dataBase64: z.string().min(1).max(20_000_000),
+        mimeType: z.string().min(1).max(100),
+      }),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      status: z
+        .enum(["pending", "proposed", "confirmed", "dismissed"])
+        .nullable(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      status: "pending" | "proposed" | "confirmed" | "dismissed" | null;
+      error: string | null;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return {
+          ok: false,
+          status: null,
+          error: "That receipt scan no longer exists.",
+        };
+      }
+      if (row.status !== "pending") {
+        return { ok: true, status: row.status, error: null };
+      }
+      const mime = args.image.mimeType.trim().toLowerCase();
+      if (mime !== "image/jpeg" && mime !== "image/png") {
+        return {
+          ok: false,
+          status: row.status,
+          error: "That photo format isn't supported — use a JPEG or PNG.",
+        };
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = base64ToBytes(args.image.dataBase64);
+      } catch {
+        return {
+          ok: false,
+          status: row.status,
+          error: "That photo couldn't be read. Try again.",
+        };
+      }
+      if (bytes.length === 0) {
+        return { ok: false, status: row.status, error: "That photo was empty." };
+      }
+      // The photo sent must be the scan's own stored photo (the
+      // tab fetched it from the scan's blob URL) — check its size
+      // against the stored blob before reading anything from it.
+      if (row.imageBlobKey) {
+        const head = await ctx.blobs.head(row.imageBlobKey);
+        if (head && head.sizeBytes !== bytes.length) {
+          return {
+            ok: false,
+            status: row.status,
+            error: "That photo doesn't match this scan's stored photo.",
+          };
+        }
+      }
+      let status: "pending" | "proposed" = "pending";
+      try {
+        const read = await readReceiptScanInline(
+          ctx,
+          { id: row.id, qrValue: row.qrValue },
+          { dataBase64: args.image.dataBase64, mimeType: mime },
+        );
+        if (read.done) status = "proposed";
+      } catch {
+        // The in-app read failed — the background reader below is
+        // the fallback, so the scan is still read automatically.
+      }
+      if (status === "pending") {
+        const read = await spawnReceiptScanRead(ctx, {
+          id: row.id,
+          qrValue: row.qrValue,
+        });
+        ctx.invalidateQueries();
+        if (!read.ok) {
+          return {
+            ok: false,
+            status,
+            error:
+              "Automatic reading couldn't be started for this scan. It stays listed below — or you can dismiss it and send the photo again.",
+          };
+        }
+      }
+      ctx.invalidateQueries();
+      return { ok: true, status, error: null };
     },
   }),
 
   getReceiptScans: defineAction({
     description:
-      "Lists receipt-scan requests for the Shopping List tab's 'Receipt scans' area, newest first: each scan's status ('pending' waiting to be read, 'proposed' awaiting the user's review, 'confirmed', 'dismissed'), when it was sent, its proposed lines (the line as printed on the receipt, matched HIT List item or null when unmatched, quantity purchased), any note from the reader, and the QR code value decoded from the photo (null when none was found). Confirmed scans also report how many lines / units were recorded into the inventory.",
+      "Lists receipt-scan requests for the Shopping List tab's 'Receipt scans' area, newest first: each scan's status ('pending' while its automatic read runs, 'proposed' awaiting the user's review, 'confirmed', 'dismissed'), when it was sent, its proposed lines (the line as printed on the receipt, matched HIT List item or null when unmatched, quantity purchased, and the line's price in dollars when the read captured one), the receipt's grand total in dollars when the read captured one (null otherwise — scans read before totals were captured have none until re-read), a URL for the scan's stored receipt photo (so the tab can send the photo back for a re-read), any note from the reader, and the QR code value decoded from the photo (null when none was found). Confirmed scans also report how many lines / units were recorded into the inventory.",
     request: z.object({}),
     response: z.object({
       scans: z.array(
@@ -8537,8 +10187,11 @@ export const Actions = {
               receiptText: z.string(),
               item: z.string().nullable(),
               quantity: z.number(),
+              price: z.number().nullable(),
             }),
           ),
+          total: z.number().nullable(),
+          imageUrl: z.string().nullable(),
           note: z.string().nullable(),
           confirmedUnits: z.number().nullable(),
           // True once a confirmed scan's stock additions have
@@ -8560,7 +10213,12 @@ export const Actions = {
         .limit(12);
       const parseLines = (
         json: string | null,
-      ): { receiptText: string; item: string | null; quantity: number }[] => {
+      ): {
+        receiptText: string;
+        item: string | null;
+        quantity: number;
+        price: number | null;
+      }[] => {
         if (!json) return [];
         try {
           const parsed: unknown = JSON.parse(json);
@@ -8579,42 +10237,66 @@ export const Actions = {
                 Number.isFinite(l.quantity)
                   ? Math.max(0, Math.round(l.quantity))
                   : 0,
+              price:
+                typeof l.price === "number" &&
+                Number.isFinite(l.price) &&
+                l.price >= 0
+                  ? Math.round(l.price * 100) / 100
+                  : null,
             }));
         } catch {
           return [];
         }
       };
-      return {
-        scans: rows.map((r) => {
-          const lines = parseLines(r.linesJson);
-          const matched = lines.filter((l) => l.item != null);
-          return {
-            id: r.id,
-            status: r.status,
-            createdAt: r.createdAt.toISOString(),
-            qrValue: r.qrValue,
-            lines,
-            note: r.note,
-            confirmedUnits:
-              r.status === "confirmed"
-                ? matched.reduce((sum, l) => sum + l.quantity, 0)
-                : null,
-            undone: r.undoneAt != null,
-            ...undoMeta(
-              settings,
-              "receiptScans",
-              r.actor,
-              r.undoneAt != null,
-            ),
-          };
-        }),
-      };
+      const scans: {
+        id: number;
+        status: "pending" | "proposed" | "confirmed" | "dismissed";
+        createdAt: string;
+        qrValue: string | null;
+        lines: ReturnType<typeof parseLines>;
+        total: number | null;
+        imageUrl: string | null;
+        note: string | null;
+        confirmedUnits: number | null;
+        undone: boolean;
+        actor: "primary" | "connected";
+        permanent: boolean;
+        canUndo: boolean;
+      }[] = [];
+      for (const r of rows) {
+        const lines = parseLines(r.linesJson);
+        const matched = lines.filter((l) => l.item != null);
+        scans.push({
+          id: r.id,
+          status: r.status,
+          createdAt: r.createdAt.toISOString(),
+          qrValue: r.qrValue,
+          lines,
+          total: r.total ?? null,
+          imageUrl: r.imageBlobKey
+            ? await ctx.blobs.getUrl(r.imageBlobKey)
+            : null,
+          note: r.note,
+          confirmedUnits:
+            r.status === "confirmed"
+              ? matched.reduce((sum, l) => sum + l.quantity, 0)
+              : null,
+          undone: r.undoneAt != null,
+          ...undoMeta(
+            settings,
+            "receiptScans",
+            r.actor,
+            r.undoneAt != null,
+          ),
+        });
+      }
+      return { scans };
     },
   }),
 
   getPendingReceiptScans: defineAction({
     description:
-      "Lists the receipt-scan requests still waiting to be read (status 'pending'), oldest first, each with a URL for its stored receipt photo and the QR code value decoded from the photo when one was found (qrValue, null otherwise), so Muse can fetch the photo, extract the PURCHASED line items with the quantities bought, match each to a HIT List item (exact item names from getHitList), and write the proposal back with setReceiptScanResult. When the photo carries a QR code — or is only a QR code — and qrValue is set, follow it to the digital receipt and read the purchased items from there; when qrValue is null, attempt QR decoding from the photo itself before falling back to reading the printed receipt.",
+      "Lists the receipt-scan requests still waiting to be read (status 'pending'), oldest first, each with a URL for its stored receipt photo and the QR code value decoded from the photo when one was found (qrValue, null otherwise), so Muse can fetch the photo, extract the PURCHASED line items with the quantities bought, each line's price and the receipt's grand total, match each to a HIT List item (exact item names from getHitList), and write the proposal back with setReceiptScanResult. When the photo carries a QR code — or is only a QR code — and qrValue is set, follow it to the digital receipt and read the purchased items from there; when qrValue is null, attempt QR decoding from the photo itself before falling back to reading the printed receipt.",
     request: z.object({}),
     response: z.object({
       pending: z.array(
@@ -8658,7 +10340,7 @@ export const Actions = {
 
   setReceiptScanResult: defineAction({
     description:
-      "Writes the proposed restock list for a pending receipt scan (called by Muse after reading the receipt photo, or the digital receipt a QR code in the photo links to): one line per item PURCHASED on the receipt — the line's text as printed on the receipt, the matched HIT List item name (exact spelling from getHitList) or null when the purchased item matched nothing, and the quantity purchased — plus an optional note. Matched names that aren't on the HIT List are dropped to unmatched rather than trusted. Moves the scan to status 'proposed' for the user to review in the app; records NO stock — only the user's in-app Confirm does that.",
+      "Writes the proposed restock list for a pending receipt scan (called by Muse after reading the receipt photo, or the digital receipt a QR code in the photo links to): one line per item PURCHASED on the receipt — the line's text as printed on the receipt, the matched HIT List item name (exact spelling from getHitList) or null when the purchased item matched nothing, the quantity purchased, and the line's price in dollars when one was read — plus the receipt's grand total in dollars when legible, and an optional note. Matched names that aren't on the HIT List are dropped to unmatched rather than trusted. Moves the scan to status 'proposed' for the user to review in the app; records NO stock — only the user's in-app Confirm does that.",
     request: z.object({
       id: z.number().int().positive(),
       lines: z
@@ -8667,9 +10349,11 @@ export const Actions = {
             receiptText: z.string().min(1).max(300),
             item: z.string().max(120).nullable().default(null),
             quantity: z.number().int().min(0).max(999),
+            price: z.number().min(0).max(1_000_000).nullable().default(null),
           }),
         )
         .max(80),
+      total: z.number().min(0).max(1_000_000).nullable().default(null),
       note: z.string().max(300).nullable().default(null),
     }),
     response: z.object({
@@ -8716,12 +10400,14 @@ export const Actions = {
             ? (canonical.get(l.item.trim().toLowerCase()) ?? null)
             : null,
         quantity: l.quantity,
+        price: receiptMoney(l.price),
       }));
       await db
         .update(schema.receiptScans)
         .set({
           status: "proposed",
           linesJson: JSON.stringify(lines),
+          total: receiptMoney(args.total),
           note: args.note,
           updatedAt: new Date(),
         })
@@ -8733,7 +10419,7 @@ export const Actions = {
 
   confirmReceiptScan: defineAction({
     description:
-      "Confirms a reviewed receipt-scan proposal (the in-app Confirm — the two-factor step): records ONE pending stock adjustment per confirmed line for its HIT List item (source 'receipt', applied to the sheet later by the auto-scan) and marks the scan 'confirmed', storing the confirmed lines on it. Only a scan in status 'proposed' can be confirmed, every line's item must be on the HIT List and its quantity 1–999 — if any line fails, nothing is recorded. Lines the user removed in review are simply not sent, so they record nothing.",
+      "Confirms a reviewed receipt-scan proposal (the in-app Confirm — the two-factor step): records ONE pending stock adjustment per confirmed line for its HIT List item (source 'receipt', applied to the sheet later by the auto-scan) and marks the scan 'confirmed', storing the confirmed lines on it — plus the proposal's unmatched lines (item null), kept as leftovers so they stay listed beside the confirmed scan with their Add button. Only a scan in status 'proposed' can be confirmed, every line's item must be on the HIT List and its quantity 1–999 — if any line fails, nothing is recorded. Lines the user removed in review are simply not sent, so they record nothing.",
     request: z.object({
       id: z.number().int().positive(),
       lines: z
@@ -8807,6 +10493,7 @@ export const Actions = {
         receiptText: string;
         item: string | null;
         quantity: number;
+        price?: number | null;
       }[] = [];
       if (row.linesJson) {
         try {
@@ -8828,8 +10515,25 @@ export const Actions = {
           receiptText: proposed?.receiptText ?? l.item,
           item: l.item,
           quantity: l.quantity,
+          price: receiptMoney(proposed?.price),
         };
       });
+      // The proposal's unmatched lines ride along as leftovers:
+      // the recognized items are now logged into the inventory,
+      // and the lines that matched nothing stay on the confirmed
+      // scan so the user can still add them to the HIT List from
+      // its history entry. They record nothing — undo skips
+      // item-null lines and the confirmed-units count sums only
+      // matched lines.
+      const leftoverLines = proposedLines
+        .filter((p) => p.item == null)
+        .map((p) => ({
+          receiptText: p.receiptText,
+          item: null,
+          quantity: p.quantity,
+          price: receiptMoney(p.price),
+        }));
+      const storedLines = [...confirmedLines, ...leftoverLines];
       const { role } = await loadAccountSettings(ctx);
       const statements: BatchItem<"sqlite">[] = resolved.map((l) =>
         db.insert(schema.stockAdjustments).values({
@@ -8847,7 +10551,7 @@ export const Actions = {
           .update(schema.receiptScans)
           .set({
             status: "confirmed",
-            linesJson: JSON.stringify(confirmedLines),
+            linesJson: JSON.stringify(storedLines),
             updatedAt: new Date(),
             // Attribution (audit #5): the confirming role is the
             // scan's actor — its Undo follows it.
@@ -8870,122 +10574,8 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.receiptScans)
-        .where(eq(schema.receiptScans.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return { ok: false, error: "That receipt scan no longer exists." };
-      }
-      if (row.status !== "confirmed") {
-        return { ok: false, error: "That scan wasn't confirmed." };
-      }
-      if (row.undoneAt != null) {
-        return { ok: false, error: "That scan is already undone." };
-      }
-      const scanGate = undoGate(
-        await loadAccountSettings(ctx),
-        "receiptScans",
-        row.actor,
-      );
-      if (scanGate) return { ok: false, error: scanGate };
-      const statements: BatchItem<"sqlite">[] = [];
-      const linked = await db
-        .select()
-        .from(schema.stockAdjustments)
-        .where(eq(schema.stockAdjustments.receiptScanId, args.id));
-      const activeLinked = linked.filter((a) => a.undone === 0);
-      if (activeLinked.length > 0) {
-        for (const adj of activeLinked) {
-          statements.push(
-            db
-              .update(schema.stockAdjustments)
-              .set({ undone: 1, undoneAt: new Date() })
-              .where(eq(schema.stockAdjustments.id, adj.id)),
-          );
-          if (adj.appliedAt != null) {
-            statements.push(
-              db.insert(schema.stockAdjustments).values({
-                item: adj.item,
-                delta: -adj.delta,
-                source: "receipt-undo",
-              }),
-            );
-          }
-        }
-      } else {
-        // Legacy scan (confirmed before adjustments carried the
-        // scan link): reverse from the confirmed lines stored on
-        // the scan. Per line, retire a matching still-pending
-        // unlinked receipt adjustment when one is there;
-        // otherwise record the compensating adjustment (which is
-        // also the right correction when the original was already
-        // applied to the sheet).
-        let lines: { item: string | null; quantity: number }[] = [];
-        if (row.linesJson) {
-          try {
-            const parsed: unknown = JSON.parse(row.linesJson);
-            if (Array.isArray(parsed)) {
-              lines = parsed as typeof lines;
-            }
-          } catch {
-            lines = [];
-          }
-        }
-        const pool = (
-          await db
-            .select()
-            .from(schema.stockAdjustments)
-            .where(eq(schema.stockAdjustments.source, "receipt"))
-        ).filter(
-          (a) =>
-            a.receiptScanId == null && a.undone === 0 && a.appliedAt == null,
-        );
-        for (const line of lines) {
-          if (line.item == null || line.quantity <= 0) continue;
-          const key = line.item.trim().toLowerCase();
-          const idx = pool.findIndex(
-            (a) =>
-              a.item.trim().toLowerCase() === key &&
-              a.delta === line.quantity,
-          );
-          const match = idx >= 0 ? pool[idx] : undefined;
-          if (match) {
-            pool.splice(idx, 1);
-            statements.push(
-              db
-                .update(schema.stockAdjustments)
-                .set({ undone: 1, undoneAt: new Date() })
-                .where(eq(schema.stockAdjustments.id, match.id)),
-            );
-          } else {
-            statements.push(
-              db.insert(schema.stockAdjustments).values({
-                item: line.item,
-                delta: -line.quantity,
-                source: "receipt-undo",
-              }),
-            );
-          }
-        }
-      }
-      statements.push(
-        db
-          .update(schema.receiptScans)
-          .set({ undoneAt: new Date(), updatedAt: new Date() })
-          .where(eq(schema.receiptScans.id, args.id)),
-      );
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoReceiptScan(ctx, args.id),
   }),
 
   dismissReceiptScan: defineAction({
@@ -9024,6 +10614,267 @@ export const Actions = {
         .where(eq(schema.receiptScans.id, args.id));
       ctx.invalidateQueries();
       return { ok: true, error: null };
+    },
+  }),
+
+  restoreReceiptScan: defineAction({
+    description:
+      "Restores a receipt scan the user removed by accident (Beta 0.13): a DISMISSED scan goes back to review ('proposed' when it has read lines, 'pending' when it was dismissed before its read finished — the tab's automatic pickup then reads it), and a CONFIRMED scan whose confirmation was undone gets its stock additions back — the exact inverse of undoReceiptScan: adjustments the undo retired before they were applied count again, and for ones already applied (where the undo recorded a compensating 'receipt-undo' adjustment) a fresh linked 'receipt' adjustment re-adds the quantity; scans confirmed before adjustments carried the link are re-recorded from their confirmed lines. The scan's undone stamp is cleared either way. A scan that isn't dismissed or undone is answered with an error and nothing changes.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; error: string | null }> => {
+      const error = await performReceiptScanRestore(ctx, args.id);
+      return error == null
+        ? { ok: true, error: null }
+        : { ok: false, error };
+    },
+  }),
+
+  rereadReceiptScan: defineAction({
+    description:
+      "Re-reads a receipt scan's stored photo to fill in what its original read didn't capture: the receipt's grand total and each line's price (reads before Beta 0.13 captured items and quantities only, so no total was ever stored for them and none could be shown). The Shopping List tab fetches the scan's stored photo (via the URL getReceiptScans returns for it) and sends it here; the sent photo is size-checked against the stored photo before anything is read, so a scan is only ever re-read from its own photo. The fresh read's prices are merged onto the scan's stored lines by receipt text and its total onto the scan — items, quantities, matches, status and recorded stock are never touched. A scan still waiting for its first read is answered as-is (its own read path owns it). Returns the total now on the scan — null when the photo's total still couldn't be read.",
+    request: z.object({
+      id: z.number().int().positive(),
+      image: z.object({
+        dataBase64: z.string().min(1).max(20_000_000),
+        mimeType: z.string().min(1).max(100),
+      }),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      total: z.number().nullable(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; total: number | null; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return {
+          ok: false,
+          total: null,
+          error: "That receipt scan no longer exists.",
+        };
+      }
+      if (row.status === "pending") {
+        return { ok: true, total: row.total ?? null, error: null };
+      }
+      const mime = args.image.mimeType.trim().toLowerCase();
+      if (mime !== "image/jpeg" && mime !== "image/png") {
+        return {
+          ok: false,
+          total: row.total ?? null,
+          error: "That photo format isn't supported — use a JPEG or PNG.",
+        };
+      }
+      let bytes: Uint8Array;
+      try {
+        bytes = base64ToBytes(args.image.dataBase64);
+      } catch {
+        return {
+          ok: false,
+          total: row.total ?? null,
+          error: "That photo couldn't be read. Try again.",
+        };
+      }
+      if (bytes.length === 0) {
+        return {
+          ok: false,
+          total: row.total ?? null,
+          error: "That photo was empty.",
+        };
+      }
+      // The photo sent must be the scan's own stored photo (the
+      // tab fetched it from the scan's blob URL) — check its size
+      // against the stored blob before reading anything from it.
+      if (row.imageBlobKey) {
+        const head = await ctx.blobs.head(row.imageBlobKey);
+        if (head && head.sizeBytes !== bytes.length) {
+          return {
+            ok: false,
+            total: row.total ?? null,
+            error: "That photo doesn't match this scan's stored photo.",
+          };
+        }
+      }
+      let fresh: { lines: ReceiptPhotoLine[]; total: number | null };
+      try {
+        fresh = await extractReceiptPhoto(
+          ctx,
+          { id: row.id, qrValue: row.qrValue },
+          { dataBase64: args.image.dataBase64, mimeType: mime },
+        );
+      } catch {
+        return {
+          ok: false,
+          total: row.total ?? null,
+          error: "The re-read didn't finish. Try again in a moment.",
+        };
+      }
+      // Merge only what the original read couldn't capture: a
+      // price for each stored line whose receipt text the fresh
+      // read priced, and the total. Stored items, quantities and
+      // matches stay exactly as they are (mergeReceiptReread).
+      const total = await mergeReceiptReread(ctx, row, fresh.lines, fresh.total);
+      return { ok: true, total, error: null };
+    },
+  }),
+
+  setReceiptScanTotal: defineAction({
+    description:
+      "Writes back a totals re-read for an existing receipt scan (called by Muse after re-reading the scan's stored photo during a recovery): the receipt's grand total in dollars and one entry per purchased line — its text as printed and the price charged — are merged onto the scan exactly the way rereadReceiptScan merges its in-app re-read: prices land on stored lines matched by receipt text, a total already on the scan is kept, and items, quantities, matches, status and recorded stock are never touched. A scan still waiting for its first read is refused (its own read path owns it — setReceiptScanResult is that write-back). Returns the total now on the scan.",
+    request: z.object({
+      id: z.number().int().positive(),
+      total: z.number().nullable(),
+      lines: z
+        .array(
+          z.object({
+            receiptText: z.string().min(1).max(300),
+            price: z.number().nullable(),
+          }),
+        )
+        .max(80),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      total: z.number().nullable(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{ ok: boolean; total: number | null; error: string | null }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.id, args.id));
+      const row = rows[0];
+      if (!row) {
+        return {
+          ok: false,
+          total: null,
+          error: "That receipt scan no longer exists.",
+        };
+      }
+      if (row.status === "pending") {
+        return {
+          ok: false,
+          total: row.total ?? null,
+          error: "That scan is still waiting for its first read.",
+        };
+      }
+      const total = await mergeReceiptReread(
+        ctx,
+        row,
+        args.lines.map((l) => ({
+          receiptText: l.receiptText,
+          price: receiptMoney(l.price),
+        })),
+        args.total,
+      );
+      return { ok: true, total, error: null };
+    },
+  }),
+
+  recoverReceiptScan: defineAction({
+    description:
+      "Recovers a receipt scan the user removed by accident, in one step (Beta 0.14 — the user's Metro receipt sat confirmed-but-undone with no total, and restoring it alone still left the total invisible): when the scan is dismissed or its confirmation was undone, it is restored exactly as restoreReceiptScan restores it (a dismissed scan returns to review; an undone confirmation gets its stock additions back); then, when the scan still has no grand total — its original read predates totals being captured, so none was ever stored even though the total is printed on the photo — a background reader is started to re-read the stored photo for the total and the line prices and write them back with setReceiptScanTotal (dedupe-keyed per scan). A scan still waiting for its first read is left to its own read path, which captures the total itself. Returns whether the scan was restored, the total now on it (null while the re-read runs), and whether that re-read started. Records no stock beyond what the restore itself reverses.",
+    request: z.object({ id: z.number().int().positive() }),
+    response: z.object({
+      ok: z.boolean(),
+      restored: z.boolean(),
+      total: z.number().nullable(),
+      rereadStarted: z.boolean(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      restored: boolean;
+      total: number | null;
+      rereadStarted: boolean;
+      error: string | null;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const rows = await db
+        .select()
+        .from(schema.receiptScans)
+        .where(eq(schema.receiptScans.id, args.id));
+      let row = rows[0];
+      if (!row) {
+        return {
+          ok: false,
+          restored: false,
+          total: null,
+          rereadStarted: false,
+          error: "That receipt scan no longer exists.",
+        };
+      }
+      let restored = false;
+      if (
+        row.status === "dismissed" ||
+        (row.status === "confirmed" && row.undoneAt != null)
+      ) {
+        const error = await performReceiptScanRestore(ctx, args.id);
+        if (error != null) {
+          return {
+            ok: false,
+            restored: false,
+            total: row.total ?? null,
+            rereadStarted: false,
+            error,
+          };
+        }
+        restored = true;
+        const after = await db
+          .select()
+          .from(schema.receiptScans)
+          .where(eq(schema.receiptScans.id, args.id));
+        if (after[0]) row = after[0];
+      }
+      if (row.status === "pending") {
+        // Its own read path owns it — and that read captures the
+        // total itself, so no separate re-read is started.
+        return {
+          ok: true,
+          restored,
+          total: row.total ?? null,
+          rereadStarted: false,
+          error: null,
+        };
+      }
+      if (row.total == null && row.imageBlobKey) {
+        const started = await spawnReceiptTotalRead(ctx, { id: row.id });
+        return {
+          ok: true,
+          restored,
+          total: null,
+          rereadStarted: started.ok,
+          error: started.ok ? null : started.error,
+        };
+      }
+      return {
+        ok: true,
+        restored,
+        total: row.total ?? null,
+        rereadStarted: false,
+        error: null,
+      };
     },
   }),
 
@@ -9167,30 +11018,7 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.alerts)
-        .where(eq(schema.alerts.id, args.id));
-      const row = rows[0];
-      if (!row) return { ok: false, error: "That alert no longer exists." };
-      if (row.dismissedAt != null) {
-        const settings = await loadAccountSettings(ctx);
-        const refusal = undoGate(settings, "alertDismissals", row.dismissedBy);
-        if (refusal) return { ok: false, error: refusal };
-      }
-      const res = await db
-        .update(schema.alerts)
-        .set({ dismissedAt: null, dismissedBy: null })
-        .where(eq(schema.alerts.id, args.id))
-        .returning({ id: schema.alerts.id });
-      ctx.invalidateQueries();
-      return { ok: res.length > 0, error: null };
-    },
+    handler: async (ctx, args) => await performRestoreAlert(ctx, args.id),
   }),
 
   bootstrapPlanner: defineAction({
@@ -9210,7 +11038,7 @@ export const Actions = {
             "Refresh the HIT List tab data in the Shopping List app from Google Sheets.",
             "",
             `1. Confirm Google Sheets is connected: run \`/opt/hatch/bin/hatch_gws_cli sheets status\`. If it is not connected, stop and report that.`,
-            `2. Read the HIT List tab of the HIT-VANDERLANCAL spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"HIT List!A1:E120"}'\`.`,
+            `2. Read the HIT List tab of the household spreadsheet (spreadsheetId ${SPREADSHEET_ID}): run \`/opt/hatch/bin/hatch_gws_cli sheets spreadsheets values get --params '{"spreadsheetId":"${SPREADSHEET_ID}","range":"HIT List!A1:E120"}'\`.`,
             "3. Parse the values grid with these rules:",
             '   - Row 1 is the title ("Household Inventory Tracker") — ignore. Rows 2–3 are the totals header and totals — ignore. Row 5 is the column header (Category, Item Name, Stock, Store, Notes). Item rows start at row 6.',
             "   - For each row from row 6 on: category = col A (often empty — the sheet only fills it on the first row of each category group; pass the empty string through and the app carries the last category forward), item = col B (skip the row when empty), stock = col C parsed as an integer, store = col D.",
@@ -9290,7 +11118,7 @@ export const Actions = {
 
   getBitState: defineAction({
     description:
-      "Reads the whole BIT (Business Inventory Tracker) side in one call: the business profile from the setup wizard (null until setup is completed) with its categories (the only organizing concept — for a business set up under the earlier category-or-zone choice, its existing groups are presented as its categories and each item's category is its group) and its saved POS connection (null until one is connected from the Inventory tab), every inventory item with its on-hand (book) count, par, unit, pack size, supplier, SKU, category and tags, the recent finished rounds with their variance / below-par / freezer summaries, and the manifest photo scans awaiting or holding a reader proposal. The business also carries its business-type needs profile (Alpha 0.75 — expiry tracking / waste log / fractional counting, keyed off the stored type), each item its optional expiry date, and, for waste-log (Restaurant) businesses, the waste history. For a requisition business (usesRequisition — TFS station 226) it also returns the current outstanding requisition with its check-off lines, the closed requisition history, the not-received lines carried onto the next build as resubmissions, and the catalogue draft extras on the requisition being built. The business also carries the requisition approver (District Chief) name and the recorded-at stamps for the Duty Officer and approver names (audit #15), each requisition its snapshotted prepared-by / approved-by names and dates, and each item its own last-counted stamp from the finished-check snapshots (audit #16; null when never counted). (The Quartermaster catalogue entries themselves are tracked inventory items since Alpha 0.72 and come back in the items list under their own category.)",
+      "Reads the whole BIT (Business Inventory Tracker) side in one call: the business profile from the setup wizard (null until setup is completed) with its categories (the only organizing concept — for a business set up under the earlier category-or-zone choice, its existing groups are presented as its categories and each item's category is its group) and its saved POS connection (null until one is connected from the Inventory tab), every inventory item with its on-hand (book) count, par, unit, pack size, supplier, SKU, category and tags, the recent finished rounds with their variance / below-par / freezer summaries, and the manifest photo scans awaiting or holding a reader proposal. The business also carries its business-type needs profile (Alpha 0.75 — expiry tracking / waste log / fractional counting, keyed off the stored type), each item its optional expiry date, and, for waste-log (Restaurant) businesses, the waste history. For a requisition business (usesRequisition) it also returns the current outstanding requisition with its check-off lines, the closed requisition history, the not-received lines carried onto the next build as resubmissions, and the catalogue draft extras on the requisition being built. The business also carries the requisition approver name and the recorded-at stamps for the preparer and approver names (audit #15), each requisition its snapshotted prepared-by / approved-by names and dates, and each item its own last-counted stamp from the finished-check snapshots (audit #16; null when never counted). (Catalogue reference entries come back separately from the inventory items.)",
     request: z.object({ businessId: bitBusinessIdRequest }),
     response: z.object({
       businesses: z.array(
@@ -9309,28 +11137,27 @@ export const Actions = {
           categories: z.array(z.string()),
           freezers: z.array(z.string()),
           colors: z.record(z.string(), z.string()),
-          // Quartermaster requisition workflow (Alpha 0.71): the
-          // flag gates the Requisition tab, catalogue and check-off
-          // flow (TFS station 226 only); division and the Duty
-          // Officer's name are the requisition form's stored,
-          // editable header fields (null until set).
+          // Requisition workflow (Alpha 0.71): the flag gates the
+          // Requisition tab, catalogue and check-off flow;
+          // division and the preparer's name are the requisition
+          // form's stored, editable header fields (null until set).
           usesRequisition: z.boolean(),
           division: z.string().nullable(),
-          dutyOfficerName: z.string().nullable(),
-          // Approver separation (audit #15): the District Chief
-          // recorded as this requisition's approver, and when each
-          // header name was recorded (ISO; null until set).
+          preparerName: z.string().nullable(),
+          // Approver separation (audit #15): the approver
+          // recorded for this business, and when each header name
+          // was recorded (ISO; null until set).
           approverName: z.string().nullable(),
           approverRecordedAt: z.string().nullable(),
-          dutyOfficerRecordedAt: z.string().nullable(),
+          preparerRecordedAt: z.string().nullable(),
           // Team size saved by the setup wizard's team-size step
           // (Alpha 0.90); null for businesses set up before it.
           teamSize: z.string().nullable(),
           // Business-type needs profile (Alpha 0.75), keyed off
           // the stored business type: which type-specific
           // features are switched on for this business. All false
-          // for Retail Store, Other / custom businesses (incl.
-          // TFS station 226) and businesses with no profile.
+          // for Retail Store, Other / custom businesses and
+          // businesses with no profile.
           needs: z.object({
             expiryTracking: z.boolean(),
             wasteLog: z.boolean(),
@@ -9339,7 +11166,7 @@ export const Actions = {
           // Analytics tab gate (Alpha 0.76): true only when the
           // business has a stored analytics dataset (monthly rows
           // in bit_analytics_months) — today only The Daily Scoop
-          // (the BIT Sim 01 dataset). TFS has none.
+          // (the BIT Sim 01 dataset).
           hasAnalytics: z.boolean(),
           // The saved POS connection (null = none connected).
           pos: z
@@ -9393,15 +11220,15 @@ export const Actions = {
       ),
       // Requisition workflow (Alpha 0.71): all empty / null for
       // businesses without the requisition flag. `requisition`
-      // is the station's current outstanding requisition awaiting
+      // is the business's current outstanding requisition awaiting
       // check-off, `requisitionHistory` the completed ones kept on
       // file, `resubmittedLines` the not-received lines from closed
       // requisitions that carry onto the next requisition build,
       // and `draftExtras` the catalogue entries put straight onto
       // the requisition being built. The `catalogue` rows are the
-      // Alpha 0.71 reference entries, kept on file; since Alpha
-      // 0.72 the catalogue items are tracked inventory (see the
-      // items list) and the client no longer renders this list.
+      // Alpha 0.71 reference entries, kept on file for any draft
+      // extras that still point at them; the client no longer
+      // renders this list.
       catalogue: z.array(bitCatalogueShape),
       // Waste history (Alpha 0.75): newest first, populated only
       // for businesses whose needs profile includes the waste log
@@ -9472,7 +11299,7 @@ export const Actions = {
         (r) => r.provider === biz?.posProvider,
       );
       // Requisition workflow data — only for businesses with the
-      // flag (TFS); every other business reads empty.
+      // flag; every other business reads empty.
       const reqBiz = biz && biz.usesRequisition === 1 ? biz : null;
       const [catalogueRows, reqRows, reqLineRows, draftExtraRows] =
         reqBiz
@@ -9516,7 +11343,7 @@ export const Actions = {
       );
       // Not-received lines from CLOSED requisitions that no later
       // requisition line has superseded carry onto the next build
-      // (SOG: no back orders — resubmit instead).
+      // (No back orders — resubmit instead).
       const resubmittedRows = reqLineRows.filter(
         (l) =>
           l.status === "not_received" &&
@@ -9626,12 +11453,12 @@ export const Actions = {
               colors: bitParseColors(biz.colorsJson),
               usesRequisition: biz.usesRequisition === 1,
               division: biz.division,
-              dutyOfficerName: biz.dutyOfficerName,
+              preparerName: biz.preparerName,
               approverName: biz.approverName,
               approverRecordedAt:
                 biz.approverRecordedAt?.toISOString() ?? null,
-              dutyOfficerRecordedAt:
-                biz.dutyOfficerRecordedAt?.toISOString() ?? null,
+              preparerRecordedAt:
+                biz.preparerRecordedAt?.toISOString() ?? null,
               teamSize: biz.teamSize,
               needs: needsProfile,
               hasAnalytics: analyticsRows.length > 0,
@@ -10194,629 +12021,13 @@ export const Actions = {
     },
   }),
 
-  convertBitTfsCatalogueToInventory: defineAction({
-    description:
-      "Converts the TFS Quartermaster catalogue (the OfficiallyDressed 'SHORELINE' PPE catalogue items 125–208, supplied by the user) into regular tracked inventory items on the TFS station 226 business — the business whose name starts with 'TFS station 226'. Each catalogue entry becomes an item in its own 'Quartermaster catalogue' category (added to the business's category list when missing): name = the catalogue description, SKU = its Material #, opening count 0, no par. Existing tracked items are never touched; an entry already tracked (same name or Material #) is skipped. Idempotent, and no other business is touched.",
-    request: z.object({}),
-    response: z.object({
-      ok: z.literal(true),
-      converted: z.boolean(),
-      businessId: z.number().nullable(),
-      itemCount: z.number(),
-    }),
-    handler: async (
-      ctx,
-    ): Promise<{
-      ok: true;
-      converted: boolean;
-      businessId: number | null;
-      itemCount: number;
-    }> => {
-      const db = ctx.db<typeof schema>();
-      const all = await db
-        .select()
-        .from(schema.bitBusiness)
-        .orderBy(asc(schema.bitBusiness.id));
-      const tfs = all.find((b) =>
-        b.name.trim().toLowerCase().startsWith("tfs station 226"),
-      );
-      if (!tfs || tfs.usesRequisition !== 1) {
-        return {
-          ok: true as const,
-          converted: false,
-          businessId: null,
-          itemCount: 0,
-        };
-      }
-      const group = "Quartermaster catalogue";
-      // The catalogue group joins the business's category list (in
-      // both stored lists, which are kept in step) so the items
-      // group under it in the Inventory tab and are countable
-      // under it in Inventory Checks. The station's own categories
-      // are untouched.
-      if (!bitBusinessCategories(tfs).includes(group)) {
-        const categories = [
-          ...bitParseStringArray(tfs.categoriesJson),
-          ...(bitParseStringArray(tfs.categoriesJson).includes(group)
-            ? []
-            : [group]),
-        ];
-        const zones = [
-          ...bitParseStringArray(tfs.zonesJson),
-          ...(bitParseStringArray(tfs.zonesJson).includes(group)
-            ? []
-            : [group]),
-        ];
-        await db
-          .update(schema.bitBusiness)
-          .set({
-            categoriesJson: JSON.stringify(categories),
-            zonesJson: JSON.stringify(zones),
-            updatedAt: new Date(),
-          })
-          .where(eq(schema.bitBusiness.id, tfs.id));
-      }
-      const existing = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      const haveNames = new Set(
-        existing.map((r) => r.name.trim().toLowerCase()),
-      );
-      const haveSkus = new Set(
-        existing
-          .map((r) => r.sku?.trim().toLowerCase())
-          .filter((s): s is string => !!s),
-      );
-      const maxOrder = existing.reduce((m, r) => Math.max(m, r.sortOrder), -1);
-      const missing = TFS_CATALOGUE.filter(
-        ([no, desc]) =>
-          !haveSkus.has(no.trim().toLowerCase()) &&
-          !haveNames.has(desc.trim().toLowerCase()),
-      );
-      if (missing.length > 0) {
-        const statements: BatchItem<"sqlite">[] = missing.map(
-          ([no, desc], i) =>
-            db.insert(schema.bitItems).values({
-              businessId: tfs.id,
-              name: desc.trim(),
-              category: group,
-              zone: group,
-              onHand: 0,
-              unit: "each",
-              par: 0,
-              packSize: 1,
-              supplier: null,
-              sku: no,
-              tagsJson: "[]",
-              sortOrder: maxOrder + 1 + i,
-            }),
-        );
-        const [first, ...rest] = statements;
-        if (first) await db.batch([first, ...rest]);
-      }
-      const items = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      ctx.invalidateQueries();
-      return {
-        ok: true as const,
-        converted: missing.length > 0,
-        businessId: tfs.id,
-        itemCount: items.length,
-      };
-    },
-  }),
-
-  importBitTfsFilledRequisitionItems: defineAction({
-    description:
-      "Adds the 56 Item / Description lines from the filled TFS requisition the user supplied (Station 232, dated 09/20/2026 — the third file) to the TFS station 226 business's tracked inventory: name verbatim from the form, in the station's existing categories (Medical, Office Supplies, Cleaning supplies, Other), unit from the form's Qty column, opening count 0 and no par (the form's quantities were that order's amounts, not station 226 stock). Every imported or already-tracked matching item is tagged 'Filled requisition form' so the app can show exactly which inventory items came from that file. Existing items' names, counts, pars and categories are never changed; an entry already tracked under the same name is not duplicated. Idempotent, and no other business is touched.",
-    request: z.object({}),
-    response: z.object({
-      ok: z.literal(true),
-      imported: z.boolean(),
-      addedCount: z.number(),
-      alreadyCount: z.number(),
-      businessId: z.number().nullable(),
-      itemCount: z.number(),
-      addedNames: z.array(z.string()),
-    }),
-    handler: async (
-      ctx,
-    ): Promise<{
-      ok: true;
-      imported: boolean;
-      addedCount: number;
-      alreadyCount: number;
-      businessId: number | null;
-      itemCount: number;
-      addedNames: string[];
-    }> => {
-      const db = ctx.db<typeof schema>();
-      const all = await db
-        .select()
-        .from(schema.bitBusiness)
-        .orderBy(asc(schema.bitBusiness.id));
-      const tfs = all.find((b) =>
-        b.name.trim().toLowerCase().startsWith("tfs station 226"),
-      );
-      if (!tfs || tfs.usesRequisition !== 1) {
-        return {
-          ok: true as const,
-          imported: false,
-          addedCount: 0,
-          alreadyCount: 0,
-          businessId: null,
-          itemCount: 0,
-          addedNames: [],
-        };
-      }
-      const existing = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      const byName = new Map(
-        existing.map((r) => [r.name.trim().toLowerCase(), r]),
-      );
-      const maxOrder = existing.reduce((m, r) => Math.max(m, r.sortOrder), -1);
-      const statements: BatchItem<"sqlite">[] = [];
-      const addedNames: string[] = [];
-      let alreadyCount = 0;
-      let insertIndex = 0;
-      for (const [name, category, unit] of TFS_FILLED_REQUISITION) {
-        const found = byName.get(name.trim().toLowerCase());
-        if (found) {
-          alreadyCount += 1;
-          // Already tracked: only the provenance tag is ensured —
-          // its name, count, par, category and unit stay as they are.
-          const tags = bitParseStringArray(found.tagsJson);
-          if (!tags.includes(TFS_FILLED_REQ_TAG)) {
-            statements.push(
-              db
-                .update(schema.bitItems)
-                .set({
-                  tagsJson: JSON.stringify([...tags, TFS_FILLED_REQ_TAG]),
-                })
-                .where(eq(schema.bitItems.id, found.id)),
-            );
-          }
-          continue;
-        }
-        addedNames.push(name);
-        statements.push(
-          db.insert(schema.bitItems).values({
-            businessId: tfs.id,
-            name,
-            category,
-            zone: category,
-            onHand: 0,
-            unit,
-            par: 0,
-            packSize: 1,
-            supplier: null,
-            sku: null,
-            tagsJson: JSON.stringify([TFS_FILLED_REQ_TAG]),
-            sortOrder: maxOrder + 1 + insertIndex,
-          }),
-        );
-        insertIndex += 1;
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      const items = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      ctx.invalidateQueries();
-      return {
-        ok: true as const,
-        imported: statements.length > 0,
-        addedCount: addedNames.length,
-        alreadyCount,
-        businessId: tfs.id,
-        itemCount: items.length,
-        addedNames,
-      };
-    },
-  }),
-
-  pruneBitTfsToFilledRequisitionItems: defineAction({
-    description:
-      "Trims the TFS station 226 business's tracked inventory to exactly the 56 items from the filled requisition the user supplied (the items tagged 'Filled requisition form'), at the user's direction to keep the new 56 and remove all the old items: the station's 12 earlier supply items and the 84 Quartermaster catalogue items converted from the PPE catalogue are deleted, the 'Quartermaster catalogue' category comes off the business, and the catalogue reference rows and any catalogue draft extras are cleared. Any of the 56 that is somehow missing is restored (count 0, no par, tagged) so the end state is exactly those 56. Kept items keep their names, counts, pars, categories and units exactly. Requisition history lines keep their name snapshots (their link to a removed item is cleared), and no other business is touched. Idempotent.",
-    request: z.object({}),
-    response: z.object({
-      ok: z.literal(true),
-      pruned: z.boolean(),
-      keptCount: z.number(),
-      removedCount: z.number(),
-      restoredCount: z.number(),
-      businessId: z.number().nullable(),
-      itemCount: z.number(),
-      removedNames: z.array(z.string()),
-    }),
-    handler: async (
-      ctx,
-    ): Promise<{
-      ok: true;
-      pruned: boolean;
-      keptCount: number;
-      removedCount: number;
-      restoredCount: number;
-      businessId: number | null;
-      itemCount: number;
-      removedNames: string[];
-    }> => {
-      const db = ctx.db<typeof schema>();
-      const all = await db
-        .select()
-        .from(schema.bitBusiness)
-        .orderBy(asc(schema.bitBusiness.id));
-      const tfs = all.find((b) =>
-        b.name.trim().toLowerCase().startsWith("tfs station 226"),
-      );
-      if (!tfs || tfs.usesRequisition !== 1) {
-        return {
-          ok: true as const,
-          pruned: false,
-          keptCount: 0,
-          removedCount: 0,
-          restoredCount: 0,
-          businessId: null,
-          itemCount: 0,
-          removedNames: [],
-        };
-      }
-      const canonicalNames = new Set(
-        TFS_FILLED_REQUISITION.map(([name]) => name.trim().toLowerCase()),
-      );
-      // Restore any of the 56 that is missing, so the end state is
-      // exactly the filled requisition's items even if an earlier
-      // import only partially landed.
-      let items = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      const haveNames = new Set(
-        items.map((r) => r.name.trim().toLowerCase()),
-      );
-      const missing = TFS_FILLED_REQUISITION.filter(
-        ([name]) => !haveNames.has(name.trim().toLowerCase()),
-      );
-      if (missing.length > 0) {
-        const maxOrder = items.reduce((m, r) => Math.max(m, r.sortOrder), -1);
-        const inserts: BatchItem<"sqlite">[] = missing.map(
-          ([name, category, unit], i) =>
-            db.insert(schema.bitItems).values({
-              businessId: tfs.id,
-              name,
-              category,
-              zone: category,
-              onHand: 0,
-              unit,
-              par: 0,
-              packSize: 1,
-              supplier: null,
-              sku: null,
-              tagsJson: JSON.stringify([TFS_FILLED_REQ_TAG]),
-              sortOrder: maxOrder + 1 + i,
-            }),
-        );
-        const [firstInsert, ...restInserts] = inserts;
-        if (firstInsert) await db.batch([firstInsert, ...restInserts]);
-        items = await db
-          .select()
-          .from(schema.bitItems)
-          .where(eq(schema.bitItems.businessId, tfs.id));
-      }
-      // Keep = one of the 56 (by canonical name, or carrying the
-      // provenance tag the import stamps on exactly those items).
-      // Everything else on TFS is an old item and is removed.
-      const kept = items.filter(
-        (r) =>
-          canonicalNames.has(r.name.trim().toLowerCase()) ||
-          bitParseStringArray(r.tagsJson).includes(TFS_FILLED_REQ_TAG),
-      );
-      const removed = items.filter((r) => !kept.some((k) => k.id === r.id));
-      const removedIds = new Set(removed.map((r) => r.id));
-      const statements: BatchItem<"sqlite">[] = [];
-      for (const r of removed) {
-        statements.push(
-          db.delete(schema.bitItems).where(eq(schema.bitItems.id, r.id)),
-        );
-      }
-      // POS mappings that pointed at a removed item go with it (the
-      // POS transaction log itself is history and stays).
-      if (removedIds.size > 0) {
-        const mappings = await db
-          .select()
-          .from(schema.bitPosMappings)
-          .where(eq(schema.bitPosMappings.businessId, tfs.id));
-        for (const m of mappings) {
-          if (removedIds.has(m.itemId)) {
-            statements.push(
-              db
-                .delete(schema.bitPosMappings)
-                .where(eq(schema.bitPosMappings.id, m.id)),
-            );
-          }
-        }
-        // Requisition history keeps its line names; only the link
-        // back to a now-removed inventory item is cleared.
-        const lines = await db
-          .select()
-          .from(schema.bitRequisitionLines)
-          .where(eq(schema.bitRequisitionLines.businessId, tfs.id));
-        for (const l of lines) {
-          if (l.itemId != null && removedIds.has(l.itemId)) {
-            statements.push(
-              db
-                .update(schema.bitRequisitionLines)
-                .set({ itemId: null })
-                .where(eq(schema.bitRequisitionLines.id, l.id)),
-            );
-          }
-        }
-      }
-      // The old catalogue itself goes: its reference rows and any
-      // draft extras still pointing at them.
-      statements.push(
-        db
-          .delete(schema.bitCatalogue)
-          .where(eq(schema.bitCatalogue.businessId, tfs.id)),
-        db
-          .delete(schema.bitRequisitionDraftExtras)
-          .where(eq(schema.bitRequisitionDraftExtras.businessId, tfs.id)),
-      );
-      // The "Quartermaster catalogue" category held only old items;
-      // it comes off the business's category lists (both stored
-      // lists are kept in step).
-      const groupKey = "quartermaster catalogue";
-      const categories = bitParseStringArray(tfs.categoriesJson).filter(
-        (c) => c.trim().toLowerCase() !== groupKey,
-      );
-      const zones = bitParseStringArray(tfs.zonesJson).filter(
-        (c) => c.trim().toLowerCase() !== groupKey,
-      );
-      const categoryChanged =
-        categories.length !== bitParseStringArray(tfs.categoriesJson).length ||
-        zones.length !== bitParseStringArray(tfs.zonesJson).length;
-      if (categoryChanged) {
-        statements.push(
-          db
-            .update(schema.bitBusiness)
-            .set({
-              categoriesJson: JSON.stringify(categories),
-              zonesJson: JSON.stringify(zones),
-              updatedAt: new Date(),
-            })
-            .where(eq(schema.bitBusiness.id, tfs.id)),
-        );
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      const finalItems = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      ctx.invalidateQueries();
-      return {
-        ok: true as const,
-        pruned:
-          removed.length > 0 || missing.length > 0 || categoryChanged,
-        keptCount: kept.length,
-        removedCount: removed.length,
-        restoredCount: missing.length,
-        businessId: tfs.id,
-        itemCount: finalItems.length,
-        removedNames: removed.map((r) => r.name),
-      };
-    },
-  }),
-
-  replaceBitTfsInventory: defineAction({
-    description:
-      "Bulk-replaces the TFS station 226 business's tracked inventory with catalogue lines supplied in the call (the station-supply categories of the TFS Quartermaster catalogue spreadsheet the user supplied). Targets the requisition business whose name starts with 'TFS station 226'; when no such business exists the call is refused and nothing changes. With clearFirst true it first deletes ALL of the business's current inventory items (plus its requisition draft extras, POS mappings to those items, and the item links on its requisition history lines — the history keeps its name snapshots) and sets the business's category list to the provided categories array, in the given order; the business's other profile fields (name, type, usesRequisition, Division / Duty Officer header fields, freezers, POS state) never change. Every line is then inserted as an inventory item: name verbatim, its category, SKU = the catalogue Material ID (stored as text), its unit, on-hand count 0, par 0, no supplier — the catalogue's warehouse stock figures are never loaded as station counts. Item names are unique case-insensitively per business: if the payload (combined with any items already present when clearFirst is false) would create a duplicate name, the whole call is rejected and nothing from it is inserted. Designed to be invoked repeatedly: the first call passes clearFirst true with the full ordered category list and the first batch of lines; later calls pass clearFirst false to append the remaining batches. No other business is touched.",
-    request: z.object({
-      clearFirst: z.boolean(),
-      categories: z.array(z.string().min(1).max(120)).max(200).optional(),
-      lines: z
-        .array(
-          z.object({
-            name: z.string().min(1).max(500),
-            category: z.string().min(1).max(120),
-            sku: z.string().max(120),
-            unit: z.string().min(1).max(60),
-          }),
-        )
-        .max(2000),
-    }),
-    response: z.object({
-      ok: z.boolean(),
-      error: z.string().nullable(),
-      removed: z.number(),
-      added: z.number(),
-      totalItems: z.number(),
-      categories: z.number(),
-    }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{
-      ok: boolean;
-      error: string | null;
-      removed: number;
-      added: number;
-      totalItems: number;
-      categories: number;
-    }> => {
-      const db = ctx.db<typeof schema>();
-      const all = await db
-        .select()
-        .from(schema.bitBusiness)
-        .orderBy(asc(schema.bitBusiness.id));
-      const tfs = all.find((b) =>
-        b.name.trim().toLowerCase().startsWith("tfs station 226"),
-      );
-      if (!tfs || tfs.usesRequisition !== 1) {
-        return {
-          ok: false,
-          error:
-            "No TFS station 226 requisition business was found — nothing was changed.",
-          removed: 0,
-          added: 0,
-          totalItems: 0,
-          categories: 0,
-        };
-      }
-      const existing = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      // Duplicate-name guard, checked before anything is written:
-      // names must stay unique case-insensitively per business.
-      // With clearFirst the current items are all going away, so
-      // only duplicates inside the payload itself can clash;
-      // otherwise the payload must also clear the names already
-      // present.
-      const seen = new Set<string>(
-        args.clearFirst
-          ? []
-          : existing.map((r) => r.name.trim().toLowerCase()),
-      );
-      for (const line of args.lines) {
-        const key = line.name.trim().toLowerCase();
-        if (seen.has(key)) {
-          return {
-            ok: false,
-            error: `Duplicate item name in this load: "${line.name}". Nothing from this call was inserted.`,
-            removed: 0,
-            added: 0,
-            totalItems: existing.length,
-            categories: bitBusinessCategories(tfs).length,
-          };
-        }
-        seen.add(key);
-      }
-      const statements: BatchItem<"sqlite">[] = [];
-      let removed = 0;
-      if (args.clearFirst) {
-        removed = existing.length;
-        const removedIds = new Set(existing.map((r) => r.id));
-        for (const r of existing) {
-          statements.push(
-            db.delete(schema.bitItems).where(eq(schema.bitItems.id, r.id)),
-          );
-        }
-        // Draft extras reference items being replaced; they go too.
-        statements.push(
-          db
-            .delete(schema.bitRequisitionDraftExtras)
-            .where(
-              eq(schema.bitRequisitionDraftExtras.businessId, tfs.id),
-            ),
-        );
-        if (removedIds.size > 0) {
-          // POS mappings pointing at a removed item go with it (the
-          // POS transaction log itself is history and stays).
-          const mappings = await db
-            .select()
-            .from(schema.bitPosMappings)
-            .where(eq(schema.bitPosMappings.businessId, tfs.id));
-          for (const m of mappings) {
-            if (removedIds.has(m.itemId)) {
-              statements.push(
-                db
-                  .delete(schema.bitPosMappings)
-                  .where(eq(schema.bitPosMappings.id, m.id)),
-              );
-            }
-          }
-          // Requisition history keeps its line names; only the link
-          // back to a now-removed inventory item is cleared.
-          const lines = await db
-            .select()
-            .from(schema.bitRequisitionLines)
-            .where(eq(schema.bitRequisitionLines.businessId, tfs.id));
-          for (const l of lines) {
-            if (l.itemId != null && removedIds.has(l.itemId)) {
-              statements.push(
-                db
-                  .update(schema.bitRequisitionLines)
-                  .set({ itemId: null })
-                  .where(eq(schema.bitRequisitionLines.id, l.id)),
-              );
-            }
-          }
-        }
-        // The business's category list becomes exactly the provided
-        // list, in the given order (both stored lists are kept in
-        // step). Every other profile field is left untouched.
-        if (args.categories) {
-          statements.push(
-            db
-              .update(schema.bitBusiness)
-              .set({
-                categoriesJson: JSON.stringify(args.categories),
-                zonesJson: JSON.stringify(args.categories),
-                updatedAt: new Date(),
-              })
-              .where(eq(schema.bitBusiness.id, tfs.id)),
-          );
-        }
-      }
-      const baseOrder = args.clearFirst
-        ? -1
-        : existing.reduce((m, r) => Math.max(m, r.sortOrder), -1);
-      args.lines.forEach((line, i) => {
-        statements.push(
-          db.insert(schema.bitItems).values({
-            businessId: tfs.id,
-            name: line.name,
-            category: line.category,
-            zone: line.category,
-            onHand: 0,
-            unit: line.unit,
-            par: 0,
-            packSize: 1,
-            supplier: null,
-            sku: line.sku.trim() ? line.sku : null,
-            tagsJson: "[]",
-            sortOrder: baseOrder + 1 + i,
-          }),
-        );
-      });
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      const finalItems = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, tfs.id));
-      const finalBiz = await db
-        .select()
-        .from(schema.bitBusiness)
-        .where(eq(schema.bitBusiness.id, tfs.id));
-      ctx.invalidateQueries();
-      return {
-        ok: true,
-        error: null,
-        removed,
-        added: args.lines.length,
-        totalItems: finalItems.length,
-        categories: finalBiz[0]
-          ? bitBusinessCategories(finalBiz[0]).length
-          : 0,
-      };
-    },
-  }),
-
   updateBitRequisitionProfile: defineAction({
     description:
-      "Stores the requisition form's editable header fields on a requisition business (TFS): the Division, the Duty Officer's name (the preparer), and the Approver's name (the District Chief, audit #15). All start blank and stay exactly what the user sets; blank clears the field. When a name changes, its recorded-at stamp moves to now (and clears with the name). The approver must differ from the Duty Officer: recording the same name as both is rejected and nothing is saved.",
+      "Stores the requisition form's editable header fields on a requisition business: the Division, the preparer's name, and the approver's name (audit #15). All start blank and stay exactly what the user sets; blank clears the field. When a name changes, its recorded-at stamp moves to now (and clears with the name). The approver must differ from the preparer: recording the same name as both is rejected and nothing is saved.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       division: z.string().max(120).nullable(),
-      dutyOfficerName: z.string().max(120).nullable(),
+      preparerName: z.string().max(120).nullable(),
       approverName: z.string().max(120).nullable(),
     }),
     response: z.object({
@@ -10831,23 +12042,23 @@ export const Actions = {
       const biz = await resolveBitBusiness(ctx, args.businessId);
       if (!biz) throw new Error("updateBitRequisitionProfile: no business");
       const division = args.division?.trim() ? args.division.trim() : null;
-      const dutyOfficerName = args.dutyOfficerName?.trim()
-        ? args.dutyOfficerName.trim()
+      const preparerName = args.preparerName?.trim()
+        ? args.preparerName.trim()
         : null;
       const approverName = args.approverName?.trim()
         ? args.approverName.trim()
         : null;
-      // Approver separation: the District Chief who approves can
-      // never be the Duty Officer who prepared it.
+      // Approver separation: the approver can never be the
+      // preparer who prepared it.
       if (
         approverName &&
-        dutyOfficerName &&
-        approverName.toLowerCase() === dutyOfficerName.toLowerCase()
+        preparerName &&
+        approverName.toLowerCase() === preparerName.toLowerCase()
       ) {
         return {
           ok: false,
           error:
-            "The approver must be different from the D.O. who prepared the requisition — the same name can't be recorded as both.",
+            "The approver must be different from the preparer — the same name can't be recorded as both.",
         };
       }
       const now = new Date();
@@ -10855,12 +12066,12 @@ export const Actions = {
         .update(schema.bitBusiness)
         .set({
           division,
-          dutyOfficerName,
+          preparerName,
           approverName,
-          dutyOfficerRecordedAt:
-            dutyOfficerName === biz.dutyOfficerName
-              ? biz.dutyOfficerRecordedAt
-              : dutyOfficerName
+          preparerRecordedAt:
+            preparerName === biz.preparerName
+              ? biz.preparerRecordedAt
+              : preparerName
                 ? now
                 : null,
           approverRecordedAt:
@@ -10877,9 +12088,267 @@ export const Actions = {
     },
   }),
 
+  getBitRequisitionFormPdf: defineAction({
+    description:
+      "Builds the filled requisition form (a generic PDF drawn for this requisition) for the requisition currently being prepared: the header boxes (Division, Business, today's date, preparer name, approver name) and the given lines (Item/Description, Qty, Unit, Material #) are filled in, 20 lines per page, repeating the page for longer requisitions with each page numbered (\"Page X of Y\"). The two signature boxes are signed with the initials typed in the Requisition tab: the client renders them in a generic cursive and passes a transparent PNG of each (null when that box's initials are blank, leaving the signature box blank). Returns the PDF as base64 for the client to download. Nothing is recorded — sending still goes through sendBitRequisition.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+      // The header exactly as it stands in the tab's header boxes
+      // (it may hold edits not yet saved to the business profile).
+      division: z.string().max(120).nullable(),
+      preparerName: z.string().max(200).nullable(),
+      approverName: z.string().max(200).nullable(),
+      // Cursive renderings of the typed initials (transparent
+      // PNG, base64) for the two signature boxes.
+      preparerSignaturePng: z.string().max(500_000).nullable(),
+      approverSignaturePng: z.string().max(500_000).nullable(),
+      lines: z
+        .array(
+          z.object({
+            name: z.string().min(1).max(200),
+            materialNo: z.string().max(80).nullable(),
+            qty: z.number().int().min(1).max(100000),
+            unit: z.string().min(1).max(60),
+          }),
+        )
+        .min(1)
+        .max(1000),
+    }),
+    response: bitRequisitionFormPdfResponse,
+    handler: async (
+      ctx,
+      args,
+    ): Promise<z.infer<typeof bitRequisitionFormPdfResponse>> => {
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz || biz.usesRequisition !== 1) {
+        return {
+          ok: false,
+          filename: null,
+          pdfBase64: null,
+          pageCount: 0,
+          error: "This business does not use requisitions.",
+        };
+      }
+      const now = new Date();
+      const reqNo = bitReqNo(biz, now);
+      const dateLong = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Toronto",
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }).format(now);
+      try {
+        const { base64, pageCount } = await buildReqFormPdf({
+          division: args.division?.trim() ?? "",
+          businessName: biz.name,
+          date: dateLong,
+          preparerName: args.preparerName?.trim() ?? "",
+          approverName: args.approverName?.trim() ?? "",
+          preparerSignaturePng: args.preparerSignaturePng,
+          approverSignaturePng: args.approverSignaturePng,
+          lines: args.lines.map((l) => ({
+            name: l.name.trim(),
+            materialNo: l.materialNo?.trim() ? l.materialNo.trim() : null,
+            qty: l.qty,
+            unit: l.unit.trim() || "units",
+          })),
+        });
+        return {
+          ok: true,
+          filename: `Requisition ${reqNo}.pdf`,
+          pdfBase64: base64,
+          pageCount,
+          error: null,
+        };
+      } catch {
+        return {
+          ok: false,
+          filename: null,
+          pdfBase64: null,
+          pageCount: 0,
+          error: "The filled form couldn't be built. Try again.",
+        };
+      }
+    },
+  }),
+
+  scanBitRequisitionForm: defineAction({
+    description:
+      "Scans a pre-populated requisition form the user uploads in the BIT Requisition tab — either the filled-in requisition-form PDF itself (its fillable form fields are read directly) or a photo of the paper form (read by the model) — and cross-references every line on the form against the business's inventory list: a line is matched to an inventory item by Material # first, then by exact item name, then by word-based name matching, and only when the match is unambiguous. Returns the form's header details (Division, preparer name, approver name) and, per line, what the form says plus the matched inventory item (or null when nothing on the list matches). Nothing is recorded and nothing is added to any requisition by this call — the tab reviews the matches and the user picks which ones go onto the draft. A PDF with no readable form fields (a flattened scan) and an unreadable photo are refused with an error saying so.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+      file: z.object({
+        // Base64 of the uploaded file (from fileToBase64 on the
+        // client). Capped so a single request stays sane.
+        dataBase64: z.string().min(1).max(20_000_000),
+        mimeType: z.string().min(1).max(100),
+      }),
+    }),
+    response: bitRequisitionFormScanResponse,
+    handler: async (
+      ctx,
+      args,
+    ): Promise<z.infer<typeof bitRequisitionFormScanResponse>> => {
+      const fail = (error: string): z.infer<typeof bitRequisitionFormScanResponse> => ({
+        ok: false,
+        error,
+        source: null,
+        header: null,
+        lines: [],
+      });
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz || biz.usesRequisition !== 1) {
+        return fail("This business does not use requisitions.");
+      }
+      const mime = args.file.mimeType.trim().toLowerCase();
+      let bytes: Uint8Array;
+      try {
+        bytes = base64ToBytes(args.file.dataBase64);
+      } catch {
+        return fail("That file couldn't be read. Try again.");
+      }
+      if (bytes.length === 0) return fail("That file was empty.");
+
+      let scanned: ScannedReqForm | null = null;
+      let source: "pdf" | "photo";
+      if (mime === "application/pdf") {
+        source = "pdf";
+        scanned = await extractReqFormPdfLines(bytes);
+        if (!scanned) {
+          return fail(
+            "No filled-in lines could be read from that PDF — if it's a scan or a printed copy of the form, take a photo of it instead; if it's the fillable REQ form, make sure the copy you upload still has its filled fields (a copy saved from this app's Download PDF is flattened and can't be read back).",
+          );
+        }
+      } else if (mime === "image/jpeg" || mime === "image/png") {
+        source = "photo";
+        try {
+          const read = await ctx.inference.complete(
+            "Read the requisition form in this photo. Extract the header details — the Division, the preparer name, and the approver name — and every filled-in line row: the Item/Description text exactly as written, the Qty, the Unit, and the Material #. Skip completely blank rows. Copy the text as written; do not invent or complete anything that is not legible — use null for any value you cannot read.",
+            {
+              images: [
+                {
+                  dataBase64: args.file.dataBase64,
+                  mimeType: mime,
+                  caption: "A filled-in requisition form",
+                },
+              ],
+              schema: reqFormPhotoExtraction,
+              timeout_secs: 120,
+            },
+          );
+          const lines: ScannedReqFormLine[] = read.lines
+            .filter((l) => l.name.trim().length > 0)
+            .map((l) => ({
+              name: l.name.trim(),
+              qty:
+                l.qty != null && Number.isFinite(l.qty) && l.qty > 0
+                  ? Math.floor(l.qty)
+                  : null,
+              unit: l.unit?.trim() ? l.unit.trim() : null,
+              materialNo: l.materialNo?.trim() ? l.materialNo.trim() : null,
+            }));
+          if (lines.length > 0) {
+            scanned = {
+              division: read.division?.trim() ? read.division.trim() : null,
+              preparerName: read.preparerName?.trim()
+                ? read.preparerName.trim()
+                : null,
+              approverName: read.approverName?.trim()
+                ? read.approverName.trim()
+                : null,
+              lines,
+            };
+          }
+        } catch {
+          return fail(
+            "That photo couldn't be read. Try a clearer, straight-on photo of the form.",
+          );
+        }
+        if (!scanned) {
+          return fail(
+            "No items could be read off that photo. Try a clearer, straight-on photo of the form.",
+          );
+        }
+      } else {
+        return fail(
+          "That file type isn't supported — upload the filled-in requisition form (PDF), or a JPEG / PNG photo of the form.",
+        );
+      }
+
+      // Cross-reference every scanned line against the station's
+      // inventory list. Lines that land on the same item are
+      // merged into one (quantities added), so an item never
+      // appears twice in the review.
+      const db = ctx.db<typeof schema>();
+      const items = await db
+        .select()
+        .from(schema.bitItems)
+        .where(eq(schema.bitItems.businessId, biz.id));
+      const out: z.infer<typeof bitRequisitionFormScanResponse>["lines"] =
+        [];
+      const byItemId = new Map<
+        number,
+        z.infer<typeof bitRequisitionFormScanResponse>["lines"][number]
+      >();
+      for (const line of scanned.lines) {
+        const match = matchScannedReqLine(line, items);
+        if (match) {
+          const existing = byItemId.get(match.item.id);
+          if (existing) {
+            existing.qty =
+              existing.qty != null || line.qty != null
+                ? (existing.qty ?? 0) + (line.qty ?? 0)
+                : null;
+            continue;
+          }
+          const row = {
+            scannedName: line.name,
+            qty: line.qty,
+            unit: line.unit,
+            materialNo: line.materialNo,
+            matchedItemId: match.item.id,
+            matchedName: match.item.name,
+            matchedMaterialNo: match.item.sku,
+            matchedCategory: match.item.category,
+            matchedUnit: match.item.unit,
+            matchedOnHand: match.item.onHand,
+            matchKind: match.kind,
+          };
+          byItemId.set(match.item.id, row);
+          out.push(row);
+        } else {
+          out.push({
+            scannedName: line.name,
+            qty: line.qty,
+            unit: line.unit,
+            materialNo: line.materialNo,
+            matchedItemId: null,
+            matchedName: null,
+            matchedMaterialNo: null,
+            matchedCategory: null,
+            matchedUnit: null,
+            matchedOnHand: null,
+            matchKind: null,
+          });
+        }
+      }
+      return {
+        ok: true,
+        error: null,
+        source,
+        header: {
+          division: scanned.division,
+          preparerName: scanned.preparerName,
+          approverName: scanned.approverName,
+        },
+        lines: out,
+      };
+    },
+  }),
+
   sendBitRequisition: defineAction({
     description:
-      "Marks a requisition as sent to the Quartermaster Section: records it (auto-generated Req. No. in the form's Fire Station-YY-MM-DD format, today's date, the exact lines sent) as the business's current outstanding requisition, awaiting the delivery check-off. Any not-received lines from earlier closed requisitions that this requisition resubmits are marked superseded, and catalogue draft extras folded into the lines are cleared. Refused while another requisition is still outstanding. Approver separation (audit #15): refused until an approver (District Chief) is recorded on the business, and refused if the approver is the same name as the Duty Officer who prepared it; the preparer / approver names and their recorded dates are snapshotted onto the requisition at send time.",
+      "Marks a requisition as sent to the supplier: records it (auto-generated Req. No. in the form's <code>-YY-MM-DD format, today's date, the exact lines sent) as the business's current outstanding requisition, awaiting the delivery check-off. Any not-received lines from earlier closed requisitions that this requisition resubmits are marked superseded, and catalogue draft extras folded into the lines are cleared. Refused while another requisition is still outstanding. Approver separation (audit #15): refused until an approver is recorded on the business, and refused if the approver is the same name as the preparer; the preparer / approver names and their recorded dates are snapshotted onto the requisition at send time.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       lines: z
@@ -10931,19 +12400,19 @@ export const Actions = {
           ok: false,
           reqNo: null,
           error:
-            "An approver is required before sending — record the District Chief's name as the approver first.",
+            "An approver is required before sending — record the approver's name first.",
         };
       }
       if (
-        biz.dutyOfficerName?.trim() &&
+        biz.preparerName?.trim() &&
         biz.approverName.trim().toLowerCase() ===
-          biz.dutyOfficerName.trim().toLowerCase()
+          biz.preparerName.trim().toLowerCase()
       ) {
         return {
           ok: false,
           reqNo: null,
           error:
-            "The approver must be different from the D.O. who prepared the requisition.",
+            "The approver must be different from the preparer.",
         };
       }
       const existing = await db
@@ -10973,8 +12442,8 @@ export const Actions = {
           status: "outstanding",
           // Prepared by → Approved by → Sent, snapshotted from
           // the header fields so the state stays on file.
-          preparedBy: biz.dutyOfficerName,
-          preparedAt: biz.dutyOfficerRecordedAt,
+          preparedBy: biz.preparerName,
+          preparedAt: biz.preparerRecordedAt,
           approvedBy: biz.approverName,
           approvedAt: biz.approverRecordedAt,
           sentAt: now,
@@ -11033,9 +12502,347 @@ export const Actions = {
     },
   }),
 
+  approveBitRequisitionForm: defineAction({
+    description:
+      "Approves the filled requisition form from the review pop-up that opens the moment an inventory check finishes (the user's submission flow): the header fields as reviewed in the pop-up (Division, preparer name, approver name) are recorded on the business exactly the way updateBitRequisitionProfile records them (a changed name moves its recorded-at stamp to now), the requisition is recorded as sent under the same guards as sendBitRequisition (an approver is required, the approver cannot be the preparer, and no other requisition may be outstanding; resubmitted source lines are superseded and catalogue draft extras cleared), and the filled requisition-form PDF — built from the reviewed header, lines and typed-initial signatures — is saved on the requisition row (base64, page count, saved-at stamp) so the Requisition tab's Download PDF button serves exactly the approved copy. The form is built before anything is recorded: if a guard fails or the form cannot be built, nothing is recorded and nothing is saved.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+      // The header exactly as reviewed in the pop-up.
+      division: z.string().max(120).nullable(),
+      preparerName: z.string().max(200).nullable(),
+      approverName: z.string().max(200).nullable(),
+      // Cursive renderings of the typed initials (transparent
+      // PNG, base64) for the two signature boxes.
+      preparerSignaturePng: z.string().max(500_000).nullable(),
+      approverSignaturePng: z.string().max(500_000).nullable(),
+      lines: z
+        .array(
+          z.object({
+            itemId: z.number().int().positive().nullable(),
+            name: z.string().min(1).max(200),
+            materialNo: z.string().max(80).nullable(),
+            qty: z.number().int().min(1).max(100000),
+            unit: z.string().min(1).max(60),
+            category: z.string().min(1).max(120),
+            resubmittedFromLineId: z
+              .number()
+              .int()
+              .positive()
+              .nullable(),
+          }),
+        )
+        .min(1)
+        .max(200),
+    }),
+    response: z.object({
+      ok: z.boolean(),
+      reqNo: z.string().nullable(),
+      pageCount: z.number().int(),
+      error: z.string().nullable(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      ok: boolean;
+      reqNo: string | null;
+      pageCount: number;
+      error: string | null;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz || biz.usesRequisition !== 1) {
+        return {
+          ok: false,
+          reqNo: null,
+          pageCount: 0,
+          error: "This business does not use requisitions.",
+        };
+      }
+      const division = args.division?.trim() ? args.division.trim() : null;
+      const preparerName = args.preparerName?.trim()
+        ? args.preparerName.trim()
+        : null;
+      const approverName = args.approverName?.trim()
+        ? args.approverName.trim()
+        : null;
+      // Approver separation (audit #15), same as everywhere: the
+      // approver is required and can never be the preparer.
+      if (
+        approverName &&
+        preparerName &&
+        approverName.toLowerCase() === preparerName.toLowerCase()
+      ) {
+        return {
+          ok: false,
+          reqNo: null,
+          pageCount: 0,
+          error:
+            "The approver must be different from the preparer — the same name can't be recorded as both.",
+        };
+      }
+      if (!approverName) {
+        return {
+          ok: false,
+          reqNo: null,
+          pageCount: 0,
+          error:
+            "An approver is required before the form can be approved — record the approver's name first.",
+        };
+      }
+      const existing = await db
+        .select()
+        .from(schema.bitRequisitions)
+        .where(
+          and(
+            eq(schema.bitRequisitions.businessId, biz.id),
+            eq(schema.bitRequisitions.status, "outstanding"),
+          ),
+        );
+      if (existing.length > 0) {
+        return {
+          ok: false,
+          reqNo: null,
+          pageCount: 0,
+          error:
+            "A requisition is already outstanding — check off its delivery before approving another.",
+        };
+      }
+      const now = new Date();
+      const reqNo = bitReqNo(biz, now);
+      const dateLong = new Intl.DateTimeFormat("en-CA", {
+        timeZone: "America/Toronto",
+        year: "numeric",
+        month: "long",
+        day: "numeric",
+      }).format(now);
+      // Build the exact form the reviewer saw BEFORE recording
+      // anything: a form that can't be built approves nothing.
+      let built: { base64: string; pageCount: number };
+      try {
+        built = await buildReqFormPdf({
+          division: division ?? "",
+          businessName: biz.name,
+          date: dateLong,
+          preparerName: preparerName ?? "",
+          approverName: approverName ?? "",
+          preparerSignaturePng: args.preparerSignaturePng,
+          approverSignaturePng: args.approverSignaturePng,
+          lines: args.lines.map((l) => ({
+            name: l.name.trim(),
+            materialNo: l.materialNo?.trim() ? l.materialNo.trim() : null,
+            qty: l.qty,
+            unit: l.unit.trim() || "units",
+          })),
+        });
+      } catch {
+        return {
+          ok: false,
+          reqNo: null,
+          pageCount: 0,
+          error: "The filled form couldn't be built. Try again.",
+        };
+      }
+      // Record the reviewed header on the business profile, with
+      // the same recorded-at stamp movement as
+      // updateBitRequisitionProfile; the requisition snapshots
+      // the same stamps as its Prepared / Approved record.
+      const preparedAt =
+        preparerName === biz.preparerName
+          ? biz.preparerRecordedAt
+          : preparerName
+            ? now
+            : null;
+      const approvedAt =
+        approverName === biz.approverName
+          ? biz.approverRecordedAt
+          : now;
+      await db
+        .update(schema.bitBusiness)
+        .set({
+          division,
+          preparerName,
+          approverName,
+          preparerRecordedAt: preparedAt,
+          approverRecordedAt: approvedAt,
+          updatedAt: now,
+        })
+        .where(eq(schema.bitBusiness.id, biz.id));
+      const inserted = await db
+        .insert(schema.bitRequisitions)
+        .values({
+          businessId: biz.id,
+          reqNo,
+          status: "outstanding",
+          preparedBy: preparerName,
+          preparedAt,
+          approvedBy: approverName,
+          approvedAt,
+          sentAt: now,
+          // The approved form itself, saved on the requisition.
+          formPdfBase64: built.base64,
+          formPageCount: built.pageCount,
+          formSavedAt: now,
+        })
+        .returning({ id: schema.bitRequisitions.id });
+      const req = inserted[0];
+      if (!req)
+        throw new Error("approveBitRequisitionForm: insert returned no rows");
+      const statements: BatchItem<"sqlite">[] = args.lines.map((l) =>
+        db.insert(schema.bitRequisitionLines).values({
+          requisitionId: req.id,
+          businessId: biz.id,
+          itemId: l.itemId,
+          name: l.name.trim(),
+          materialNo: l.materialNo?.trim() ? l.materialNo.trim() : null,
+          qtyOrdered: l.qty,
+          unit: l.unit.trim() || "units",
+          category: l.category.trim() || "Other",
+          status: "pending",
+        }),
+      );
+      const [first, ...rest] = statements;
+      if (first) await db.batch([first, ...rest]);
+      // Mark the resubmitted source lines superseded by the new
+      // lines that carry them (matched in request order).
+      const newLines = await db
+        .select()
+        .from(schema.bitRequisitionLines)
+        .where(eq(schema.bitRequisitionLines.requisitionId, req.id))
+        .orderBy(asc(schema.bitRequisitionLines.id));
+      const supersede: BatchItem<"sqlite">[] = [];
+      args.lines.forEach((l, i) => {
+        const created = newLines[i];
+        if (l.resubmittedFromLineId != null && created) {
+          supersede.push(
+            db
+              .update(schema.bitRequisitionLines)
+              .set({ supersededBy: created.id })
+              .where(
+                eq(
+                  schema.bitRequisitionLines.id,
+                  l.resubmittedFromLineId,
+                ),
+              ),
+          );
+        }
+      });
+      const [sFirst, ...sRest] = supersede;
+      if (sFirst) await db.batch([sFirst, ...sRest]);
+      // The catalogue extras folded into this requisition are
+      // spent — clear the draft.
+      await db
+        .delete(schema.bitRequisitionDraftExtras)
+        .where(eq(schema.bitRequisitionDraftExtras.businessId, biz.id));
+      ctx.invalidateQueries();
+      return { ok: true, reqNo, pageCount: built.pageCount, error: null };
+    },
+  }),
+
+  getBitSavedRequisitionFormInfo: defineAction({
+    description:
+      "Reports the latest approved-and-saved requisition form for a BIT requisition business (saved on its requisition by approveBitRequisitionForm from the post-check review pop-up): the requisition number it belongs to, when it was saved, and its page count — or exists=false when no form has been saved yet. The Requisition tab's Download PDF button reads this to know whether it serves the saved approved form or builds one from the current draft.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+    }),
+    response: z.object({
+      exists: z.boolean(),
+      reqNo: z.string().nullable(),
+      savedAt: z.string().nullable(),
+      pageCount: z.number().int(),
+    }),
+    handler: async (
+      ctx,
+      args,
+    ): Promise<{
+      exists: boolean;
+      reqNo: string | null;
+      savedAt: string | null;
+      pageCount: number;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz) {
+        return { exists: false, reqNo: null, savedAt: null, pageCount: 0 };
+      }
+      const rows = await db
+        .select()
+        .from(schema.bitRequisitions)
+        .where(
+          and(
+            eq(schema.bitRequisitions.businessId, biz.id),
+            isNotNull(schema.bitRequisitions.formPdfBase64),
+          ),
+        )
+        .orderBy(desc(schema.bitRequisitions.id));
+      const row = rows[0];
+      if (!row || !row.formPdfBase64) {
+        return { exists: false, reqNo: null, savedAt: null, pageCount: 0 };
+      }
+      return {
+        exists: true,
+        reqNo: row.reqNo,
+        savedAt: row.formSavedAt?.toISOString() ?? null,
+        pageCount: row.formPageCount ?? 1,
+      };
+    },
+  }),
+
+  downloadBitSavedRequisitionForm: defineAction({
+    description:
+      "Returns the latest approved-and-saved requisition form PDF (base64) for a BIT requisition business — the exact copy the reviewer approved in the post-check review pop-up, saved on its requisition by approveBitRequisitionForm. The Requisition tab's Download PDF button downloads this copy when one exists; ok=false when no form has been saved yet.",
+    request: z.object({
+      businessId: bitBusinessIdRequest,
+    }),
+    response: bitRequisitionFormPdfResponse,
+    handler: async (
+      ctx,
+      args,
+    ): Promise<z.infer<typeof bitRequisitionFormPdfResponse>> => {
+      const db = ctx.db<typeof schema>();
+      const biz = await resolveBitBusiness(ctx, args.businessId);
+      if (!biz) {
+        return {
+          ok: false,
+          filename: null,
+          pdfBase64: null,
+          pageCount: 0,
+          error: "That business is gone.",
+        };
+      }
+      const rows = await db
+        .select()
+        .from(schema.bitRequisitions)
+        .where(
+          and(
+            eq(schema.bitRequisitions.businessId, biz.id),
+            isNotNull(schema.bitRequisitions.formPdfBase64),
+          ),
+        )
+        .orderBy(desc(schema.bitRequisitions.id));
+      const row = rows[0];
+      if (!row || !row.formPdfBase64) {
+        return {
+          ok: false,
+          filename: null,
+          pdfBase64: null,
+          pageCount: 0,
+          error: "No approved form has been saved yet.",
+        };
+      }
+      return {
+        ok: true,
+        filename: `Requisition ${row.reqNo}.pdf`,
+        pdfBase64: row.formPdfBase64,
+        pageCount: row.formPageCount ?? 1,
+        error: null,
+      };
+    },
+  }),
+
   checkOffBitRequisitionLine: defineAction({
     description:
-      "The SOG delivery check-off on one line of the outstanding requisition: 'received' applies the received quantity (default the ordered quantity) to the tracked item's stock; 'not_received' remarks the line — it is never back-ordered and will resurface badged 'Resubmitted' on the next requisition build. When every line is checked off, the requisition closes and stays on file in the requisition history.",
+      "The delivery check-off on one line of the outstanding requisition: 'received' applies the received quantity (default the ordered quantity) to the tracked item's stock; 'not_received' remarks the line — it is never back-ordered and will resurface badged 'Resubmitted' on the next requisition build. When every line is checked off, the requisition closes and stays on file in the requisition history.",
     request: z.object({
       lineId: z.number().int().positive(),
       outcome: z.enum(["received", "not_received"]),
@@ -11096,6 +12903,7 @@ export const Actions = {
           status: args.outcome,
           qtyReceived: receivedQty,
           checkedOffBy: role,
+          checkedOffAt: new Date(),
         })
         .where(eq(schema.bitRequisitionLines.id, line.id));
       // Received supplies go onto the station stock.
@@ -11159,136 +12967,8 @@ export const Actions = {
       reopened: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; reopened: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const lineRows = await db
-        .select()
-        .from(schema.bitRequisitionLines)
-        .where(eq(schema.bitRequisitionLines.id, args.lineId));
-      const line = lineRows[0];
-      if (!line) {
-        return { ok: false, reopened: false, error: "That line is gone." };
-      }
-      if (line.status === "pending") {
-        return {
-          ok: false,
-          reopened: false,
-          error: "That line hasn't been checked off.",
-        };
-      }
-      if (line.supersededBy != null) {
-        return {
-          ok: false,
-          reopened: false,
-          error:
-            "That line was already resubmitted on a newer requisition, so its check-off can't be undone.",
-        };
-      }
-      const lineGate = undoGate(
-        await loadAccountSettings(ctx),
-        "requisitionCheckOffs",
-        line.checkedOffBy,
-      );
-      if (lineGate) {
-        return { ok: false, reopened: false, error: lineGate };
-      }
-      const reqRows = await db
-        .select()
-        .from(schema.bitRequisitions)
-        .where(eq(schema.bitRequisitions.id, line.requisitionId));
-      const req = reqRows[0];
-      if (!req) {
-        return {
-          ok: false,
-          reopened: false,
-          error: "That requisition is gone.",
-        };
-      }
-      let reopened = false;
-      if (req.status === "closed") {
-        const others = await db
-          .select()
-          .from(schema.bitRequisitions)
-          .where(
-            and(
-              eq(schema.bitRequisitions.businessId, req.businessId),
-              eq(schema.bitRequisitions.status, "outstanding"),
-            ),
-          );
-        if (others.length > 0) {
-          return {
-            ok: false,
-            reopened: false,
-            error:
-              "Another requisition is outstanding, so this one can't reopen for the undo.",
-          };
-        }
-        reopened = true;
-      }
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.bitRequisitionLines)
-          .set({ status: "pending", qtyReceived: null, checkedOffBy: null })
-          .where(eq(schema.bitRequisitionLines.id, line.id)),
-      ];
-      if (reopened) {
-        statements.push(
-          db
-            .update(schema.bitRequisitions)
-            .set({ status: "outstanding", closedAt: null })
-            .where(eq(schema.bitRequisitions.id, req.id)),
-        );
-      }
-      // Take back the stock a "received" mark applied, and retire
-      // the stock event it logged.
-      if (
-        line.status === "received" &&
-        line.itemId != null &&
-        (line.qtyReceived ?? 0) !== 0
-      ) {
-        const qty = line.qtyReceived ?? 0;
-        const itemRows = await db
-          .select()
-          .from(schema.bitItems)
-          .where(eq(schema.bitItems.id, line.itemId));
-        const item = itemRows[0];
-        if (item) {
-          statements.push(
-            db
-              .update(schema.bitItems)
-              .set({ onHand: Math.max(0, item.onHand - qty) })
-              .where(eq(schema.bitItems.id, item.id)),
-          );
-          const eventRows = await db
-            .select()
-            .from(schema.bitStockEvents)
-            .where(
-              and(
-                eq(schema.bitStockEvents.itemId, item.id),
-                eq(schema.bitStockEvents.source, "requisition_received"),
-                eq(schema.bitStockEvents.undone, 0),
-              ),
-            )
-            .orderBy(desc(schema.bitStockEvents.id));
-          const event = eventRows.find((e) => e.delta === qty);
-          if (event) {
-            statements.push(
-              db
-                .update(schema.bitStockEvents)
-                .set({ undone: 1 })
-                .where(eq(schema.bitStockEvents.id, event.id)),
-            );
-          }
-        }
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, reopened, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoBitRequisitionCheckOff(ctx, args.lineId),
   }),
 
   removeBitRequisitionDraftExtra: defineAction({
@@ -11308,7 +12988,10 @@ export const Actions = {
 
   completeBitSetup: defineAction({
     description:
-      "Finishes the BIT Business setup wizard by creating a BRAND-NEW business: stores the new business's profile (type, custom type for 'Other', name, the chosen categories — the only organizing concept — freezers, category colours) and seeds its inventory with the supplied starter-pack items already merged with any manifest lines confirmed in the wizard. Only the categories the user actually picked are stored, and only items in those categories are seeded — a completed setup stores exactly the picked set, nothing more. Setup is add-only (Alpha 0.88): it ALWAYS inserts a new business and returns its id; it never updates, replaces, or deletes an existing business's profile or inventory, and it never touches any household (HIT) data.",
+      "Finishes the BIT Business setup wizard by creating a BRAND-NEW business: stores the new business's profile (type, custom type for 'Other', name, the chosen categories — the only organizing concept — freezers, category colours) and seeds its inventory with the supplied starter-pack items already merged with any manifest lines confirmed in the wizard. Only the categories the user actually picked are stored, and only items in those categories are seeded — a completed setup stores exactly the picked set, nothing more. Setup is add-only (Alpha 0.88): it ALWAYS inserts a new business and returns its id; it never updates, replaces, or deletes an existing business's profile or inventory, and it never touches any household (HIT) data. Pass
+      usesRequisition true when the business orders by requisition —
+      the wizard's Review step asks — and the business gets the
+      Requisition tab instead of the Order Email tab.",
     request: z.object({
       businessType: z.string().min(1).max(80),
       customType: z.string().max(120).nullable(),
@@ -11317,6 +13000,10 @@ export const Actions = {
       // one of the eight bands or a custom Other entry; null when
       // the step was skipped.
       teamSize: z.string().max(60).nullable().default(null),
+      // Whether this business orders by requisition (the wizard's
+      // Review step asks): true gives it the Requisition tab with
+      // the preparer / approver flow instead of the Order Email tab.
+      usesRequisition: z.boolean().default(false),
       categories: z.array(z.string().min(1).max(120)).max(24),
       freezers: z.array(z.string().min(1).max(80)).max(12),
       colors: z.record(z.string(), z.string()),
@@ -11389,6 +13076,7 @@ export const Actions = {
           isBitFoodAndBeverageType(args.businessType) ? args.freezers : [],
         ),
         colorsJson: JSON.stringify(args.colors),
+        usesRequisition: args.usesRequisition ? 1 : 0,
         updatedAt: new Date(),
       };
       const insertedBiz = await db
@@ -11553,61 +13241,8 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.bitStockEvents)
-        .where(eq(schema.bitStockEvents.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return { ok: false, error: "That count change no longer exists." };
-      }
-      if (row.source !== "manual_count") {
-        return {
-          ok: false,
-          error:
-            "That change came from a requisition receipt — undo it from the requisition line instead.",
-        };
-      }
-      if (row.undone === 1) {
-        return { ok: false, error: "That count change is already undone." };
-      }
-      const eventGate = undoGate(
-        await loadAccountSettings(ctx),
-        "bitCountChanges",
-        row.actor,
-      );
-      if (eventGate) return { ok: false, error: eventGate };
-      if (row.itemId == null) {
-        return { ok: false, error: "That item is no longer tracked." };
-      }
-      const itemRows = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.id, row.itemId));
-      const item = itemRows[0];
-      if (!item) {
-        return { ok: false, error: "That item is no longer tracked." };
-      }
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.bitStockEvents)
-          .set({ undone: 1 })
-          .where(eq(schema.bitStockEvents.id, row.id)),
-        db
-          .update(schema.bitItems)
-          .set({ onHand: Math.max(0, item.onHand - row.delta) })
-          .where(eq(schema.bitItems.id, item.id)),
-      ];
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoBitStockEvent(ctx, args.id),
   }),
 
   setBitItemPar: defineAction({
@@ -11771,70 +13406,7 @@ export const Actions = {
       error: z.string().nullable(),
       onHand: z.number().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{
-      ok: boolean;
-      error: string | null;
-      onHand: number | null;
-    }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.bitWasteLog)
-        .where(eq(schema.bitWasteLog.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return {
-          ok: false,
-          error: "That waste entry no longer exists.",
-          onHand: null,
-        };
-      }
-      if (row.undone === 1) {
-        return {
-          ok: false,
-          error: "That waste entry is already undone.",
-          onHand: null,
-        };
-      }
-      const wasteGate = undoGate(
-        await loadAccountSettings(ctx),
-        "wasteLog",
-        row.actor,
-      );
-      if (wasteGate) {
-        return { ok: false, error: wasteGate, onHand: null };
-      }
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.bitWasteLog)
-          .set({ undone: 1 })
-          .where(eq(schema.bitWasteLog.id, row.id)),
-      ];
-      let onHand: number | null = null;
-      if (row.itemId != null) {
-        const itemRows = await db
-          .select()
-          .from(schema.bitItems)
-          .where(eq(schema.bitItems.id, row.itemId));
-        const item = itemRows[0];
-        if (item) {
-          onHand = item.onHand + (row.stockDeducted ?? row.quantity);
-          statements.push(
-            db
-              .update(schema.bitItems)
-              .set({ onHand })
-              .where(eq(schema.bitItems.id, item.id)),
-          );
-        }
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null, onHand };
-    },
+    handler: async (ctx, args) => await performUndoBitWaste(ctx, args.id),
   }),
 
   renameBitCategory: defineAction({
@@ -11954,7 +13526,7 @@ export const Actions = {
 
   finishBitRound: defineAction({
     description:
-      "Finishes a BIT inventory check (a round): writes each counted item's count back as its new on-hand (book) count, and records the check — who counted (for the TFS requisition business, the shift letter A–D instead of a name, stored in the same counter field and displayed as 'Shift A'), the category filter, counted-of-total, every variance (counted vs the previous book count), the items left at or below par, and the freezer temperature readings (anything warmer than −18°C flagged as an alert; recorded only for food & beverage businesses). Counts are rounded to tenths for a fractional-counting (Bar / Pub profile) business and to whole numbers for every other business. Returns that same summary for the Inventory Checks tab to display. Since Alpha 0.79 it also writes one bit_item_snapshots row for EVERY counted item (name, category, book count before the check, counted value, par at the time, round id) — the per-item count history behind the Trends view — and returns those counted items so the Finish summary can offer a par editor per item. Alpha 0.82: each counted item also carries its snapshot id so the summary can record a variance reason (setBitVarianceReason) or submit the one blind recount (recountBitItem) for that item's round record. Alpha 0.85: when the request carries itemIds (a weekly cycle-count check started from getBitWeeklyCount's proposal), the check is scoped to exactly that item set — its counted-of total is the set's size and counts for items outside the set are ignored; snapshots are written as usual, which is what advances each item's cycle schedule.",
+      "Finishes a BIT inventory check (a round): writes each counted item's count back as its new on-hand (book) count, and records the check — who counted (for a requisition business, the shift letter instead of a name, stored in the same counter field and displayed as 'Shift A'), the category filter, counted-of-total, every variance (counted vs the previous book count), the items left at or below par, and the freezer temperature readings (anything warmer than −18°C flagged as an alert; recorded only for food & beverage businesses). Counts are rounded to tenths for a fractional-counting (Bar / Pub profile) business and to whole numbers for every other business. Returns that same summary for the Inventory Checks tab to display. Since Alpha 0.79 it also writes one bit_item_snapshots row for EVERY counted item (name, category, book count before the check, counted value, par at the time, round id) — the per-item count history behind the Trends view — and returns those counted items so the Finish summary can offer a par editor per item. Alpha 0.82: each counted item also carries its snapshot id so the summary can record a variance reason (setBitVarianceReason) or submit the one blind recount (recountBitItem) for that item's round record. Alpha 0.85: when the request carries itemIds (a weekly cycle-count check started from getBitWeeklyCount's proposal), the check is scoped to exactly that item set — its counted-of total is the set's size and counts for items outside the set are ignored; snapshots are written as usual, which is what advances each item's cycle schedule.",
     request: z.object({
       businessId: bitBusinessIdRequest,
       counterName: z.string().min(1).max(80),
@@ -12962,81 +14534,8 @@ export const Actions = {
       ok: z.boolean(),
       error: z.string().nullable(),
     }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.bitManifestImports)
-        .where(eq(schema.bitManifestImports.id, args.id));
-      const row = rows[0];
-      if (!row) {
-        return { ok: false, error: "That import no longer exists." };
-      }
-      if (row.undone === 1) {
-        return { ok: false, error: "That import is already undone." };
-      }
-      const importGate = undoGate(
-        await loadAccountSettings(ctx),
-        "manifestImports",
-        row.actor,
-      );
-      if (importGate) return { ok: false, error: importGate };
-      const changes = bitParseManifestImportChanges(row.changesJson);
-      const itemRows = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.businessId, row.businessId));
-      const byId = new Map(itemRows.map((r) => [r.id, r]));
-      const byName = new Map(
-        itemRows.map((r) => [r.name.trim().toLowerCase(), r]),
-      );
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.bitManifestImports)
-          .set({ undone: 1 })
-          .where(eq(schema.bitManifestImports.id, row.id)),
-      ];
-      for (const change of changes) {
-        const item =
-          (change.itemId != null ? byId.get(change.itemId) : undefined) ??
-          byName.get(change.name.trim().toLowerCase());
-        if (!item) continue;
-        if (change.added) {
-          statements.push(
-            db
-              .delete(schema.bitItems)
-              .where(eq(schema.bitItems.id, item.id)),
-          );
-        } else if (change.priorOnHand != null) {
-          statements.push(
-            db
-              .update(schema.bitItems)
-              .set({ onHand: change.priorOnHand })
-              .where(eq(schema.bitItems.id, item.id)),
-          );
-        }
-      }
-      if (row.scanId != null) {
-        statements.push(
-          db
-            .update(schema.bitManifestScans)
-            .set({ status: "proposed", updatedAt: new Date() })
-            .where(
-              and(
-                eq(schema.bitManifestScans.id, row.scanId),
-                eq(schema.bitManifestScans.status, "confirmed"),
-              ),
-            ),
-        );
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoBitManifestImport(ctx, args.id),
   }),
 
   requestBitManifestScan: defineAction({
@@ -13508,50 +15007,8 @@ export const Actions = {
       "Undoes one applied POS transaction: restores the item's count by the transaction quantity and marks the log entry undone. Already-undone or unmatched entries are not changed.",
     request: z.object({ id: z.number().int().positive() }),
     response: z.object({ ok: z.boolean(), error: z.string().nullable() }),
-    handler: async (
-      ctx,
-      args,
-    ): Promise<{ ok: boolean; error: string | null }> => {
-      const db = ctx.db<typeof schema>();
-      const rows = await db
-        .select()
-        .from(schema.bitPosTransactions)
-        .where(eq(schema.bitPosTransactions.id, args.id));
-      const row = rows[0];
-      if (!row) return { ok: false, error: "That entry no longer exists." };
-      if (row.matched !== 1 || row.undone === 1 || row.itemId == null) {
-        return { ok: false, error: "That entry can't be undone." };
-      }
-      const posGate = undoGate(
-        await loadAccountSettings(ctx),
-        "posSyncs",
-        row.actor,
-      );
-      if (posGate) return { ok: false, error: posGate };
-      const itemRows = await db
-        .select()
-        .from(schema.bitItems)
-        .where(eq(schema.bitItems.id, row.itemId));
-      const item = itemRows[0];
-      const statements: BatchItem<"sqlite">[] = [
-        db
-          .update(schema.bitPosTransactions)
-          .set({ undone: 1 })
-          .where(eq(schema.bitPosTransactions.id, row.id)),
-      ];
-      if (item) {
-        statements.push(
-          db
-            .update(schema.bitItems)
-            .set({ onHand: Math.min(100000, item.onHand + row.quantity) })
-            .where(eq(schema.bitItems.id, item.id)),
-        );
-      }
-      const [first, ...rest] = statements;
-      if (first) await db.batch([first, ...rest]);
-      ctx.invalidateQueries();
-      return { ok: true, error: null };
-    },
+    handler: async (ctx, args) =>
+      await performUndoBitPosTransaction(ctx, args.id),
   }),
 
   matchBitPosUnmatched: defineAction({
@@ -13719,4 +15176,140 @@ export const Actions = {
       return { ok: true as const };
     },
   }),
+
+  importSampleData: defineAction({
+    description:
+      "One-time load of the bundled sample dataset (The Daily Scoop sample business with its inventory, the Sim 01 analytics dataset for it, and the default account settings). Runs ONLY when no business exists yet — if anything is already stored it changes nothing and reports imported: false, so it can never overwrite data entered in this copy. BIT history tables (check rounds, snapshots, stock events) start empty by design.",
+    request: z.object({}),
+    response: z.object({
+      imported: z.boolean(),
+      counts: sampleCountsShape,
+    }),
+    handler: async (
+      ctx,
+    ): Promise<{
+      imported: boolean;
+      counts: z.infer<typeof sampleCountsShape>;
+    }> => {
+      const db = ctx.db<typeof schema>();
+      const [bizExisting] = await Promise.all([
+        db
+          .select({ id: schema.bitBusiness.id })
+          .from(schema.bitBusiness)
+          .limit(1),
+      ]);
+      if (bizExisting.length > 0) {
+        return { imported: false, counts: await sampleDataCounts(ctx) };
+      }
+
+      const statements: BatchItem<"sqlite">[] = [];
+
+      // ---- BIT sample business + inventory (export ids preserved). ----
+      const b = bitScoopExport.business;
+      statements.push(
+        db.insert(schema.bitBusiness).values({
+          id: b.id,
+          businessType: b.type,
+          customType: b.customType,
+          name: b.name,
+          zonesJson: JSON.stringify(b.categories),
+          organizeBy: "category",
+          categoriesJson: JSON.stringify(b.categories),
+          freezersJson: JSON.stringify(b.freezers),
+          colorsJson: JSON.stringify(b.colors),
+          usesRequisition: b.usesRequisition ? 1 : 0,
+          division: b.division,
+          preparerName: b.preparerName,
+          approverName: b.approverName,
+          teamSize: b.teamSize,
+        }),
+      );
+      bitScoopExport.items.forEach((it, i) => {
+        statements.push(
+          db.insert(schema.bitItems).values({
+            id: it.id,
+            businessId: b.id,
+            name: it.name,
+            category: it.category,
+            zone: it.zone,
+            onHand: it.onHand,
+            unit: it.unit,
+            par: it.par,
+            packSize: it.packSize,
+            supplier: it.supplier,
+            sku: it.sku,
+            expiryDate: it.expiryDate,
+            tagsJson: JSON.stringify(it.tags),
+            sortOrder: i,
+          }),
+        );
+      });
+
+      // ---- BIT Sim 01 analytics dataset (The Daily Scoop). ----
+      const ana = bitAnalyticsExport;
+      const scoopId = bitScoopExport.business.id;
+      for (const m of ana.months) {
+        statements.push(
+          db.insert(schema.bitAnalyticsMonths).values({
+            businessId: scoopId,
+            monthKey: m.monthKey,
+            label: m.label,
+            daysOpen: m.daysOpen,
+            transactions: m.transactions,
+            unitsSold: m.unitsSold,
+            revenue: m.revenue,
+            cogs: m.cogs,
+            wasteCost: m.wasteCost,
+            grossProfit: m.grossProfit,
+            netProfit: m.netProfit,
+            ordersPlaced: m.ordersPlaced,
+            stockoutEvents: m.stockoutEvents,
+            endingInventoryValue: m.endingInventoryValue,
+          }),
+        );
+      }
+      ana.menu.forEach((m, i) => {
+        statements.push(
+          db.insert(schema.bitAnalyticsMenu).values({
+            businessId: scoopId,
+            name: m.name,
+            units: m.units,
+            revenue: m.revenue,
+            sortOrder: i,
+          }),
+        );
+      });
+      statements.push(
+        db.insert(schema.bitAnalyticsSummary).values({
+          businessId: scoopId,
+          label: ana.label ?? "",
+          periodLabel: ana.periodLabel ?? "",
+          lostRevenue: ana.lostRevenue,
+          lostUnits: ana.lostUnits,
+          stockoutEvents: ana.stockoutEvents,
+          wasteJson: JSON.stringify(ana.tubWaste),
+          itemCostsJson: JSON.stringify(ana.itemCosts),
+        }),
+      );
+
+      // ---- Account settings (role + undo policy, as bundled). ----
+      statements.push(
+        db.insert(schema.accountSettings).values({
+          id: 1,
+          actingRole: accountSettingsExport.role,
+          policyJson: JSON.stringify(accountSettingsExport.policy),
+        }),
+      );
+
+      // Run in chunks so no single batch is oversized.
+      for (let i = 0; i < statements.length; i += 400) {
+        const chunk = statements.slice(i, i + 400);
+        const [first, ...rest] = chunk;
+        if (first) await db.batch([first, ...rest]);
+      }
+      ctx.invalidateQueries();
+      return { imported: true, counts: await sampleDataCounts(ctx) };
+    },
+  }),
+
 } satisfies ActionsModule;

@@ -7,21 +7,25 @@ import { api, type ApiResponse } from "./api";
  * Primary vs Connected account settings. This page is the one
  * place the account system lives — it is NOT sprinkled through
  * the daily shopping / counting / requisition flows; those only
- * show each record's actor label and its Undo (or "Permanent")
- * state.
+ * show each record's actor label and its "Permanent" state.
  *
  * - Acting as: this copy's role — Primary user or Connected
  *   account (Primary until changed). The role is this copy's own
  *   identity, so it can be switched from either role.
  * - Undo policy: per action type, Permanent (the action applies
- *   with no Undo offered and its records read as permanent) or
- *   Reversible (the 7a Undo works). Everything starts Reversible.
- *   The table is editable ONLY while acting as Primary; acting as
- *   Connected it is read-only — connected-account actions stay
- *   reversible unless the Primary user changes a type here.
+ *   for good — the Settings Undo skips it and its records read
+ *   as permanent) or Reversible (the Settings Undo can revert
+ *   it). Everything starts Reversible. The table is editable
+ *   ONLY while acting as Primary; acting as Connected it is
+ *   read-only — connected-account actions stay reversible unless
+ *   the Primary user changes a type here.
  * - Ownership: the Primary user can undo anyone's action; a
  *   Connected account can undo only its own actions (the server
- *   refuses the rest, and the Undo simply isn't offered).
+ *   refuses the rest, and the Settings Undo skips them).
+ *
+ * Since Beta 0.15 the app has exactly ONE Undo: the "Undo last
+ * action" button in Settings, under Switch to. It reverts the
+ * last action this policy and ownership rule allow.
  */
 
 export type ActorRole = "primary" | "connected";
@@ -77,7 +81,7 @@ const POLICY_ROWS: { type: PolicyType; label: string; blurb: string }[] = [
   {
     type: "alertDismissals",
     label: "Alert dismissals",
-    blurb: "Dismissed alerts on the Shopping List (Restore is the Undo).",
+    blurb: "Dismissed alerts on the Shopping List (undoing one brings it back).",
   },
   {
     type: "posSyncs",
@@ -234,11 +238,13 @@ export function AccountPolicy({ onClose }: { onClose: () => void }) {
       >
         <h3 className="text-base font-bold">Undo policy</h3>
         <p className="mt-1 text-sm text-[var(--dim)]">
-          For each kind of action, choose whether it is{" "}
-          <strong>Reversible</strong> — its records offer an Undo —
-          or <strong>Permanent</strong> — it applies with no Undo
-          and its records read as permanent. Everything starts
-          Reversible, including every Connected account action.
+          The Undo button in Settings reverts the last action in
+          the app. For each kind of action, choose whether it is{" "}
+          <strong>Reversible</strong> — the Undo can revert it — or{" "}
+          <strong>Permanent</strong> — it applies for good, the
+          Undo skips it, and its records read as permanent.
+          Everything starts Reversible, including every Connected
+          account action.
         </p>
         {!isPrimary && (
           <p

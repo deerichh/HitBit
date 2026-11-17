@@ -1048,7 +1048,7 @@ function AddItemForm({
       </button>
       <p className="mt-2 text-center text-xs text-[var(--dim)]">
         The item appears right away, a price check starts automatically,
-        and it will also appear in Vanessa&rsquo;s app.
+        and it will also appear in the shared household copy.
       </p>
     </form>
   );
@@ -1102,10 +1102,29 @@ function hitCountedLabel(dateKey: string | null): string {
   return `Last counted: ${label} · ${rel}`;
 }
 
-export function HitListTab() {
+export function HitListTab({
+  addItemSignal = 0,
+  onAddItemSignalHandled,
+}: {
+  // Bumped by the App when a leftover receipt line's Add button
+  // is tapped over in the Shopping List tab: this tab opens its
+  // Add item form — the same form its own "Add item" button
+  // opens — and reports the signal handled so it fires once.
+  addItemSignal?: number;
+  onAddItemSignalHandled?: () => void;
+}) {
   const [query, setQuery] = useState("");
   const [showLowOnly, setShowLowOnly] = useState(false);
   const [showForm, setShowForm] = useState(false);
+  useEffect(() => {
+    if (addItemSignal > 0) {
+      setShowForm(true);
+      onAddItemSignalHandled?.();
+    }
+    // onAddItemSignalHandled is the App's reset for the signal;
+    // only the signal's arrival drives this.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addItemSignal]);
   const [refreshingSince, setRefreshingSince] = useState<string | null>(null);
   const [refreshFailed, setRefreshFailed] = useState(false);
   // When the in-flight refresh started, for the timeout below.
@@ -1226,35 +1245,6 @@ export function HitListTab() {
   const activity = useQuery({
     queryKey: ["activity"],
     queryFn: () => api.getActivityLog({}),
-  });
-  const undoUsage = useMutation({
-    mutationFn: async (id: number) => await api.undoUsage({ id }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["usage"] });
-      queryClient.invalidateQueries({ queryKey: ["activity"] });
-      queryClient.invalidateQueries({ queryKey: ["hit"] });
-      queryClient.invalidateQueries({ queryKey: ["planner"] });
-    },
-  });
-  const undoPurchase = useMutation({
-    mutationFn: async (id: number) => await api.undoPurchase({ id }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["activity"] });
-      queryClient.invalidateQueries({ queryKey: ["hit"] });
-      queryClient.invalidateQueries({ queryKey: ["list"] });
-      queryClient.invalidateQueries({ queryKey: ["planner"] });
-    },
-  });
-  // Undo coverage (audit #5): a stepper tap's or stocktake
-  // correction's own Undo, restoring the item's prior count.
-  const undoAdjustment = useMutation({
-    mutationFn: async (id: number) => await api.undoStockAdjustment({ id }),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["activity"] });
-      queryClient.invalidateQueries({ queryKey: ["hit"] });
-      queryClient.invalidateQueries({ queryKey: ["list"] });
-      queryClient.invalidateQueries({ queryKey: ["planner"] });
-    },
   });
   // Stocktake confirm: records the differences as pending stock
   // adjustments (source "stocktake") for the auto-scan to apply.
@@ -1496,7 +1486,7 @@ export function HitListTab() {
           <p className="mt-2 text-sm text-[var(--dim)]">
             {hit.data?.pendingSyncCount}{" "}
             {hit.data?.pendingSyncCount === 1 ? "item" : "items"} added
-            here will also appear in Vanessa&rsquo;s app.
+            here will also appear in the shared household copy.
           </p>
         )}
         {(hit.data?.pendingStockCount ?? 0) > 0 && (
@@ -2457,43 +2447,6 @@ export function HitListTab() {
                         <ActorTag actor={e.actor} permanent={e.permanent} />
                       </p>
                     </div>
-                    {!e.undone && e.permanent && (
-                      <span className="shrink-0 rounded-full px-3 py-1 text-xs font-bold text-[var(--dim)]">
-                        Permanent
-                      </span>
-                    )}
-                    {!e.undone && e.canUndo && (
-                      <button
-                        type="button"
-                        aria-label={
-                          e.kind === "purchased"
-                            ? `Undo the purchase of ${e.item}`
-                            : e.kind === "adjusted"
-                              ? `Undo the stock change for ${e.item}`
-                              : `Undo usage of ${e.item}`
-                        }
-                        disabled={
-                          undoUsage.isPending ||
-                          undoPurchase.isPending ||
-                          undoAdjustment.isPending
-                        }
-                        onClick={() =>
-                          e.kind === "purchased"
-                            ? undoPurchase.mutate(e.refId)
-                            : e.kind === "adjusted"
-                              ? undoAdjustment.mutate(e.refId)
-                              : undoUsage.mutate(e.refId)
-                        }
-                        className="shrink-0 rounded-full px-3 py-1 text-xs font-bold disabled:opacity-50"
-                        style={{
-                          backgroundColor: "var(--surface-alt)",
-                          color: "var(--accent)",
-                          border: "1px solid var(--border)",
-                        }}
-                      >
-                        Undo
-                      </button>
-                    )}
                   </li>
                 ))}
               </ul>
@@ -2511,7 +2464,7 @@ export function HitListTab() {
           Refreshing also starts a
           stocktake, walking the whole list to correct the counts;
           the Activity log below covers usage, purchases and stock
-          changes, each with an Undo.
+          changes.
         </p>
       )}
     </div>

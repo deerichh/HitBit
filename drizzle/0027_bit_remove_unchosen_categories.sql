@@ -1,0 +1,9 @@
+-- Template note: this migration was a one-off data cleanup for the
+-- original owner's station business (it moved that one business
+-- from the old category-or-zone scheme to categories-only and
+-- re-grouped its items onto the categories its owner had picked).
+-- That business is not part of this bare template, so there is
+-- nothing for this migration to do here. The file is kept, empty,
+-- so the migration order stays 0001-0039 and the journal stays
+-- consistent; a business set up through the setup wizard already
+-- starts categories-only.

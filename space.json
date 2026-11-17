@@ -1,12 +1,8 @@
 {
   "entry": "client/dist/index.html",
-  "managedCronJobs": [
-    "shopping-list-daily-refresh",
-    "shopping-list-hit-refresh",
-    "shopping-list-bit-pos-daily-pull"
-  ],
-  "name": "HitBit - Beta 0.01",
+  "managedCronJobs": [],
+  "name": "HitBit",
   "platformVersion": 28,
   "runtime": "typescript",
-  "slug": "shopping-list"
+  "slug": "hitbit"
 }

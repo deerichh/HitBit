@@ -52,4 +52,6 @@ CREATE TABLE bit_requisition_draft_extras (
   created_at integer NOT NULL
 );
 --> statement-breakpoint
-UPDATE bit_business SET uses_requisition = 1 WHERE lower(name) LIKE 'tfs station 226%';
+-- Template note: no business is backfilled here. A new
+-- business gets uses_requisition = 1 from the setup wizard
+-- (completeBitSetup) when its owner ticks "Order by requisition".

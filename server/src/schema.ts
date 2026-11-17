@@ -2,8 +2,10 @@
 //
 // Shopping List tab:
 //   list_items    — one cached row per Shopping List row from the
-//                   HIT-VANDERLANCAL Google Sheet (the sheet is the
-//                   system of record; saveList replaces these wholesale).
+//                   an optional Google Sheet (when one is connected it is
+//                   the system of record; saveList replaces these wholesale).
+//                   The sheet is configured in server/src/actions.ts
+//                   (SPREADSHEET_ID) — leave it blank to use the app alone.
 //   list_meta     — single-row metadata: the sheet's "Updated …" stamp
 //                   and when the last refresh landed.
 //   checked_items — local check-off state (items the user has purchased),
@@ -35,8 +37,8 @@
 //                   current check began; getHitList fails a check
 //                   still pending ten minutes later — its task never
 //                   reported back), and a synced_at stamp for the
-//                   Vanessa app-sync outbox (null = still to be
-//                   included in the updates between the two apps).
+//                   household sync outbox (null = still to be
+//                   included in the updates to the shared household copy).
 //
 // Meal Planner tab (ported from the standalone Meal Planner app):
 //   meals / meal_proteins / meal_ingredients / picks / meal_matches /
@@ -413,7 +415,7 @@ export const watchedItems = sqliteTable("watched_items", {
     .$defaultFn(() => new Date()),
 });
 
-// One stock snapshot per item per day (Toronto date), recorded by
+// One stock snapshot per item per day (local date), recorded by
 // saveHitList, pruned to the last ~60 days. Run-out forecasts are
 // estimated from declines between snapshots — nothing is forecast
 // without at least two snapshots showing change. The unique index
@@ -473,7 +475,7 @@ export const itemSources = sqliteTable(
     // "flipp" | "website"
     sourceType: text("source_type", { enum: ["flipp", "website"] }).notNull(),
     store: text("store"),
-    // Toronto date key ("2026-11-13") the source was last recorded.
+    // Local date key ("2026-11-13") the source was last recorded.
     updatedDate: text("updated_date").notNull(),
     updatedAt: integer("updated_at", { mode: "timestamp_ms" })
       .notNull()
@@ -678,16 +680,21 @@ export const itemExpiries = sqliteTable("item_expiries", {
 // "Receipt scans" area). The receipt photo itself lives in
 // ctx.blobs under image_blob_key (the MIME type is kept here so
 // readers know what they're fetching); this row carries the
-// workflow state. Status flow: "pending" (photo stored, waiting for
-// the external reader) → "proposed" (setReceiptScanResult wrote the
-// matched purchased-items proposal in lines_json) → "confirmed"
+// workflow state. Status flow: "pending" (photo stored, its
+// automatic read not yet finished) → "proposed" (the read —
+// requestReceiptScan / readReceiptScanNow reading the photo in
+// the app, or the fallback background reader via
+// setReceiptScanResult — wrote the matched purchased-items
+// proposal in lines_json) → "confirmed"
 // (the user confirmed in the app; pending stock adjustments with
 // source "receipt" were recorded) or "dismissed" (the user
 // dismissed it; nothing was recorded). lines_json entries are
-// { receiptText, item, quantity }: receiptText is the line as
+// { receiptText, item, quantity, price? }: receiptText is the line as
 // printed on the receipt, item the matched HIT List item name
 // (null when the line matched nothing), quantity the number
-// purchased. qr_value holds a QR code decoded from the photo in
+// purchased, price the line's price in dollars when the reader
+// could read one (absent on scans read before prices were
+// captured). The receipt's grand total lives in the total column. qr_value holds a QR code decoded from the photo in
 // the app when the platform supports it (receipts often carry a QR
 // code, and some receipts are only a QR code linking to a digital
 // copy) so the reader can follow it to the digital receipt; it is
@@ -704,8 +711,15 @@ export const receiptScans = sqliteTable("receipt_scans", {
     .notNull()
     .default("pending"),
   linesJson: text("lines_json"),
-  // Short note from the external reader (e.g. why a read failed).
+  // Short note from the reader (e.g. why a read failed, or why a
+  // read couldn't be started).
   note: text("note"),
+  // The receipt's grand total as printed, in dollars, when the
+  // reader could read it (Beta 0.13); null when the total wasn't
+  // legible or the scan was read before totals were captured.
+  // Per-line prices ride in lines_json (each entry's optional
+  // price, dollars) — no column needed for those.
+  total: real("total"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -942,19 +956,18 @@ export const bitBusiness = sqliteTable("bit_business", {
   }),
   posSkuCacheJson: text("pos_sku_cache_json"),
   posConnectedAt: integer("pos_connected_at", { mode: "timestamp_ms" }),
-  // Quartermaster requisition workflow (Alpha 0.71, TFS SOG F-SUPP
-  // "Supplies and Ordering"): uses_requisition gates the whole
-  // requisition flow — set for TFS station 226 only; every other
-  // business keeps the Order Email tab exactly as before. division
-  // and duty_officer_name are the requisition form's header fields,
-  // stored on the business and editable from the Requisition tab;
-  // both start blank until the user sets them.
+  // Requisition workflow (Alpha 0.71): uses_requisition gates the
+  // whole requisition flow — set from the setup wizard when the
+  // business orders by requisition; every other business keeps the
+  // Order Email tab exactly as before. division and preparer_name
+  // are the requisition form's header fields, stored on the
+  // business and editable from the Requisition tab; both start
+  // blank until the user sets them.
   usesRequisition: integer("uses_requisition").notNull().default(0),
   division: text("division"),
-  dutyOfficerName: text("duty_officer_name"),
+  preparerName: text("preparer_name"),
   // Approver separation (Beta 0.06, audit #15): the requisition's
-  // approver is the District Chief (the form's DC name/signature
-  // line), recorded separately from the Duty Officer who prepared
+  // approver is recorded separately from the preparer who prepared
   // it — the two names must differ, and no requisition can be
   // marked sent until an approver is recorded. The recorded-at
   // stamps say when each name was last recorded (set when the
@@ -963,7 +976,7 @@ export const bitBusiness = sqliteTable("bit_business", {
   approverRecordedAt: integer("approver_recorded_at", {
     mode: "timestamp_ms",
   }),
-  dutyOfficerRecordedAt: integer("duty_officer_recorded_at", {
+  preparerRecordedAt: integer("preparer_recorded_at", {
     mode: "timestamp_ms",
   }),
   // Setup questionnaire team size (Alpha 0.90): the band picked on
@@ -983,7 +996,7 @@ export const bitBusiness = sqliteTable("bit_business", {
 export const bitRequisitions = sqliteTable("bit_requisitions", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   businessId: integer("business_id").notNull().default(1),
-  // Fire Station-YY-MM-DD, e.g. 226-26-11-14.
+  // Business code-YY-MM-DD, e.g. B2-26-11-14.
   reqNo: text("req_no").notNull(),
   status: text("status", { enum: ["outstanding", "closed"] })
     .notNull()
@@ -999,6 +1012,16 @@ export const bitRequisitions = sqliteTable("bit_requisitions", {
   approvedAt: integer("approved_at", { mode: "timestamp_ms" }),
   sentAt: integer("sent_at", { mode: "timestamp_ms" }).notNull(),
   closedAt: integer("closed_at", { mode: "timestamp_ms" }),
+  // The approved filled requisition form (PDF), saved when the form is
+  // approved from the review pop-up that opens the moment an
+  // inventory check finishes: the exact bytes the reviewer
+  // approved, kept as base64 so the Requisition tab's Download
+  // PDF button serves this copy rather than a rebuild. Null on
+  // requisitions sent the older way ("Mark requisition as
+  // sent"), which never saved a form.
+  formPdfBase64: text("form_pdf_base64"),
+  formPageCount: integer("form_page_count"),
+  formSavedAt: integer("form_saved_at", { mode: "timestamp_ms" }),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
@@ -1007,7 +1030,7 @@ export const bitRequisitions = sqliteTable("bit_requisitions", {
 // One line of a sent requisition. item_id links back to the
 // tracked inventory item when the line came from stock (null for
 // catalogue lines ordered straight onto the requisition). status
-// is the SOG check-off: "pending" until the Duty Officer checks
+// is the delivery check-off: "pending" until the preparer checks
 // the delivery, then "received" (qty_received applied to stock) or
 // "not_received". A not-received line is NEVER back-ordered: it
 // resurfaces on the next requisition build badged "Resubmitted"
@@ -1037,19 +1060,21 @@ export const bitRequisitionLines = sqliteTable("bit_requisition_lines", {
   checkedOffBy: text("checked_off_by", {
     enum: ["primary", "connected"],
   }),
+  // When the line was checked off (Beta 0.15): the single Undo
+  // button in Settings reverts the app's LAST action, and a
+  // check-off's place in that order comes from this stamp. Null
+  // while pending, and on check-offs from before the column
+  // existed (those order by the requisition's sent date instead).
+  checkedOffAt: integer("checked_off_at", { mode: "timestamp_ms" }),
   supersededBy: integer("superseded_by"),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
 });
 
-// Quartermaster catalogue reference entries (Alpha 0.71): for TFS,
-// the OfficiallyDressed "SHORELINE" PPE catalogue items 125–208
-// (description + Material # = the catalogue number), seeded by the
-// seed action. Since Alpha 0.72 the catalogue items are regular
-// tracked inventory (bit_items, category "Quartermaster
-// catalogue", converted by convertBitTfsCatalogueToInventory);
-// these rows are kept on file as the original reference list and
+// Catalogue reference entries (Alpha 0.71): a supplier catalogue's
+// items (description + item number), seeded by the seed action.
+// These rows are kept on file as the original reference list and
 // for any draft extras that still point at them.
 export const bitCatalogue = sqliteTable(
   "bit_catalogue",

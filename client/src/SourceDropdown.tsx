@@ -3,62 +3,45 @@ import { useMenuDismiss } from "./popupHooks";
 
 /**
  * The small "Source ▾" dropdown, mirroring the Shopping List tab's
- * Source dropdown: a compact pill toggle; expanded it shows a short
- * heading line (e.g. "Recipe from RecipeTin Eats"), the dish /
- * product name it points at, and the full URL as a wrapping
- * hyperlink. Tapping the link opens a tiny menu with exactly "Open
- * link" and "Copy link" (with a "Copied ✓" confirmation). The URL
- * is always one recorded by the app — never guessed or built here.
- * The dropdown follows the app's one dismissal spec: an outside
- * tap, a scroll, or Escape closes it.
+ * Source dropdown: a compact pill toggle; expanded it shows the
+ * dish / product name it points at and a short provenance line
+ * (e.g. "Found on Flipp" / "Recipe from RecipeTin Eats") in which
+ * the website's name itself is the hyperlink — tapping it opens
+ * the recorded page in a new tab. The full URL is never shown as
+ * text. The URL is always one recorded by the app — never
+ * guessed or built here. The dropdown follows the app's one
+ * dismissal spec: an outside tap, a scroll, or Escape closes it.
  */
 export function SourceDropdown({
   name,
-  heading,
+  headingBefore,
+  siteName,
+  headingAfter,
   url,
   itemLabel,
 }: {
   /** The dish / product name the source points at. */
   name: string;
-  /** Short provenance line, e.g. "Recipe from RecipeTin Eats". */
-  heading: string;
+  /** Provenance text before the site name, e.g. "Found on" /
+      "Found on the" / "Recipe from". */
+  headingBefore: string;
+  /** The website the source is from — the hyperlink's text,
+      e.g. "Flipp", "Food Basics", "RecipeTin Eats". */
+  siteName: string;
+  /** Optional provenance text after the site name, e.g.
+      "website" in "Found on the Food Basics website". */
+  headingAfter?: string;
   url: string;
   /** Accessible-name context, e.g. the recipe name. */
   itemLabel: string;
 }) {
   const [open, setOpen] = useState(false);
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [copied, setCopied] = useState(false);
   // One dismissal spec (Beta 0.04, audit #6): an outside tap, a
-  // scroll, or Escape closes the dropdown and its link menu.
+  // scroll, or Escape closes the dropdown.
   const wrapRef = useRef<HTMLDivElement | null>(null);
   useMenuDismiss(open, wrapRef, () => {
     setOpen(false);
-    setMenuOpen(false);
   });
-
-  const copyLink = async () => {
-    try {
-      await navigator.clipboard.writeText(url);
-    } catch {
-      // Clipboard API unavailable (older webview): fall back to a
-      // temporary textarea + execCommand copy.
-      const ta = document.createElement("textarea");
-      ta.value = url;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try {
-        document.execCommand("copy");
-      } catch {
-        /* copy unavailable — the URL stays visible to copy by hand */
-      }
-      document.body.removeChild(ta);
-    }
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 2000);
-  };
 
   return (
     <div ref={wrapRef}>
@@ -68,7 +51,6 @@ export function SourceDropdown({
         aria-label={`${open ? "Hide" : "Show"} source for ${itemLabel}`}
         onClick={() => {
           setOpen((v) => !v);
-          setMenuOpen(false);
         }}
         className="hit24y-lg inline-flex items-center gap-[3px] rounded-full px-[6px] py-[1.25px] text-[12px] leading-none font-bold"
         style={{
@@ -91,55 +73,20 @@ export function SourceDropdown({
       {open && (
         <div className="mt-1.5">
           <p className="text-xs font-medium text-[var(--text)]">{name}</p>
-          <p className="text-[13px] font-medium text-[var(--dim)]">
-            {heading}
-          </p>
-          <button
-            type="button"
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            aria-label={`Source link options for ${itemLabel}`}
-            onClick={() => setMenuOpen((v) => !v)}
-            className="mt-0.5 block max-w-full text-left text-xs font-medium break-all underline"
-            style={{ color: "var(--accent)" }}
-          >
-            {url}
-          </button>
-          {menuOpen && (
-            <div
-              role="menu"
-              aria-label="Source link actions"
-              className="mt-1.5 inline-flex overflow-hidden rounded-lg"
-              style={{ border: "1px solid var(--border)" }}
+          <p className="flex flex-wrap items-center gap-x-1.5 text-[13px] font-medium text-[var(--dim)]">
+            <span>{headingBefore}</span>
+            <a
+              href={url}
+              target="_blank"
+              rel="noreferrer"
+              aria-label={`Open the ${siteName} page for ${itemLabel}`}
+              className="font-bold underline"
+              style={{ color: "var(--accent)" }}
             >
-              <a
-                role="menuitem"
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center px-3 text-xs font-bold"
-                style={{
-                  backgroundColor: "var(--surface)",
-                  color: "var(--accent)",
-                  minHeight: "2rem",
-                }}
-              >
-                Open link
-              </a>
-              <button
-                type="button"
-                role="menuitem"
-                onClick={copyLink}
-                className="px-3 text-xs font-bold"
-                style={{
-                  backgroundColor: "var(--surface-alt)",
-                  color: "var(--accent)",
-                }}
-              >
-                {copied ? "Copied ✓" : "Copy link"}
-              </button>
-            </div>
-          )}
+              {siteName}
+            </a>
+            {headingAfter && <span>{headingAfter}</span>}
+          </p>
         </div>
       )}
     </div>

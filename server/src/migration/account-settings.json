@@ -1,0 +1,1 @@
+{"policy":{"alertDismissals":"reversible","bitCountChanges":"reversible","eaten":"reversible","manifestImports":"reversible","posSyncs":"reversible","purchases":"reversible","receiptScans":"reversible","requisitionCheckOffs":"reversible","stockAdjustments":"reversible","wasteLog":"reversible"},"role":"primary"}
